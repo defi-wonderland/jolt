@@ -1,0 +1,22 @@
+[package]
+name = "gnark-transpiler"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gnark-transpiler"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse zkLean's MLE AST infrastructure
+zklean-extractor = { path = "../zklean-extractor" }
+
+# Jolt dependencies
+jolt-core = { path = "../jolt-core" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+ark-bn254 = "0.5.0"

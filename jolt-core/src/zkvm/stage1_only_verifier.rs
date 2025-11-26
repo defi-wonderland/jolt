@@ -472,36 +472,197 @@ mod tests {
         assert!(proof.trace_length.is_power_of_two());
     }
 
-    // NOTE: Full integration test commented out due to deserialization limitation
-    //
-    // The JoltProof deserialization requires AllCommittedPolynomials::initialize()
-    // context which triggers unimplemented trait bounds. This is a known limitation
-    // of the current serialization approach.
-    //
-    // For real-world usage, Stage1OnlyProof should be extracted from the JoltProof
-    // object BEFORE serialization, or the proof should be passed in-memory.
-    //
-    // Example usage pattern:
-    // ```
-    // // In prover code:
-    // let full_proof = prove_fibonacci(input);
-    // let stage1_proof = Stage1OnlyProof::from_full_proof(&full_proof);
-    //
-    // // Pass stage1_proof to verifier (in-memory or with custom serialization)
-    // let stage1_preprocessing = Stage1OnlyPreprocessing::new(trace_length);
-    // let verifier = Stage1OnlyVerifier::new(stage1_preprocessing, stage1_proof)?;
-    // verifier.verify()?; // Verifies ONLY R1CS constraints (Stage 1)
-    // ```
-    //
-    // For manual testing:
-    // 1. Run: cargo run --release -p fibonacci
-    // 2. In fibonacci/src/main.rs, add after line 39:
-    //    ```
-    //    use jolt_core::zkvm::stage1_only_verifier::{Stage1OnlyProof, Stage1OnlyPreprocessing, Stage1OnlyVerifier};
-    //    let stage1_proof = Stage1OnlyProof::from_full_proof(&proof);
-    //    let stage1_preprocessing = Stage1OnlyPreprocessing::new(proof.trace_length.next_power_of_two());
-    //    let verifier = Stage1OnlyVerifier::new(stage1_preprocessing, stage1_proof).unwrap();
-    //    verifier.verify().expect("Stage 1 verification failed!");
-    //    println!("✅ Stage 1 verification PASSED!");
-    //    ```
+}
+
+// ============================================================================
+// Transpilation-friendly verification (no Transcript)
+// ============================================================================
+
+use crate::zkvm::r1cs::constraints::{
+    OUTER_FIRST_ROUND_POLY_NUM_COEFFS, OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
+};
+use crate::poly::lagrange_poly::LagrangeHelper;
+
+/// Challenges and proof data for transpilation-friendly verification.
+///
+/// This structure contains all the data needed to verify Stage 1 without
+/// using a Fiat-Shamir transcript. The challenges are pre-computed externally
+/// (e.g., by replaying the transcript) and passed in directly.
+///
+/// This enables transpilation to Gnark/Groth16 circuits where challenges
+/// become public inputs rather than being computed via hash functions.
+#[derive(Clone, Debug)]
+pub struct Stage1VerificationData<F: JoltField> {
+    /// Initial challenges for outer sumcheck (tau)
+    pub tau: Vec<F>,
+    /// Challenge from uni-skip first round
+    pub r0: F,
+    /// Challenges from remaining sumcheck rounds
+    pub sumcheck_challenges: Vec<F>,
+    /// Univariate polynomial coefficients from first round
+    pub uni_skip_poly_coeffs: Vec<F>,
+    /// Decompressed polynomials from sumcheck rounds
+    pub sumcheck_round_polys: Vec<Vec<F>>,
+    /// Trace length
+    pub trace_length: usize,
+}
+
+/// Result of Stage 1 verification with all constraints.
+///
+/// Contains the final claim and all intermediate constraint values
+/// that must equal zero for a valid proof.
+#[derive(Clone, Debug)]
+pub struct Stage1VerificationResult<F: JoltField> {
+    /// The final claim after all sumcheck rounds
+    pub final_claim: F,
+    /// Power sum check: should equal 0
+    pub power_sum_check: F,
+    /// Sumcheck round consistency checks: each should equal 0
+    /// (computed as poly(0) + poly(1) - previous_claim)
+    pub sumcheck_consistency_checks: Vec<F>,
+}
+
+/// Verify Stage 1 without Transcript - suitable for transpilation to Gnark.
+///
+/// This function performs the same verification as `Stage1OnlyVerifier::verify()`,
+/// but takes all challenges as parameters instead of generating them via
+/// Fiat-Shamir transcript. This makes it suitable for:
+///
+/// 1. **Transpilation to Gnark**: Run with `MleAst` to build AST, then transpile
+/// 2. **Transpilation to other circuit DSLs**: Same approach
+/// 3. **Testing**: Verify with pre-computed challenges
+///
+/// ## Arguments
+///
+/// * `data` - Pre-computed challenges and proof polynomials
+///
+/// ## Returns
+///
+/// `Stage1VerificationResult` containing:
+/// - `final_claim`: The result after all sumcheck rounds
+/// - `power_sum_check`: Must equal 0 for valid proof
+/// - `sumcheck_consistency_checks`: Each must equal 0 for valid proof
+///
+/// ## Usage for Transpilation
+///
+/// ```rust,ignore
+/// use zklean_extractor::mle_ast::MleAst;
+///
+/// // Create MleAst versions of the inputs
+/// let data = Stage1VerificationData {
+///     tau: tau.iter().map(|&x| MleAst::from_i128(x)).collect(),
+///     r0: MleAst::from_i128(r0),
+///     // ... etc
+/// };
+///
+/// // Run verification - AST builds automatically
+/// let result = verify_stage1_for_transpilation(data);
+///
+/// // Transpile each constraint to Gnark
+/// // power_sum_check should be constrained to equal 0
+/// // each sumcheck_consistency_check should be constrained to equal 0
+/// ```
+pub fn verify_stage1_for_transpilation<F: JoltField>(
+    data: Stage1VerificationData<F>,
+) -> Stage1VerificationResult<F> {
+    // Step 1: Verify univariate-skip first round
+    // Check: Σ_j coeff[j] * power_sum[j] == 0 (initial claim)
+    // Then: evaluate polynomial at r0 to get claim_after_first
+    let (claim_after_first, power_sum_check) = verify_uni_skip_first_round(
+        &data.uni_skip_poly_coeffs,
+        &data.r0,
+    );
+
+    // Step 2: Verify remaining sumcheck rounds
+    // For each round: check g(0) + g(1) == previous_claim
+    // Then: evaluate g(r) to get next claim
+    let (final_claim, sumcheck_consistency_checks) = verify_sumcheck_rounds(
+        claim_after_first,
+        &data.sumcheck_challenges,
+        &data.sumcheck_round_polys,
+    );
+
+    Stage1VerificationResult {
+        final_claim,
+        power_sum_check,
+        sumcheck_consistency_checks,
+    }
+}
+
+/// Verify univariate-skip first round (pure field arithmetic).
+///
+/// Returns:
+/// - next_claim: poly(r0)
+/// - power_sum_check: Σ_j coeff[j] * S_j (should equal 0 for valid proof)
+fn verify_uni_skip_first_round<F: JoltField>(
+    poly_coeffs: &[F],
+    r0: &F,
+) -> (F, F) {
+    // Power sum check: Σ_j coeff[j] * S_j should equal 0
+    // The power sums are precomputed constants for the symmetric domain
+    let power_sums = LagrangeHelper::power_sums::<
+        OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
+        OUTER_FIRST_ROUND_POLY_NUM_COEFFS,
+    >();
+
+    let mut power_sum_check = F::zero();
+    for (j, coeff) in poly_coeffs.iter().enumerate() {
+        if j < power_sums.len() {
+            power_sum_check += coeff.mul_i128(power_sums[j]);
+        }
+    }
+
+    // Evaluate polynomial at r0 (Horner's method)
+    let next_claim = evaluate_polynomial(poly_coeffs, r0);
+
+    (next_claim, power_sum_check)
+}
+
+/// Verify sumcheck rounds (pure field arithmetic).
+///
+/// Returns:
+/// - final_claim: The claim after all rounds
+/// - consistency_checks: Vec of (poly(0) + poly(1) - previous_claim) for each round
+///   (each should equal 0 for valid proof)
+fn verify_sumcheck_rounds<F: JoltField>(
+    initial_claim: F,
+    challenges: &[F],
+    round_polys: &[Vec<F>],
+) -> (F, Vec<F>) {
+    let mut claim = initial_claim;
+    let mut consistency_checks = Vec::with_capacity(round_polys.len());
+
+    for (challenge, poly_coeffs) in challenges.iter().zip(round_polys) {
+        // Check: poly(0) + poly(1) == previous_claim
+        let poly_at_0 = evaluate_polynomial(poly_coeffs, &F::zero());
+        let poly_at_1 = evaluate_polynomial(poly_coeffs, &F::one());
+        let sum = poly_at_0 + poly_at_1;
+
+        // Constraint: sum - claim should equal 0
+        consistency_checks.push(sum - claim);
+
+        // Update claim for next round
+        claim = evaluate_polynomial(poly_coeffs, challenge);
+    }
+
+    (claim, consistency_checks)
+}
+
+/// Evaluate polynomial using Horner's method (pure field arithmetic).
+///
+/// Computes: Σ_i coeff[i] * x^i
+fn evaluate_polynomial<F: JoltField>(coeffs: &[F], x: &F) -> F {
+    if coeffs.is_empty() {
+        return F::zero();
+    }
+
+    let mut result = coeffs[0];
+    let mut x_power = *x;
+
+    for coeff in coeffs.iter().skip(1) {
+        result += *coeff * x_power;
+        x_power *= *x;
+    }
+
+    result
 }
