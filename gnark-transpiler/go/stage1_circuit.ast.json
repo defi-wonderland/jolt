@@ -1,0 +1,967 @@
+{
+  "nodes": [
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 0
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 1
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 2
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 3
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 4
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 5
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 6
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 7
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 8
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 9
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 10
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 11
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 12
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 13
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 14
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 15
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Var",
+        "index": 16
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 0
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 10
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 7
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 10
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 19
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 5
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 8
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 5
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 20
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 22
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 85
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 9
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 85
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 23
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 25
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 125
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 125
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 26
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 28
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 8
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 6
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 7
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 30
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 6
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 6
+        }
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 9
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 32
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 31
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 33
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 32
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 6
+        }
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 35
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 34
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 36
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 35
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 6
+        }
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 0
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 40
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 1
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 44
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 41
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 45
+      }
+    },
+    {
+      "op": "Sub",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 47
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 37
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 3
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 49
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 3
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 3
+        }
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 0
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 14
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 13
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 53
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 1
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 14
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 13
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 57
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 54
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 58
+      }
+    },
+    {
+      "op": "Sub",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 60
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 50
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 14
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 4
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 13
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 62
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 4
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 4
+        }
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 0
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 16
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 15
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 66
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 1
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 16
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 15
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 70
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 67
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 71
+      }
+    },
+    {
+      "op": "Sub",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 73
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 63
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 16
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 5
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 15
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 75
+      }
+    }
+  ],
+  "constraints": [
+    {
+      "name": "power_sum_check",
+      "description": "Sum over symmetric domain must equal 0",
+      "root_node_id": 29
+    },
+    {
+      "name": "consistency_check_0",
+      "description": "Sumcheck round 0: poly(0) + poly(1) - claim == 0",
+      "root_node_id": 48
+    },
+    {
+      "name": "consistency_check_1",
+      "description": "Sumcheck round 1: poly(0) + poly(1) - claim == 0",
+      "root_node_id": 61
+    },
+    {
+      "name": "consistency_check_2",
+      "description": "Sumcheck round 2: poly(0) + poly(1) - claim == 0",
+      "root_node_id": 74
+    },
+    {
+      "name": "final_claim",
+      "description": "Final claim must match expected value",
+      "root_node_id": 76
+    }
+  ],
+  "variables": [
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16
+  ],
+  "trace_length": 8,
+  "num_rounds": 3
+}

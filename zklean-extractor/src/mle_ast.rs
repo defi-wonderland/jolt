@@ -32,7 +32,7 @@ fn insert_node(node: Node) -> NodeId {
     id
 }
 
-fn get_node(id: NodeId) -> Node {
+pub fn get_node(id: NodeId) -> Node {
     let arena = node_arena();
     let guard = arena.read().expect("node arena poisoned");
     guard.get(id).copied().expect("invalid node reference")
@@ -116,6 +116,11 @@ pub struct MleAst {
 }
 
 impl MleAst {
+    /// Get the root node ID of this AST
+    pub fn root(&self) -> NodeId {
+        self.root
+    }
+
     fn new_scalar(scalar: Scalar) -> Self {
         let root = insert_node(Node::Atom(Atom::Scalar(scalar)));
         Self {
@@ -130,6 +135,12 @@ impl MleAst {
             root,
             reg_name: Some(name),
         }
+    }
+
+    /// Create a new variable for circuit transpilation.
+    /// The index maps to circuit input variables (e.g., index 0 → circuit.X_0)
+    pub fn from_var(index: u16) -> Self {
+        Self::new_var('x', index)
     }
 
     fn merge_reg_name(&mut self, other: Option<char>) {
