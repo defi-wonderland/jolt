@@ -100,6 +100,15 @@ pub enum Node {
     /// The quotient between the first and second nodes
     /// NOTE: No div-by-zero checks are performed here
     Div(Edge, Edge),
+    /// Poseidon hash of 2 inputs (for transcript)
+    /// This is a circuit-friendly hash function with ~150 constraints in Gnark
+    Poseidon2(Edge, Edge),
+    /// Poseidon hash of 4 inputs (for batch absorption)
+    Poseidon4(Edge, Edge, Edge, Edge),
+    /// Keccak256 hash (Ethereum-compatible)
+    /// Takes single input (can be chained for multiple inputs)
+    /// ~20,000-150,000 constraints in Gnark (expensive but standard)
+    Keccak256(Edge),
 }
 
 /// An AST intended for representing an MLE computation (although it will actually work for any
@@ -165,6 +174,40 @@ impl MleAst {
         let rhs_edge = edge_for_root(rhs.root);
         self.root = insert_node(constructor(lhs_edge, rhs_edge));
     }
+
+    /// Poseidon hash of 2 elements
+    pub fn poseidon2(a: &Self, b: &Self) -> Self {
+        let a_edge = edge_for_root(a.root);
+        let b_edge = edge_for_root(b.root);
+        let root = insert_node(Node::Poseidon2(a_edge, b_edge));
+        Self {
+            root,
+            reg_name: a.reg_name.or(b.reg_name),
+        }
+    }
+
+    /// Poseidon hash of 4 elements
+    pub fn poseidon4(a: &Self, b: &Self, c: &Self, d: &Self) -> Self {
+        let a_edge = edge_for_root(a.root);
+        let b_edge = edge_for_root(b.root);
+        let c_edge = edge_for_root(c.root);
+        let d_edge = edge_for_root(d.root);
+        let root = insert_node(Node::Poseidon4(a_edge, b_edge, c_edge, d_edge));
+        Self {
+            root,
+            reg_name: a.reg_name.or(b.reg_name).or(c.reg_name).or(d.reg_name),
+        }
+    }
+
+    /// Keccak256 hash (Ethereum-compatible)
+    pub fn keccak256(input: &Self) -> Self {
+        let input_edge = edge_for_root(input.root);
+        let root = insert_node(Node::Keccak256(input_edge));
+        Self {
+            root,
+            reg_name: input.reg_name,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +228,12 @@ fn evaluate_node<F: JoltField>(node: NodeId, env: &Environment<F>) -> F {
         Node::Mul(e1, e2) => evaluate_edge(e1, env) * evaluate_edge(e2, env),
         Node::Sub(e1, e2) => evaluate_edge(e1, env) - evaluate_edge(e2, env),
         Node::Div(e1, e2) => evaluate_edge(e1, env) / evaluate_edge(e2, env),
+        Node::Poseidon2(_, _) | Node::Poseidon4(_, _, _, _) => {
+            unimplemented!("Poseidon evaluation not needed for tests")
+        }
+        Node::Keccak256(_) => {
+            unimplemented!("Keccak256 evaluation not needed for tests")
+        }
     }
 }
 
@@ -249,6 +298,14 @@ fn node_depth(node: Node) -> usize {
         Node::Mul(e1, e2) => 1 + max(edge_depth(e1), edge_depth(e2)),
         Node::Sub(e1, e2) => 1 + max(edge_depth(e1), edge_depth(e2)),
         Node::Div(e1, e2) => 1 + max(edge_depth(e1), edge_depth(e2)),
+        Node::Poseidon2(e1, e2) => 1 + max(edge_depth(e1), edge_depth(e2)),
+        Node::Poseidon4(e1, e2, e3, e4) => {
+            1 + max(
+                max(edge_depth(e1), edge_depth(e2)),
+                max(edge_depth(e3), edge_depth(e4)),
+            )
+        }
+        Node::Keccak256(e) => 1 + edge_depth(e),
     }
 }
 
@@ -326,6 +383,22 @@ fn common_subexpression_elimination(node: Node) -> (Vec<Node>, Node) {
                 let cse_e2 = aux_edge(bindings, nodes, e2);
                 register(bindings, nodes, Node::Div(cse_e1, cse_e2))
             }
+            Node::Poseidon2(e1, e2) => {
+                let cse_e1 = aux_edge(bindings, nodes, e1);
+                let cse_e2 = aux_edge(bindings, nodes, e2);
+                register(bindings, nodes, Node::Poseidon2(cse_e1, cse_e2))
+            }
+            Node::Poseidon4(e1, e2, e3, e4) => {
+                let cse_e1 = aux_edge(bindings, nodes, e1);
+                let cse_e2 = aux_edge(bindings, nodes, e2);
+                let cse_e3 = aux_edge(bindings, nodes, e3);
+                let cse_e4 = aux_edge(bindings, nodes, e4);
+                register(bindings, nodes, Node::Poseidon4(cse_e1, cse_e2, cse_e3, cse_e4))
+            }
+            Node::Keccak256(e) => {
+                let cse_e = aux_edge(bindings, nodes, e);
+                register(bindings, nodes, Node::Keccak256(cse_e))
+            }
         }
     }
 
@@ -393,6 +466,29 @@ fn fmt_node(
             fmt_edge(f, fmt_data, e1, true)?;
             write!(f, " / ")?;
             fmt_edge(f, fmt_data, e2, true)
+        }
+        Node::Poseidon2(e1, e2) => {
+            write!(f, "Poseidon2(")?;
+            fmt_edge(f, fmt_data, e1, false)?;
+            write!(f, ", ")?;
+            fmt_edge(f, fmt_data, e2, false)?;
+            write!(f, ")")
+        }
+        Node::Poseidon4(e1, e2, e3, e4) => {
+            write!(f, "Poseidon4(")?;
+            fmt_edge(f, fmt_data, e1, false)?;
+            write!(f, ", ")?;
+            fmt_edge(f, fmt_data, e2, false)?;
+            write!(f, ", ")?;
+            fmt_edge(f, fmt_data, e3, false)?;
+            write!(f, ", ")?;
+            fmt_edge(f, fmt_data, e4, false)?;
+            write!(f, ")")
+        }
+        Node::Keccak256(e) => {
+            write!(f, "Keccak256(")?;
+            fmt_edge(f, fmt_data, e, false)?;
+            write!(f, ")")
         }
     }
 }

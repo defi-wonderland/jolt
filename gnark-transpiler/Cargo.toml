@@ -14,6 +14,10 @@ zklean-extractor = { path = "../zklean-extractor" }
 # Jolt dependencies
 jolt-core = { path = "../jolt-core" }
 
+# Arkworks (for transcript trait)
+ark-serialize = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout", default-features = false }
+ark-ec = { git = "https://github.com/a16z/arkworks-algebra", branch = "dev/twist-shout", default-features = false }
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

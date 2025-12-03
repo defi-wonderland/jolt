@@ -103,6 +103,31 @@ pub fn generate_gnark_expr(node_id: usize) -> String {
                 edge_to_gnark(right)
             )
         }
+
+        Node::Poseidon2(left, right) => {
+            format!(
+                "poseidon.Poseidon2(api, {}, {})",
+                edge_to_gnark(left),
+                edge_to_gnark(right)
+            )
+        }
+
+        Node::Poseidon4(e1, e2, e3, e4) => {
+            format!(
+                "poseidon.Poseidon4(api, {}, {}, {}, {})",
+                edge_to_gnark(e1),
+                edge_to_gnark(e2),
+                edge_to_gnark(e3),
+                edge_to_gnark(e4)
+            )
+        }
+
+        Node::Keccak256(input) => {
+            format!(
+                "keccak.Keccak256(api, {})",
+                edge_to_gnark(input)
+            )
+        }
     }
 }
 
@@ -150,6 +175,31 @@ fn generate_gnark_expr_with_vars(node_id: usize, vars: &mut BTreeSet<u16>) -> St
                 "api.Div({}, {})",
                 edge_to_gnark_with_vars(left, vars),
                 edge_to_gnark_with_vars(right, vars)
+            )
+        }
+
+        Node::Poseidon2(left, right) => {
+            format!(
+                "poseidon.Poseidon2(api, {}, {})",
+                edge_to_gnark_with_vars(left, vars),
+                edge_to_gnark_with_vars(right, vars)
+            )
+        }
+
+        Node::Poseidon4(e1, e2, e3, e4) => {
+            format!(
+                "poseidon.Poseidon4(api, {}, {}, {}, {})",
+                edge_to_gnark_with_vars(e1, vars),
+                edge_to_gnark_with_vars(e2, vars),
+                edge_to_gnark_with_vars(e3, vars),
+                edge_to_gnark_with_vars(e4, vars)
+            )
+        }
+
+        Node::Keccak256(input) => {
+            format!(
+                "keccak.Keccak256(api, {})",
+                edge_to_gnark_with_vars(input, vars)
             )
         }
     }

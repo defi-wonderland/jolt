@@ -52,6 +52,9 @@ pub enum NodeJson {
     Mul { left: EdgeJson, right: EdgeJson },
     Sub { left: EdgeJson, right: EdgeJson },
     Div { left: EdgeJson, right: EdgeJson },
+    Poseidon2 { left: EdgeJson, right: EdgeJson },
+    Poseidon4 { e1: EdgeJson, e2: EdgeJson, e3: EdgeJson, e4: EdgeJson },
+    Keccak256 { input: EdgeJson },
 }
 
 impl From<Node> for NodeJson {
@@ -79,6 +82,19 @@ impl From<Node> for NodeJson {
             Node::Div(left, right) => NodeJson::Div {
                 left: left.into(),
                 right: right.into(),
+            },
+            Node::Poseidon2(left, right) => NodeJson::Poseidon2 {
+                left: left.into(),
+                right: right.into(),
+            },
+            Node::Poseidon4(e1, e2, e3, e4) => NodeJson::Poseidon4 {
+                e1: e1.into(),
+                e2: e2.into(),
+                e3: e3.into(),
+                e4: e4.into(),
+            },
+            Node::Keccak256(input) => NodeJson::Keccak256 {
+                input: input.into(),
             },
         }
     }
@@ -121,11 +137,24 @@ fn collect_nodes_from_root(root_id: usize, max_id: &mut usize) {
         Node::Add(left, right)
         | Node::Mul(left, right)
         | Node::Sub(left, right)
-        | Node::Div(left, right) => {
+        | Node::Div(left, right)
+        | Node::Poseidon2(left, right) => {
             if let Edge::NodeRef(id) = left {
                 collect_nodes_from_root(id, max_id);
             }
             if let Edge::NodeRef(id) = right {
+                collect_nodes_from_root(id, max_id);
+            }
+        }
+        Node::Poseidon4(e1, e2, e3, e4) => {
+            for edge in [e1, e2, e3, e4] {
+                if let Edge::NodeRef(id) = edge {
+                    collect_nodes_from_root(id, max_id);
+                }
+            }
+        }
+        Node::Keccak256(input) => {
+            if let Edge::NodeRef(id) = input {
                 collect_nodes_from_root(id, max_id);
             }
         }
@@ -207,9 +236,18 @@ fn collect_vars_from_node(node_id: usize, vars: &mut std::collections::BTreeSet<
         Node::Add(left, right)
         | Node::Mul(left, right)
         | Node::Sub(left, right)
-        | Node::Div(left, right) => {
+        | Node::Div(left, right)
+        | Node::Poseidon2(left, right) => {
             collect_vars_from_edge(left, vars);
             collect_vars_from_edge(right, vars);
+        }
+        Node::Poseidon4(e1, e2, e3, e4) => {
+            for edge in [e1, e2, e3, e4] {
+                collect_vars_from_edge(edge, vars);
+            }
+        }
+        Node::Keccak256(input) => {
+            collect_vars_from_edge(input, vars);
         }
     }
 }
@@ -290,7 +328,8 @@ impl Stage1AstJson {
             NodeJson::Add { left, right }
             | NodeJson::Mul { left, right }
             | NodeJson::Sub { left, right }
-            | NodeJson::Div { left, right } => {
+            | NodeJson::Div { left, right }
+            | NodeJson::Poseidon2 { left, right } => {
                 for (i, edge) in [left, right].iter().enumerate() {
                     if let Some(child_id) = self.edge_to_id(edge) {
                         output.push_str(&format!("    N{} --> N{}\n", node_id, child_id));
@@ -306,6 +345,36 @@ impl Stage1AstJson {
                     }
                 }
             }
+            NodeJson::Poseidon4 { e1, e2, e3, e4 } => {
+                for (i, edge) in [e1, e2, e3, e4].iter().enumerate() {
+                    if let Some(child_id) = self.edge_to_id(edge) {
+                        output.push_str(&format!("    N{} --> N{}\n", node_id, child_id));
+                        self.render_node_mermaid(child_id, output, visited);
+                    } else {
+                        let leaf_id = format!("L{}_{}", node_id, i);
+                        output.push_str(&format!(
+                            "    {}[\"{}\"]\n",
+                            leaf_id,
+                            self.edge_to_label(edge)
+                        ));
+                        output.push_str(&format!("    N{} --> {}\n", node_id, leaf_id));
+                    }
+                }
+            }
+            NodeJson::Keccak256 { input } => {
+                if let Some(child_id) = self.edge_to_id(input) {
+                    output.push_str(&format!("    N{} --> N{}\n", node_id, child_id));
+                    self.render_node_mermaid(child_id, output, visited);
+                } else {
+                    let leaf_id = format!("L{}_0", node_id);
+                    output.push_str(&format!(
+                        "    {}[\"{}\"]\n",
+                        leaf_id,
+                        self.edge_to_label(input)
+                    ));
+                    output.push_str(&format!("    N{} --> {}\n", node_id, leaf_id));
+                }
+            }
         }
     }
 
@@ -318,6 +387,9 @@ impl Stage1AstJson {
             NodeJson::Mul { .. } => "×".to_string(),
             NodeJson::Sub { .. } => "-".to_string(),
             NodeJson::Div { .. } => "÷".to_string(),
+            NodeJson::Poseidon2 { .. } => "POSEIDON2".to_string(),
+            NodeJson::Poseidon4 { .. } => "POSEIDON4".to_string(),
+            NodeJson::Keccak256 { .. } => "KECCAK256".to_string(),
         }
     }
 
@@ -341,5 +413,67 @@ impl Stage1AstJson {
             EdgeJson::Atom { .. } => None,
             EdgeJson::NodeRef { node_id } => Some(*node_id),
         }
+    }
+}
+
+/// Export Stage1PoseidonVerificationResult to JSON
+///
+/// This is for Poseidon-based verification results where challenges are derived in-circuit.
+pub fn export_stage1_poseidon_ast(
+    result: &jolt_core::zkvm::stage1_only_verifier::Stage1PoseidonVerificationResult<
+        zklean_extractor::mle_ast::MleAst,
+    >,
+    trace_length: usize,
+) -> Stage1AstJson {
+    use std::collections::BTreeSet;
+
+    // Find the maximum node ID we need
+    let mut max_id = 0usize;
+    collect_nodes_from_root(result.final_claim.root(), &mut max_id);
+    collect_nodes_from_root(result.power_sum_check.root(), &mut max_id);
+    for check in &result.sumcheck_consistency_checks {
+        collect_nodes_from_root(check.root(), &mut max_id);
+    }
+
+    // Export all nodes up to max_id
+    let nodes: Vec<NodeJson> = (0..=max_id).map(|id| get_node(id).into()).collect();
+
+    // Collect variables
+    let mut vars = BTreeSet::new();
+    collect_vars_from_node(result.final_claim.root(), &mut vars);
+    collect_vars_from_node(result.power_sum_check.root(), &mut vars);
+    for check in &result.sumcheck_consistency_checks {
+        collect_vars_from_node(check.root(), &mut vars);
+    }
+
+    // Build constraints
+    let mut constraints = vec![ConstraintJson {
+        name: "power_sum_check".to_string(),
+        description: "Sum over symmetric domain must equal 0".to_string(),
+        root_node_id: result.power_sum_check.root(),
+    }];
+
+    for (i, check) in result.sumcheck_consistency_checks.iter().enumerate() {
+        constraints.push(ConstraintJson {
+            name: format!("consistency_check_{}", i),
+            description: format!("Sumcheck round {}: poly(0) + poly(1) - claim == 0", i),
+            root_node_id: check.root(),
+        });
+    }
+
+    constraints.push(ConstraintJson {
+        name: "final_claim".to_string(),
+        description: "Final claim must match expected value".to_string(),
+        root_node_id: result.final_claim.root(),
+    });
+
+    let num_rounds = (trace_length as f64).log2() as usize;
+
+    Stage1AstJson {
+        nodes,
+        constraints,
+        variables: vars.into_iter().collect(),
+        trace_length,
+        num_rounds,
     }
 }

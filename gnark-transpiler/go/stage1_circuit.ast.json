@@ -92,31 +92,151 @@
       }
     },
     {
-      "op": "Atom",
-      "atom": {
-        "type": "Var",
-        "index": 13
+      "op": "Poseidon2",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
       }
     },
     {
-      "op": "Atom",
-      "atom": {
-        "type": "Var",
-        "index": 14
+      "op": "Poseidon2",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 13
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
       }
     },
     {
-      "op": "Atom",
-      "atom": {
-        "type": "Var",
-        "index": 15
+      "op": "Poseidon4",
+      "e1": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "e2": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "e3": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 14
       }
     },
     {
-      "op": "Atom",
-      "atom": {
-        "type": "Var",
-        "index": 16
+      "op": "Poseidon4",
+      "e1": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "e2": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "e3": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 14
+      }
+    },
+    {
+      "op": "Poseidon2",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 16
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 15
+      }
+    },
+    {
+      "op": "Poseidon4",
+      "e1": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "e2": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "e3": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 14
+      }
+    },
+    {
+      "op": "Poseidon2",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 15
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 17
+      }
+    },
+    {
+      "op": "Poseidon2",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 18
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 19
       }
     },
     {
@@ -139,7 +259,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 7
+          "index": 0
         }
       },
       "right": {
@@ -161,7 +281,7 @@
       },
       "right": {
         "type": "NodeRef",
-        "node_id": 19
+        "node_id": 23
       }
     },
     {
@@ -177,7 +297,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 8
+          "index": 1
         }
       },
       "right": {
@@ -192,11 +312,11 @@
       "op": "Add",
       "left": {
         "type": "NodeRef",
-        "node_id": 20
+        "node_id": 24
       },
       "right": {
         "type": "NodeRef",
-        "node_id": 22
+        "node_id": 26
       }
     },
     {
@@ -212,7 +332,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 9
+          "index": 2
         }
       },
       "right": {
@@ -227,11 +347,11 @@
       "op": "Add",
       "left": {
         "type": "NodeRef",
-        "node_id": 23
+        "node_id": 27
       },
       "right": {
         "type": "NodeRef",
-        "node_id": 25
+        "node_id": 29
       }
     },
     {
@@ -247,7 +367,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 10
+          "index": 3
         }
       },
       "right": {
@@ -262,69 +382,7 @@
       "op": "Add",
       "left": {
         "type": "NodeRef",
-        "node_id": 26
-      },
-      "right": {
-        "type": "NodeRef",
-        "node_id": 28
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 8
-        }
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 6
-        }
-      }
-    },
-    {
-      "op": "Add",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 7
-        }
-      },
-      "right": {
-        "type": "NodeRef",
         "node_id": 30
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 6
-        }
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 6
-        }
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 9
-        }
       },
       "right": {
         "type": "NodeRef",
@@ -332,49 +390,52 @@
       }
     },
     {
-      "op": "Add",
-      "left": {
-        "type": "NodeRef",
-        "node_id": 31
-      },
-      "right": {
-        "type": "NodeRef",
-        "node_id": 33
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "NodeRef",
-        "node_id": 32
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 6
-        }
-      }
-    },
-    {
       "op": "Mul",
       "left": {
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 10
+          "index": 1
         }
       },
       "right": {
         "type": "NodeRef",
-        "node_id": 35
+        "node_id": 20
       }
     },
     {
       "op": "Add",
       "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 0
+        }
+      },
+      "right": {
         "type": "NodeRef",
         "node_id": 34
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 20
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 20
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 2
+        }
       },
       "right": {
         "type": "NodeRef",
@@ -382,145 +443,10 @@
       }
     },
     {
-      "op": "Mul",
+      "op": "Add",
       "left": {
         "type": "NodeRef",
         "node_id": 35
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 6
-        }
-      }
-    },
-    {
-      "op": "Atom",
-      "atom": {
-        "type": "Scalar",
-        "value": 0
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 12
-        }
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Scalar",
-          "value": 0
-        }
-      }
-    },
-    {
-      "op": "Add",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 11
-        }
-      },
-      "right": {
-        "type": "NodeRef",
-        "node_id": 40
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Scalar",
-          "value": 0
-        }
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Scalar",
-          "value": 0
-        }
-      }
-    },
-    {
-      "op": "Atom",
-      "atom": {
-        "type": "Scalar",
-        "value": 1
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 12
-        }
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Scalar",
-          "value": 1
-        }
-      }
-    },
-    {
-      "op": "Add",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 11
-        }
-      },
-      "right": {
-        "type": "NodeRef",
-        "node_id": 44
-      }
-    },
-    {
-      "op": "Mul",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Scalar",
-          "value": 1
-        }
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Scalar",
-          "value": 1
-        }
-      }
-    },
-    {
-      "op": "Add",
-      "left": {
-        "type": "NodeRef",
-        "node_id": 41
-      },
-      "right": {
-        "type": "NodeRef",
-        "node_id": 45
-      }
-    },
-    {
-      "op": "Sub",
-      "left": {
-        "type": "NodeRef",
-        "node_id": 47
       },
       "right": {
         "type": "NodeRef",
@@ -530,32 +456,12 @@
     {
       "op": "Mul",
       "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 12
-        }
-      },
-      "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 3
-        }
-      }
-    },
-    {
-      "op": "Add",
-      "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 11
-        }
+        "type": "NodeRef",
+        "node_id": 36
       },
       "right": {
         "type": "NodeRef",
-        "node_id": 49
+        "node_id": 20
       }
     },
     {
@@ -568,11 +474,204 @@
         }
       },
       "right": {
+        "type": "NodeRef",
+        "node_id": 39
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 38
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 40
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 39
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 20
+      }
+    },
+    {
+      "op": "Poseidon4",
+      "e1": {
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 3
+          "index": 10
         }
+      },
+      "e2": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "e3": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 14
+      }
+    },
+    {
+      "op": "Poseidon4",
+      "e1": {
+        "type": "NodeRef",
+        "node_id": 43
+      },
+      "e2": {
+        "type": "NodeRef",
+        "node_id": 15
+      },
+      "e3": {
+        "type": "NodeRef",
+        "node_id": 17
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 20
+      }
+    },
+    {
+      "op": "Poseidon4",
+      "e1": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "e2": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "e3": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 14
+      }
+    },
+    {
+      "op": "Poseidon4",
+      "e1": {
+        "type": "NodeRef",
+        "node_id": 45
+      },
+      "e2": {
+        "type": "NodeRef",
+        "node_id": 15
+      },
+      "e3": {
+        "type": "NodeRef",
+        "node_id": 17
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 20
+      }
+    },
+    {
+      "op": "Poseidon2",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 46
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 44
+      }
+    },
+    {
+      "op": "Poseidon4",
+      "e1": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 10
+        }
+      },
+      "e2": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 11
+        }
+      },
+      "e3": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 12
+        }
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 14
+      }
+    },
+    {
+      "op": "Poseidon4",
+      "e1": {
+        "type": "NodeRef",
+        "node_id": 48
+      },
+      "e2": {
+        "type": "NodeRef",
+        "node_id": 15
+      },
+      "e3": {
+        "type": "NodeRef",
+        "node_id": 17
+      },
+      "e4": {
+        "type": "NodeRef",
+        "node_id": 20
+      }
+    },
+    {
+      "op": "Poseidon2",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 44
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 47
+      }
+    },
+    {
+      "op": "Poseidon2",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 49
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 50
       }
     },
     {
@@ -588,7 +687,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 14
+          "index": 5
         }
       },
       "right": {
@@ -605,7 +704,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 13
+          "index": 4
         }
       },
       "right": {
@@ -643,7 +742,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 14
+          "index": 5
         }
       },
       "right": {
@@ -660,7 +759,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 13
+          "index": 4
         }
       },
       "right": {
@@ -704,7 +803,7 @@
       },
       "right": {
         "type": "NodeRef",
-        "node_id": 50
+        "node_id": 41
       }
     },
     {
@@ -713,15 +812,12 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 14
+          "index": 5
         }
       },
       "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 4
-        }
+        "type": "NodeRef",
+        "node_id": 44
       }
     },
     {
@@ -730,7 +826,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 13
+          "index": 4
         }
       },
       "right": {
@@ -741,18 +837,12 @@
     {
       "op": "Mul",
       "left": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 4
-        }
+        "type": "NodeRef",
+        "node_id": 44
       },
       "right": {
-        "type": "Atom",
-        "atom": {
-          "type": "Var",
-          "index": 4
-        }
+        "type": "NodeRef",
+        "node_id": 44
       }
     },
     {
@@ -768,7 +858,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 16
+          "index": 7
         }
       },
       "right": {
@@ -785,7 +875,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 15
+          "index": 6
         }
       },
       "right": {
@@ -823,7 +913,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 16
+          "index": 7
         }
       },
       "right": {
@@ -840,7 +930,7 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 15
+          "index": 6
         }
       },
       "right": {
@@ -893,14 +983,60 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 16
+          "index": 7
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 47
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 6
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 75
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 47
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 47
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 0
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 9
         }
       },
       "right": {
         "type": "Atom",
         "atom": {
-          "type": "Var",
-          "index": 5
+          "type": "Scalar",
+          "value": 0
         }
       }
     },
@@ -910,12 +1046,134 @@
         "type": "Atom",
         "atom": {
           "type": "Var",
-          "index": 15
+          "index": 8
         }
       },
       "right": {
         "type": "NodeRef",
-        "node_id": 75
+        "node_id": 79
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 0
+        }
+      }
+    },
+    {
+      "op": "Atom",
+      "atom": {
+        "type": "Scalar",
+        "value": 1
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 9
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 8
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 83
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      },
+      "right": {
+        "type": "Atom",
+        "atom": {
+          "type": "Scalar",
+          "value": 1
+        }
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 80
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 84
+      }
+    },
+    {
+      "op": "Sub",
+      "left": {
+        "type": "NodeRef",
+        "node_id": 86
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 76
+      }
+    },
+    {
+      "op": "Mul",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 9
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 51
+      }
+    },
+    {
+      "op": "Add",
+      "left": {
+        "type": "Atom",
+        "atom": {
+          "type": "Var",
+          "index": 8
+        }
+      },
+      "right": {
+        "type": "NodeRef",
+        "node_id": 88
       }
     }
   ],
@@ -923,30 +1181,33 @@
     {
       "name": "power_sum_check",
       "description": "Sum over symmetric domain must equal 0",
-      "root_node_id": 29
+      "root_node_id": 33
     },
     {
       "name": "consistency_check_0",
       "description": "Sumcheck round 0: poly(0) + poly(1) - claim == 0",
-      "root_node_id": 48
+      "root_node_id": 61
     },
     {
       "name": "consistency_check_1",
       "description": "Sumcheck round 1: poly(0) + poly(1) - claim == 0",
-      "root_node_id": 61
+      "root_node_id": 74
     },
     {
       "name": "consistency_check_2",
       "description": "Sumcheck round 2: poly(0) + poly(1) - claim == 0",
-      "root_node_id": 74
+      "root_node_id": 87
     },
     {
       "name": "final_claim",
       "description": "Final claim must match expected value",
-      "root_node_id": 76
+      "root_node_id": 89
     }
   ],
   "variables": [
+    0,
+    1,
+    2,
     3,
     4,
     5,
@@ -956,11 +1217,7 @@
     9,
     10,
     11,
-    12,
-    13,
-    14,
-    15,
-    16
+    12
   ],
   "trace_length": 8,
   "num_rounds": 3

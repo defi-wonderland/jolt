@@ -208,6 +208,25 @@ pub struct Stage1OnlyVerifier<F: JoltField, ProofTranscript: Transcript> {
 }
 
 impl<F: JoltField, ProofTranscript: Transcript> Stage1OnlyVerifier<F, ProofTranscript> {
+    /// Create a verifier for transpilation (symbolic execution)
+    ///
+    /// This constructor skips Fiat-Shamir preamble and commitment handling,
+    /// making it suitable for use with MleAst where we just want to build the AST.
+    pub fn new_for_transpilation(
+        preprocessing: Stage1OnlyPreprocessing<F>,
+        proof: Stage1OnlyProof<F, ProofTranscript>,
+        transcript: ProofTranscript,
+    ) -> Self {
+        let opening_accumulator = VerifierOpeningAccumulator::new(proof.trace_length.log_2());
+
+        Self {
+            proof,
+            preprocessing,
+            transcript,
+            opening_accumulator,
+        }
+    }
+
     /// Create a new Stage 1 only verifier
     ///
     /// # Arguments
@@ -665,4 +684,134 @@ fn evaluate_polynomial<F: JoltField>(coeffs: &[F], x: &F) -> F {
     }
 
     result
+}
+
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// POSEIDON-BASED VERIFIER (with in-circuit challenge derivation)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+
+/// Transcript protocol trait for Poseidon-based Fiat-Shamir
+///
+/// This trait abstracts transcript operations to support both concrete fields
+/// and symbolic execution (MleAst) for transpilation.
+pub trait PoseidonTranscriptProtocol {
+    type Challenge: JoltField;
+
+    /// Append a field element to the transcript
+    fn append_field(&mut self, element: Self::Challenge);
+
+    /// Derive a challenge from current transcript state
+    fn challenge(&mut self) -> Self::Challenge;
+}
+
+/// Verification data for Poseidon-based Stage 1 verification
+///
+/// Unlike `Stage1VerificationData`, this does NOT include pre-computed challenges.
+/// Challenges are derived from Poseidon transcript during verification.
+#[derive(Clone)]
+pub struct Stage1PoseidonVerificationData<F: JoltField> {
+    /// Coefficients of univariate-skip polynomial
+    pub uni_skip_poly_coeffs: Vec<F>,
+
+    /// Sumcheck round polynomials (flattened)
+    pub sumcheck_round_polys: Vec<Vec<F>>,
+
+    /// Number of sumcheck rounds
+    pub num_rounds: usize,
+}
+
+/// Result of Poseidon-based Stage 1 verification
+pub struct Stage1PoseidonVerificationResult<F: JoltField> {
+    /// Final claim after all rounds
+    pub final_claim: F,
+
+    /// Power sum check (must equal 0)
+    pub power_sum_check: F,
+
+    /// Consistency checks for each round (all must equal 0)
+    pub sumcheck_consistency_checks: Vec<F>,
+
+    /// Derived challenges (for debugging)
+    pub derived_tau: Vec<F>,
+    pub derived_r0: F,
+    pub derived_sumcheck_challenges: Vec<F>,
+}
+
+/// Stage 1 verifier with Poseidon transcript for challenge derivation
+///
+/// This version derives all challenges from a Poseidon-based Fiat-Shamir transcript,
+/// making it suitable for full in-circuit verification with Gnark.
+///
+/// ## Usage for Transpilation
+///
+/// ```rust,ignore
+/// use zklean_extractor::mle_ast::MleAst;
+/// use gnark_transpiler::poseidon::PoseidonTranscript;
+///
+/// // Create transcript
+/// let mut transcript = PoseidonTranscript::new();
+///
+/// // Absorb commitments from proof
+/// transcript.append_field(commitment_az);
+/// transcript.append_field(commitment_bz);
+/// transcript.append_field(commitment_cz);
+///
+/// // Create verification data
+/// let data = Stage1PoseidonVerificationData {
+///     uni_skip_poly_coeffs: vec![MleAst::var(0), ...],
+///     sumcheck_round_polys: vec![vec![MleAst::var(4), ...]],
+///     num_rounds: 3,
+/// };
+///
+/// // Run verification - challenges derived via Poseidon hashing
+/// let result = verify_stage1_with_poseidon(data, &mut transcript);
+/// ```
+pub fn verify_stage1_with_poseidon<F, T>(
+    data: Stage1PoseidonVerificationData<F>,
+    transcript: &mut T,
+) -> Stage1PoseidonVerificationResult<F>
+where
+    F: JoltField + Clone,
+    T: PoseidonTranscriptProtocol<Challenge = F>,
+{
+    let num_rounds = data.num_rounds;
+
+    // Derive tau challenges from transcript
+    let mut derived_tau = Vec::with_capacity(num_rounds);
+    for _ in 0..num_rounds {
+        derived_tau.push(transcript.challenge());
+    }
+
+    // Derive r0 from transcript
+    let derived_r0 = transcript.challenge();
+
+    // Step 1: Verify univariate-skip first round
+    let (claim_after_first, power_sum_check) = verify_uni_skip_first_round(
+        &data.uni_skip_poly_coeffs,
+        &derived_r0,
+    );
+
+    // Derive sumcheck challenges from transcript
+    let mut derived_sumcheck_challenges = Vec::with_capacity(num_rounds);
+    for _ in 0..num_rounds {
+        derived_sumcheck_challenges.push(transcript.challenge());
+    }
+
+    // Step 2: Verify remaining sumcheck rounds
+    let (final_claim, sumcheck_consistency_checks) = verify_sumcheck_rounds(
+        claim_after_first,
+        &derived_sumcheck_challenges,
+        &data.sumcheck_round_polys,
+    );
+
+    Stage1PoseidonVerificationResult {
+        final_claim,
+        power_sum_check,
+        sumcheck_consistency_checks,
+        derived_tau,
+        derived_r0,
+        derived_sumcheck_challenges,
+    }
 }

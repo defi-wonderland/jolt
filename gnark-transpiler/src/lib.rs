@@ -37,8 +37,12 @@
 
 pub mod ast_json;
 pub mod codegen;
+pub mod keccak_transcript;
+pub mod poseidon;
 pub mod witness;
 
-pub use ast_json::{export_stage1_ast, Stage1AstJson};
+pub use ast_json::{export_stage1_ast, export_stage1_poseidon_ast, Stage1AstJson};
 pub use codegen::{generate_circuit, generate_gnark_expr, generate_stage1_circuit};
+pub use keccak_transcript::KeccakMleTranscript;
+pub use poseidon::{PoseidonHash, PoseidonTranscript};
 pub use witness::Stage1Witness;
