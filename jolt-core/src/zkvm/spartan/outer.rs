@@ -292,14 +292,16 @@ impl<F: JoltField> OuterUniSkipVerifier<F> {
     }
 }
 
-impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for OuterUniSkipVerifier<F> {
+impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> SumcheckInstanceVerifier<F, T, A>
+    for OuterUniSkipVerifier<F>
+{
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
     }
 
     fn expected_output_claim(
         &self,
-        _accumulator: &VerifierOpeningAccumulator<F>,
+        _accumulator: &A,
         _sumcheck_challenges: &[<F as JoltField>::Challenge],
     ) -> F {
         unimplemented!("Unused for univariate skip")
@@ -307,7 +309,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for OuterUniSki
 
     fn cache_openings(
         &self,
-        accumulator: &mut VerifierOpeningAccumulator<F>,
+        accumulator: &mut A,
         transcript: &mut T,
         sumcheck_challenges: &[<F as JoltField>::Challenge],
     ) {
@@ -385,11 +387,11 @@ pub struct OuterRemainingSumcheckVerifier<F: JoltField> {
 }
 
 impl<F: JoltField> OuterRemainingSumcheckVerifier<F> {
-    pub fn new(
+    pub fn new<A: OpeningAccumulator<F>>(
         key: UniformSpartanKey<F>,
         trace_len: usize,
         uni_skip_params: OuterUniSkipParams<F>,
-        opening_accumulator: &VerifierOpeningAccumulator<F>,
+        opening_accumulator: &A,
     ) -> Self {
         let params =
             OuterRemainingSumcheckParams::new(trace_len, uni_skip_params, opening_accumulator);
@@ -397,7 +399,7 @@ impl<F: JoltField> OuterRemainingSumcheckVerifier<F> {
     }
 }
 
-impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
+impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> SumcheckInstanceVerifier<F, T, A>
     for OuterRemainingSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
@@ -406,7 +408,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
 
     fn expected_output_claim(
         &self,
-        accumulator: &VerifierOpeningAccumulator<F>,
+        accumulator: &A,
         sumcheck_challenges: &[F::Challenge],
     ) -> F {
         let r1cs_input_evals = ALL_R1CS_INPUTS.map(|input| {
@@ -437,7 +439,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
 
     fn cache_openings(
         &self,
-        accumulator: &mut VerifierOpeningAccumulator<F>,
+        accumulator: &mut A,
         transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
