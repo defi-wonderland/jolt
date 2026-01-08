@@ -75,6 +75,7 @@ members = [
     "examples/hash-bench/guest",
     "zklean-extractor",
     "z3-verifier",
+    "gnark-transpiler",
 ]
 
 [features]
