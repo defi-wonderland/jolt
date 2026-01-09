@@ -415,7 +415,7 @@ fn generate_simple_circuit(root: usize, name: &str, bindings: &str, expr: &str) 
     output.push_str("import (\n");
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     if bindings.contains("poseidon.Hash") || expr.contains("poseidon.Hash") {
-        output.push_str("\t\"github.com/vocdoni/gnark-crypto-primitives/poseidon\"\n");
+        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
     }
     output.push_str(")\n\n");
 

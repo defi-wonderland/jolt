@@ -24,6 +24,8 @@ pub struct MemoizedCodeGen {
     cse_counter: usize,
     /// Collected input variable indices
     vars: BTreeSet<u16>,
+    /// Maps variable index to input name (e.g., 0 -> "UniSkipCoeff0")
+    var_names: HashMap<u16, String>,
 }
 
 impl MemoizedCodeGen {
@@ -34,6 +36,19 @@ impl MemoizedCodeGen {
             bindings: Vec::new(),
             cse_counter: 0,
             vars: BTreeSet::new(),
+            var_names: HashMap::new(),
+        }
+    }
+
+    /// Create a new MemoizedCodeGen with custom variable names
+    pub fn with_var_names(var_names: HashMap<u16, String>) -> Self {
+        Self {
+            ref_counts: HashMap::new(),
+            generated: HashMap::new(),
+            bindings: Vec::new(),
+            cse_counter: 0,
+            vars: BTreeSet::new(),
+            var_names,
         }
     }
 
@@ -97,7 +112,12 @@ impl MemoizedCodeGen {
             Atom::Scalar(value) => format!("{}", value),
             Atom::Var(index) => {
                 self.vars.insert(index);
-                format!("circuit.X_{}", index)
+                // Use custom variable name if available, otherwise fall back to X_{index}
+                if let Some(name) = self.var_names.get(&index) {
+                    format!("circuit.{}", sanitize_go_name(name))
+                } else {
+                    format!("circuit.X_{}", index)
+                }
             }
             Atom::NamedVar(index) => format!("cse_{}", index),
         }
@@ -214,7 +234,7 @@ pub fn generate_stage1_circuit_memoized(
     output.push_str("import (\n");
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     if bindings_code.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"github.com/vocdoni/gnark-crypto-primitives/poseidon\"\n");
+        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
     }
     output.push_str(")\n\n");
 
@@ -277,7 +297,14 @@ pub fn generate_circuit_from_bundle(
 ) -> String {
     use zklean_extractor::mle_ast::{Assertion, InputKind};
 
-    let mut codegen = MemoizedCodeGen::new();
+    // Build var_names mapping from bundle inputs
+    let var_names: HashMap<u16, String> = bundle
+        .inputs
+        .iter()
+        .map(|input| (input.index, input.name.clone()))
+        .collect();
+
+    let mut codegen = MemoizedCodeGen::with_var_names(var_names);
 
     // First pass: count references to all constraint roots
     for constraint in &bundle.constraints {
@@ -309,7 +336,7 @@ pub fn generate_circuit_from_bundle(
     if bindings_code.contains("poseidon.Hash")
         || constraint_exprs.iter().any(|(_, e, _)| e.contains("poseidon.Hash"))
     {
-        output.push_str("\t\"github.com/vocdoni/gnark-crypto-primitives/poseidon\"\n");
+        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
     }
     output.push_str(")\n\n");
 
@@ -935,7 +962,7 @@ pub fn generate_stage1_circuit_with_cse(
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     // Check if we use Poseidon
     if all_bindings.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"github.com/vocdoni/gnark-crypto-primitives/poseidon\"\n");
+        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
     }
     output.push_str(")\n\n");
 
@@ -1058,7 +1085,7 @@ pub fn generate_stage1_circuit_with_global_cse(
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     // Check if we use Poseidon
     if bindings_code.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"github.com/vocdoni/gnark-crypto-primitives/poseidon\"\n");
+        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
     }
     output.push_str(")\n\n");
 

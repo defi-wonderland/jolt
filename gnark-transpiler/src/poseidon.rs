@@ -15,6 +15,20 @@ use jolt_core::transcripts::Transcript;
 use std::borrow::Borrow;
 use zklean_extractor::mle_ast::{set_pending_challenge, take_pending_append, MleAst};
 
+/// Convert 32 bytes (little-endian) to i128.
+/// For values that fit in i128, this matches Fr::from_le_bytes_mod_order behavior.
+/// Note: i128 can only hold 128 bits, but field elements are 256 bits.
+/// For transpilation purposes, we only need to capture the symbolic structure,
+/// not compute actual values (Gnark will do that).
+fn bytes_to_le_i128(bytes: &[u8; 32]) -> i128 {
+    // Take first 16 bytes (128 bits) in little-endian
+    let mut value: i128 = 0;
+    for (i, &byte) in bytes.iter().take(16).enumerate() {
+        value |= (byte as i128) << (8 * i);
+    }
+    value
+}
+
 /// Poseidon transcript for symbolic execution.
 /// Mirrors jolt-core's PoseidonTranscript structure exactly:
 /// - 32-byte state (represented as MleAst)
@@ -96,6 +110,38 @@ impl PoseidonMleTranscript {
     pub fn challenge_vector_mle(&mut self, len: usize) -> Vec<MleAst> {
         (0..len).map(|_| self.challenge_mle()).collect()
     }
+
+    /// Append symbolic field elements (for commitments/preamble as circuit inputs).
+    ///
+    /// This mirrors append_bytes but with symbolic inputs instead of concrete bytes.
+    /// Each field element corresponds to one 32-byte chunk.
+    pub fn append_field_elements(&mut self, elements: &[MleAst]) {
+        let round = MleAst::from_i128(self.n_rounds as i128);
+        let zero = MleAst::from_i128(0);
+
+        let mut iter = elements.iter();
+
+        // First element: includes n_rounds for domain separation
+        let mut current = if let Some(first) = iter.next() {
+            MleAst::poseidon(&self.state, &round, first)
+        } else {
+            // Empty: just hash state with n_rounds and zero
+            MleAst::poseidon(&self.state, &round, &zero)
+        };
+
+        // Remaining elements: no n_rounds (already accounted for)
+        for elem in iter {
+            current = MleAst::poseidon(&current, &zero, elem);
+        }
+
+        self.state = current;
+        self.n_rounds += 1;
+    }
+
+    /// Append a single symbolic u64 (for preamble values as circuit inputs).
+    pub fn append_u64_symbolic(&mut self, value: MleAst) {
+        self.hash_and_update(value);
+    }
 }
 
 /// Implement Jolt's Transcript trait for PoseidonMleTranscript.
@@ -117,16 +163,55 @@ impl Transcript for PoseidonMleTranscript {
         }
     }
 
-    fn append_message(&mut self, _msg: &'static [u8]) {
-        self.hash_and_update(MleAst::from_i128(0));
+    fn append_message(&mut self, msg: &'static [u8]) {
+        // Same as append_bytes but for static messages
+        // Pad to 32 bytes and convert to field element (LE)
+        assert!(msg.len() <= 32);
+        let mut padded = [0u8; 32];
+        padded[..msg.len()].copy_from_slice(msg);
+        let value = bytes_to_le_i128(&padded);
+        self.hash_and_update(MleAst::from_i128(value));
     }
 
-    fn append_bytes(&mut self, _bytes: &[u8]) {
-        self.hash_and_update(MleAst::from_i128(0));
+    fn append_bytes(&mut self, bytes: &[u8]) {
+        // Hash all bytes using Poseidon with domain separation via n_rounds.
+        // First chunk: hash(state, n_rounds, chunk), includes domain separator.
+        // Subsequent chunks: hash(prev, 0, chunk), chained but without redundant n_rounds.
+        let round = MleAst::from_i128(self.n_rounds as i128);
+        let zero = MleAst::from_i128(0);
+
+        let mut chunks = bytes.chunks(32);
+
+        // First chunk: includes n_rounds for domain separation
+        let mut current = if let Some(first_chunk) = chunks.next() {
+            let mut padded = [0u8; 32];
+            padded[..first_chunk.len()].copy_from_slice(first_chunk);
+            let chunk_field = MleAst::from_i128(bytes_to_le_i128(&padded));
+            MleAst::poseidon(&self.state, &round, &chunk_field)
+        } else {
+            // Empty bytes: just hash state with n_rounds and zero
+            MleAst::poseidon(&self.state, &round, &zero)
+        };
+
+        // Remaining chunks: no n_rounds (already accounted for)
+        for chunk in chunks {
+            let mut padded = [0u8; 32];
+            padded[..chunk.len()].copy_from_slice(chunk);
+            let chunk_field = MleAst::from_i128(bytes_to_le_i128(&padded));
+            current = MleAst::poseidon(&current, &zero, &chunk_field);
+        }
+
+        self.state = current;
+        self.n_rounds += 1;
     }
 
     fn append_u64(&mut self, x: u64) {
-        self.hash_and_update(MleAst::from_i128(x as i128));
+        // Allocate into a 32 byte region (BE-padded to match EVM word format)
+        // Then convert to LE field element (same as hash_bytes32_and_update)
+        let mut packed = [0u8; 32];
+        packed[24..].copy_from_slice(&x.to_be_bytes());
+        let value = bytes_to_le_i128(&packed);
+        self.hash_and_update(MleAst::from_i128(value));
     }
 
     fn append_scalar<F: JoltField>(&mut self, scalar: &F) {

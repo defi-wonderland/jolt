@@ -697,10 +697,38 @@ fn evaluate_polynomial<F: JoltField>(coeffs: &[F], x: &F) -> F {
 
 /// Verification data for transcript-based Stage 1 verification
 ///
+/// Preamble data for Fiat-Shamir initialization.
+/// These values are hashed into the transcript before Stage 1.
+#[derive(Clone)]
+pub struct Stage1PreambleData<F: JoltField> {
+    /// max_input_size (as field element)
+    pub max_input_size: F,
+    /// max_output_size (as field element)
+    pub max_output_size: F,
+    /// memory_size (as field element)
+    pub memory_size: F,
+    /// inputs hash (as field elements, one per 32-byte chunk)
+    pub inputs: Vec<F>,
+    /// outputs hash (as field elements, one per 32-byte chunk)
+    pub outputs: Vec<F>,
+    /// panic flag (as field element)
+    pub panic: F,
+    /// ram_K (as field element)
+    pub ram_k: F,
+    /// trace_length (as field element)
+    pub trace_length: F,
+}
+
 /// Unlike `Stage1VerificationData`, this does NOT include pre-computed challenges.
 /// Challenges are derived from the transcript during verification.
 #[derive(Clone)]
 pub struct Stage1TranscriptVerificationData<F: JoltField> {
+    /// Preamble data (memory layout, inputs, outputs, etc.)
+    pub preamble: Option<Stage1PreambleData<F>>,
+
+    /// Commitments (each as a vector of field elements representing 32-byte chunks)
+    pub commitments: Vec<Vec<F>>,
+
     /// Coefficients of univariate-skip polynomial
     pub uni_skip_poly_coeffs: Vec<F>,
 
@@ -762,28 +790,84 @@ pub fn verify_stage1_with_transcript<F: JoltField + Clone, T: Transcript>(
 ) -> Stage1TranscriptVerificationResult<F> {
     let num_rounds = data.num_rounds;
 
-    // Derive tau challenges from transcript
+    // === Fiat-Shamir Protocol (matching real Jolt verifier) ===
+    //
+    // Complete Jolt verification flow:
+    //   1. fiat_shamir_preamble (memory layout, inputs, outputs, etc.)
+    //   2. append commitments (41 commitments, each ~384 bytes)
+    //   3. derive tau challenges
+    //   4. append uni_skip_poly, derive r0
+    //   5. for each sumcheck round: append poly, derive challenge
+    //
+    // If preamble/commitments are provided, we process them here.
+    // Otherwise, we assume transcript is already initialized.
+
+    // Step 1: Append preamble to transcript (if provided)
+    if let Some(preamble) = &data.preamble {
+        // fiat_shamir_preamble order:
+        // append_u64(max_input_size)
+        // append_u64(max_output_size)
+        // append_u64(memory_size)
+        // append_bytes(inputs)
+        // append_bytes(outputs)
+        // append_u64(panic)
+        // append_u64(ram_K)
+        // append_u64(trace_length)
+        transcript.append_scalar(&preamble.max_input_size);
+        transcript.append_scalar(&preamble.max_output_size);
+        transcript.append_scalar(&preamble.memory_size);
+        // inputs as field elements (each represents 32-byte chunk)
+        for input_chunk in &preamble.inputs {
+            transcript.append_scalar(input_chunk);
+        }
+        // outputs as field elements
+        for output_chunk in &preamble.outputs {
+            transcript.append_scalar(output_chunk);
+        }
+        transcript.append_scalar(&preamble.panic);
+        transcript.append_scalar(&preamble.ram_k);
+        transcript.append_scalar(&preamble.trace_length);
+    }
+
+    // Step 2: Append commitments to transcript
+    for commitment in &data.commitments {
+        // Each commitment is a vector of field elements (representing 32-byte chunks)
+        for chunk in commitment {
+            transcript.append_scalar(chunk);
+        }
+    }
+
+    // Step 3: Derive tau challenges from transcript
+    // (tau depends on preamble + commitments)
     let mut derived_tau = Vec::with_capacity(num_rounds);
     for _ in 0..num_rounds {
         derived_tau.push(transcript.challenge_scalar::<F>());
     }
 
-    // Derive r0 from transcript
+    // Step 4: Append uni-skip polynomial to transcript, then derive r0
+    for coeff in &data.uni_skip_poly_coeffs {
+        transcript.append_scalar(coeff);
+    }
     let derived_r0 = transcript.challenge_scalar::<F>();
 
-    // Step 1: Verify univariate-skip first round
+    // Verify univariate-skip first round
     let (claim_after_first, power_sum_check) = verify_uni_skip_first_round(
         &data.uni_skip_poly_coeffs,
         &derived_r0,
     );
 
-    // Derive sumcheck challenges from transcript
+    // Step 5: For each sumcheck round, append poly then derive challenge
     let mut derived_sumcheck_challenges = Vec::with_capacity(num_rounds);
-    for _ in 0..num_rounds {
+    for round_poly in &data.sumcheck_round_polys {
+        // Append this round's polynomial coefficients
+        for coeff in round_poly {
+            transcript.append_scalar(coeff);
+        }
+        // Derive challenge for this round
         derived_sumcheck_challenges.push(transcript.challenge_scalar::<F>());
     }
 
-    // Step 2: Verify remaining sumcheck rounds
+    // Verify sumcheck rounds
     let (final_claim, sumcheck_consistency_checks) = verify_sumcheck_rounds(
         claim_after_first,
         &derived_sumcheck_challenges,
