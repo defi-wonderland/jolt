@@ -48,5 +48,5 @@ pub use codegen::{
     generate_stage1_circuit_with_global_cse, MemoizedCodeGen,
 };
 pub use keccak::KeccakMleTranscript;
-pub use poseidon::PoseidonMleTranscript;
+pub use poseidon::PoseidonAstTranscript;
 pub use witness::Stage1Witness;

@@ -7,10 +7,14 @@
 use ark_bn254::Fr;
 use ark_serialize::CanonicalSerialize;
 use common::jolt_device::JoltDevice;
+use jolt_core::poly::opening_proof::{OpeningId, SumcheckId};
 use jolt_core::transcripts::{FrParams, PoseidonTranscript, Transcript};
-use jolt_core::zkvm::stage1_only_verifier::{
-    verify_stage1_with_transcript, Stage1PreambleData, Stage1TranscriptVerificationData,
+use jolt_core::zkvm::r1cs::inputs::ALL_R1CS_INPUTS;
+use jolt_core::zkvm::r1cs::inputs::NUM_R1CS_INPUTS;
+use jolt_core::zkvm::stepwise_verifier::{
+    verify_stage1_full, PreambleData as StepwisePreambleData, Stage1FullVerificationData,
 };
+use jolt_core::zkvm::witness::VirtualPolynomial;
 use jolt_core::zkvm::RV64IMACProof;
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +50,9 @@ pub struct Stage1ExtractedData {
     pub num_commitments: usize,
     /// Expected final claim (computed by running real verifier)
     pub expected_final_claim: String,
+    /// R1CS input evaluations at the final sumcheck point (36 elements)
+    /// These are needed for computing the R1CS constraint check.
+    pub r1cs_input_evals: Vec<String>,
 }
 
 fn main() {
@@ -166,15 +173,6 @@ fn load_io_device_from_file(path: &str) -> Result<JoltDevice, Box<dyn std::error
     Ok(io_device)
 }
 
-/// Number of 32-byte chunks per commitment (384 bytes / 32 = 12)
-const CHUNKS_PER_COMMITMENT: usize = 12;
-
-/// Convert bytes to Fr field element (little-endian)
-fn bytes_to_fr(bytes: &[u8]) -> Fr {
-    use ark_ff::PrimeField;
-    Fr::from_le_bytes_mod_order(bytes)
-}
-
 fn extract_stage1_data(proof: &RV64IMACProof, io_device: Option<&JoltDevice>) -> Stage1ExtractedData {
     // Extract preamble from io_device if available
     let preamble = io_device.map(|device| PreambleData {
@@ -218,14 +216,21 @@ fn extract_stage1_data(proof: &RV64IMACProof, io_device: Option<&JoltDevice>) ->
     let num_rounds = proof.trace_length.trailing_zeros() as usize;
 
     // Extract serialized commitments
+    // NOTE: PoseidonTranscript::append_serializable does:
+    //   1. serialize_uncompressed -> bytes (LE)
+    //   2. reverse bytes (for EVM compat)
+    //   3. append_bytes (chunks of 32 bytes)
+    // So we store the REVERSED bytes here, matching what the transcript hashes.
     let commitments: Vec<Vec<u8>> = proof
         .commitments
         .iter()
         .map(|commitment| {
             let mut bytes = Vec::new();
             commitment
-                .serialize_compressed(&mut bytes)
+                .serialize_uncompressed(&mut bytes)
                 .expect("Failed to serialize commitment");
+            // Reverse to match PoseidonTranscript::append_serializable
+            bytes.reverse();
             bytes
         })
         .collect();
@@ -234,61 +239,51 @@ fn extract_stage1_data(proof: &RV64IMACProof, io_device: Option<&JoltDevice>) ->
 
     // =========================================================================
     // Compute expected final_claim by running real Stage 1 verification
+    // Using verify_stage1_full from stepwise_verifier (matches transpilation!)
     // =========================================================================
-    println!("\n=== Computing Expected Final Claim ===");
+    println!("\n=== Computing Expected Final Claim (using stepwise_verifier) ===");
 
-    // Build verification data with concrete Fr values
-    let preamble_fr: Option<Stage1PreambleData<Fr>> = io_device.map(|device| {
-        use ark_ff::PrimeField;
-
-        // Convert inputs to Fr chunks (32 bytes each)
-        let inputs_chunks: Vec<Fr> = device
-            .inputs
-            .chunks(32)
-            .map(|chunk| {
-                let mut padded = [0u8; 32];
-                padded[..chunk.len()].copy_from_slice(chunk);
-                bytes_to_fr(&padded)
+    // First extract R1CS input evaluations from proof.opening_claims
+    let r1cs_input_evals_fr: [Fr; NUM_R1CS_INPUTS] = {
+        let evals: Vec<Fr> = ALL_R1CS_INPUTS
+            .iter()
+            .map(|input| {
+                let virtual_poly = VirtualPolynomial::from(input);
+                let opening_id = OpeningId::Virtual(virtual_poly, SumcheckId::SpartanOuter);
+                let (_point, claim) = proof
+                    .opening_claims
+                    .0
+                    .get(&opening_id)
+                    .unwrap_or_else(|| panic!("Missing opening for R1CS input {:?}", input));
+                *claim
             })
             .collect();
+        evals.try_into().expect("Wrong number of R1CS inputs")
+    };
 
-        // Convert outputs to Fr chunks
-        let outputs_chunks: Vec<Fr> = device
-            .outputs
-            .chunks(32)
-            .map(|chunk| {
-                let mut padded = [0u8; 32];
-                padded[..chunk.len()].copy_from_slice(chunk);
-                bytes_to_fr(&padded)
-            })
-            .collect();
-
-        Stage1PreambleData {
-            max_input_size: Fr::from(device.memory_layout.max_input_size),
-            max_output_size: Fr::from(device.memory_layout.max_output_size),
-            memory_size: Fr::from(device.memory_layout.memory_size),
-            inputs: inputs_chunks,
-            outputs: outputs_chunks,
-            panic: if device.panic { Fr::from(1u64) } else { Fr::from(0u64) },
-            ram_k: Fr::from(proof.ram_K as u64),
-            trace_length: Fr::from(proof.trace_length as u64),
+    // Build preamble for stepwise_verifier (now uses concrete types, not Fr!)
+    let stepwise_preamble = io_device.map(|device| {
+        StepwisePreambleData {
+            max_input_size: device.memory_layout.max_input_size,
+            max_output_size: device.memory_layout.max_output_size,
+            memory_size: device.memory_layout.memory_size,
+            inputs: device.inputs.clone(),
+            outputs: device.outputs.clone(),
+            panic: device.panic,
+            ram_k: proof.ram_K,
+            trace_length: proof.trace_length,
         }
-    });
+    }).expect("io_device required for stepwise verification");
 
-    // Convert commitments to Fr chunks
-    let commitments_fr: Vec<Vec<Fr>> = commitments
-        .iter()
-        .map(|commitment_bytes| {
-            commitment_bytes
-                .chunks(32)
-                .map(|chunk| {
-                    let mut padded = [0u8; 32];
-                    padded[..chunk.len()].copy_from_slice(chunk);
-                    bytes_to_fr(&padded)
-                })
-                .collect()
-        })
-        .collect();
+    // Use original commitments directly (G1Affine implements CanonicalSerialize)
+    // The generic Stage1FullVerificationData<F, C> now accepts any C: CanonicalSerialize
+    // This matches the real verifier exactly: transcript.append_serializable(commitment)
+    let commitments_for_verification = proof.commitments.clone();
+
+    // Debug: check for advice commitments
+    println!("\n=== Advice Commitments Debug ===");
+    println!("  untrusted_advice_commitment: {:?}", proof.untrusted_advice_commitment.is_some());
+    // Note: trusted_advice_commitment comes from preprocessing, not proof
 
     // Extract uni-skip coefficients as Fr
     let uni_skip_coeffs_fr: Vec<Fr> = proof
@@ -305,26 +300,56 @@ fn extract_stage1_data(proof: &RV64IMACProof, io_device: Option<&JoltDevice>) ->
         .map(|compressed| compressed.coeffs_except_linear_term.clone())
         .collect();
 
-    // Build verification data
-    let verification_data = Stage1TranscriptVerificationData {
-        preamble: preamble_fr,
-        commitments: commitments_fr,
+    // Build verification data for stepwise_verifier
+    // num_cycle_vars = log2(trace_length) for trace_length 1024 = 10
+    let num_cycle_vars = proof.trace_length.trailing_zeros() as usize;
+    let verification_data = Stage1FullVerificationData {
+        preamble: stepwise_preamble,
+        commitments: commitments_for_verification,
         uni_skip_poly_coeffs: uni_skip_coeffs_fr,
         sumcheck_round_polys: sumcheck_round_polys_fr,
-        num_rounds,
+        r1cs_input_evals: r1cs_input_evals_fr,
+        num_cycle_vars,
     };
 
     // Run verification with Poseidon transcript (must match Gnark circuit!)
     let mut transcript: PoseidonTranscript<Fr, FrParams> = Transcript::new(b"Jolt");
-    let result = verify_stage1_with_transcript(verification_data, &mut transcript);
+    let result = verify_stage1_full(verification_data, &mut transcript);
 
     let expected_final_claim = format!("{:?}", result.final_claim);
     println!("  final_claim: {}", expected_final_claim);
     println!("  power_sum_check: {:?}", result.power_sum_check);
-    println!(
-        "  consistency_checks: {} (all should be 0)",
-        result.sumcheck_consistency_checks.len()
-    );
+    println!("  final_check: {:?} (should be 0!)", result.final_check);
+    println!("  claims_after_round len: {}", result.claims_after_round.len());
+
+    // Debug: print derived challenges
+    println!("\n=== Stepwise Derived Challenges ===");
+    println!("  tau[0]: {:?}", result.tau[0]);
+    println!("  tau[len-1] (tau_high): {:?}", result.tau[result.tau.len() - 1]);
+    println!("  r0: {:?}", result.r0);
+    println!("  batching_coeff: {:?}", result.batching_coeff);
+    println!("  claim_after_uni_skip: {:?}", result.claim_after_uni_skip);
+    println!("  sumcheck_challenges[0]: {:?}", result.sumcheck_challenges[0]);
+    if result.sumcheck_challenges.len() > 1 {
+        println!("  sumcheck_challenges[1]: {:?}", result.sumcheck_challenges[1]);
+    }
+    println!("  tau_high_bound_r0: {:?}", result.tau_high_bound_r0);
+    println!("  tau_bound_r_tail: {:?}", result.tau_bound_r_tail);
+    println!("  inner_sum_prod: {:?}", result.inner_sum_prod);
+    println!("  expected_output_claim: {:?}", result.expected_output_claim);
+
+    // R1CS input evals already extracted above - convert to strings for JSON
+    println!("\n=== R1CS Input Evaluations ===");
+    let r1cs_input_evals: Vec<String> = r1cs_input_evals_fr
+        .iter()
+        .enumerate()
+        .map(|(i, eval)| {
+            let eval_str = format!("{:?}", eval);
+            println!("  r1cs_input[{}]: {}...", i, &eval_str[..20.min(eval_str.len())]);
+            eval_str
+        })
+        .collect();
+    println!("  Total: {} R1CS input evaluations", r1cs_input_evals.len());
 
     Stage1ExtractedData {
         preamble,
@@ -335,5 +360,6 @@ fn extract_stage1_data(proof: &RV64IMACProof, io_device: Option<&JoltDevice>) ->
         commitments,
         num_commitments,
         expected_final_claim,
+        r1cs_input_evals,
     }
 }

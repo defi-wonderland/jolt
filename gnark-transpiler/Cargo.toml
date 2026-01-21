@@ -16,7 +16,13 @@ serde_json = "1.0"
 jolt-core = { path = "../jolt-core", features = ["transcript-poseidon"] }
 zklean-extractor = { path = "../zklean-extractor" }
 common = { path = "../common" }
+light-poseidon = "0.4.0"
+num-bigint = "0.4"
 
 [[bin]]
 name = "gnark-transpiler"
 path = "src/main.rs"
+
+[[bin]]
+name = "debug_transcript_full"
+path = "src/bin/debug_transcript_full.rs"
