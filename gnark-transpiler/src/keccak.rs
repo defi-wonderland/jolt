@@ -133,6 +133,10 @@ impl Transcript for KeccakMleTranscript {
         let _ = self.challenge_mle();
         vec![F::zero(); len]
     }
+
+    fn debug_state(&self, label: &str) {
+        println!("TRANSCRIPT DEBUG [{}]: (keccak)", label);
+    }
 }
 
 #[cfg(test)]

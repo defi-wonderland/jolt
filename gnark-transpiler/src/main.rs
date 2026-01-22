@@ -2,13 +2,14 @@
 //!
 //! Transpiles Jolt's Stage 1 verifier with Poseidon transcript into Gnark circuits.
 
-use gnark_transpiler::{generate_circuit_from_bundle, PoseidonMleTranscript};
+use gnark_transpiler::{generate_circuit_from_bundle, PoseidonAstTranscript};
 use jolt_core::transcripts::Transcript;
-use jolt_core::zkvm::stage1_only_verifier::{
-    verify_stage1_with_transcript, Stage1PreambleData, Stage1TranscriptVerificationData,
+use jolt_core::zkvm::r1cs::inputs::NUM_R1CS_INPUTS;
+use jolt_core::zkvm::stepwise_verifier::{
+    verify_stage1_full, PreambleData, Stage1FullVerificationData,
 };
 use serde::Deserialize;
-use zklean_extractor::mle_ast::{AstBundle, InputKind, MleAst};
+use zklean_extractor::mle_ast::{AstBundle, InputKind, MleAst, AstCommitment};
 
 /// JSON structure for extracted preamble data
 #[derive(Deserialize)]
@@ -30,6 +31,10 @@ struct ExtractedStage1Data {
     uni_skip_poly_coeffs: Vec<String>,
     sumcheck_round_polys: Vec<Vec<String>>,
     commitments: Vec<Vec<u8>>,
+    /// R1CS input evaluations at the sumcheck point (36 elements)
+    #[serde(default)]
+    #[allow(dead_code)]
+    r1cs_input_evals: Vec<String>,
 }
 
 /// Number of 32-byte chunks per commitment (384 bytes / 32 = 12)
@@ -49,16 +54,20 @@ fn main() {
         serde_json::from_str(&json_content).expect("Failed to parse JSON");
 
     let num_uni_skip_coeffs = extracted.uni_skip_poly_coeffs.len();
-    let num_rounds = extracted.sumcheck_round_polys.len();
+    let num_sumcheck_rounds = extracted.sumcheck_round_polys.len();
     let coeffs_per_round = extracted.sumcheck_round_polys[0].len();
     let num_commitments = extracted.commitments.len();
+
+    // num_cycle_vars = num_sumcheck_rounds - 1 (since rounds = 1 + num_cycle_vars)
+    let num_cycle_vars = num_sumcheck_rounds - 1;
 
     // Count preamble inputs/outputs chunks
     let preamble_inputs_chunks = (extracted.preamble.inputs.len() + 31) / 32;
     let preamble_outputs_chunks = (extracted.preamble.outputs.len() + 31) / 32;
 
     println!("\nExtracted data summary:");
-    println!("  num_rounds: {}", num_rounds);
+    println!("  num_cycle_vars: {}", num_cycle_vars);
+    println!("  num_sumcheck_rounds: {}", num_sumcheck_rounds);
     println!("  num_uni_skip_coeffs: {}", num_uni_skip_coeffs);
     println!("  coeffs_per_round: {}", coeffs_per_round);
     println!("  num_commitments: {}", num_commitments);
@@ -77,80 +86,48 @@ fn main() {
     let mut input_descriptions: Vec<(u16, String)> = Vec::new();
     let mut var_idx: u16 = 0;
 
-    // === Create symbolic preamble ===
-    // 8 fixed values + inputs chunks + outputs chunks
-    println!("\n=== Creating Symbolic Preamble ===");
+    // === Create concrete preamble (constants, not variables) ===
+    // Preamble values are part of the public statement - they're fixed per program
+    // and don't need to be circuit variables.
+    println!("\n=== Creating Concrete Preamble (Constants) ===");
 
-    let max_input_size = MleAst::from_var(var_idx);
-    input_descriptions.push((var_idx, "preamble_max_input_size".to_string()));
-    var_idx += 1;
-
-    let max_output_size = MleAst::from_var(var_idx);
-    input_descriptions.push((var_idx, "preamble_max_output_size".to_string()));
-    var_idx += 1;
-
-    let memory_size = MleAst::from_var(var_idx);
-    input_descriptions.push((var_idx, "preamble_memory_size".to_string()));
-    var_idx += 1;
-
-    let preamble_inputs: Vec<MleAst> = (0..preamble_inputs_chunks)
-        .map(|i| {
-            let ast = MleAst::from_var(var_idx);
-            input_descriptions.push((var_idx, format!("preamble_input_chunk_{}", i)));
-            var_idx += 1;
-            ast
-        })
-        .collect();
-
-    let preamble_outputs: Vec<MleAst> = (0..preamble_outputs_chunks)
-        .map(|i| {
-            let ast = MleAst::from_var(var_idx);
-            input_descriptions.push((var_idx, format!("preamble_output_chunk_{}", i)));
-            var_idx += 1;
-            ast
-        })
-        .collect();
-
-    let panic_flag = MleAst::from_var(var_idx);
-    input_descriptions.push((var_idx, "preamble_panic".to_string()));
-    var_idx += 1;
-
-    let ram_k = MleAst::from_var(var_idx);
-    input_descriptions.push((var_idx, "preamble_ram_k".to_string()));
-    var_idx += 1;
-
-    let trace_length = MleAst::from_var(var_idx);
-    input_descriptions.push((var_idx, "preamble_trace_length".to_string()));
-    var_idx += 1;
-
-    let preamble = Stage1PreambleData {
-        max_input_size,
-        max_output_size,
-        memory_size,
-        inputs: preamble_inputs,
-        outputs: preamble_outputs,
-        panic: panic_flag,
-        ram_k,
-        trace_length,
+    let preamble = PreambleData {
+        max_input_size: extracted.preamble.max_input_size,
+        max_output_size: extracted.preamble.max_output_size,
+        memory_size: extracted.preamble.memory_size,
+        inputs: extracted.preamble.inputs.clone(),
+        outputs: extracted.preamble.outputs.clone(),
+        panic: extracted.preamble.panic,
+        ram_k: extracted.preamble.ram_k as usize,
+        trace_length: extracted.preamble.trace_length as usize,
     };
 
-    println!("  Preamble variables: {} (indices 0..{})", var_idx, var_idx - 1);
+    println!("  max_input_size: {}", preamble.max_input_size);
+    println!("  max_output_size: {}", preamble.max_output_size);
+    println!("  memory_size: {}", preamble.memory_size);
+    println!("  inputs: {} bytes", preamble.inputs.len());
+    println!("  outputs: {} bytes", preamble.outputs.len());
+    println!("  panic: {}", preamble.panic);
+    println!("  ram_k: {}", preamble.ram_k);
+    println!("  trace_length: {}", preamble.trace_length);
 
     // === Create symbolic commitments ===
     // 41 commitments × 12 chunks each = 492 variables
+    // Each commitment is wrapped in AstCommitment for proper hash chaining
     println!("\n=== Creating Symbolic Commitments ===");
     let commitments_start_idx = var_idx;
 
-    let commitments: Vec<Vec<MleAst>> = (0..num_commitments)
+    let commitments: Vec<AstCommitment> = (0..num_commitments)
         .map(|c| {
-            (0..CHUNKS_PER_COMMITMENT)
+            let chunks: Vec<MleAst> = (0..CHUNKS_PER_COMMITMENT)
                 .map(|chunk| {
                     let ast = MleAst::from_var(var_idx);
                     input_descriptions.push((var_idx, format!("commitment_{}_chunk_{}", c, chunk)));
                     var_idx += 1;
                     ast
                 })
-                .collect()
+                .collect();
+            AstCommitment::new(chunks)
         })
         .collect();
 
@@ -185,7 +162,7 @@ fn main() {
     println!("\n=== Creating Symbolic Sumcheck Round Polynomials ===");
     let sumcheck_start_idx = var_idx;
 
-    let sumcheck_round_polys: Vec<Vec<MleAst>> = (0..num_rounds)
+    let sumcheck_round_polys: Vec<Vec<MleAst>> = (0..num_sumcheck_rounds)
         .map(|round| {
             (0..coeffs_per_round)
                 .map(|coeff| {
@@ -200,28 +177,54 @@ fn main() {
 
     println!(
         "  Sumcheck variables: {} (indices {}..{})",
-        num_rounds * coeffs_per_round,
+        num_sumcheck_rounds * coeffs_per_round,
         sumcheck_start_idx,
         var_idx - 1
     );
 
+    // === Create symbolic R1CS input evaluations ===
+    // 36 R1CS inputs: evaluations at the final sumcheck point
+    println!("\n=== Creating Symbolic R1CS Input Evaluations ===");
+    let r1cs_start_idx = var_idx;
+
+    let mut r1cs_input_evals_vec: Vec<MleAst> = Vec::with_capacity(NUM_R1CS_INPUTS);
+    for i in 0..NUM_R1CS_INPUTS {
+        let ast = MleAst::from_var(var_idx);
+        input_descriptions.push((var_idx, format!("r1cs_input_{}", i)));
+        var_idx += 1;
+        r1cs_input_evals_vec.push(ast);
+    }
+
+    // Convert to fixed-size array
+    let r1cs_input_evals: [MleAst; NUM_R1CS_INPUTS] = r1cs_input_evals_vec
+        .try_into()
+        .expect("Vec has exactly NUM_R1CS_INPUTS elements");
+
+    println!(
+        "  R1CS input eval variables: {} (indices {}..{})",
+        NUM_R1CS_INPUTS,
+        r1cs_start_idx,
+        var_idx - 1
+    );
+
     // Build verification data
-    let data = Stage1TranscriptVerificationData {
-        preamble: Some(preamble),
+    let data = Stage1FullVerificationData {
+        preamble,
         commitments,
         uni_skip_poly_coeffs,
         sumcheck_round_polys,
-        num_rounds,
+        r1cs_input_evals,
+        num_cycle_vars,
     };
 
     println!("\n=== Total Symbolic Variables: {} ===", var_idx);
 
     // Create Poseidon transcript for symbolic execution
-    let mut transcript: PoseidonMleTranscript = Transcript::new(b"Jolt");
+    let mut transcript: PoseidonAstTranscript = Transcript::new(b"Jolt");
 
-    // Run verification with MleAst and Poseidon transcript
-    println!("\nRunning verify_stage1_with_transcript with MleAst + PoseidonMleTranscript...");
-    let result = verify_stage1_with_transcript(data, &mut transcript);
+    // Run FULL verification with MleAst and Poseidon transcript
+    println!("\nRunning verify_stage1_full with MleAst + PoseidonAstTranscript...");
+    let result = verify_stage1_full(data, &mut transcript);
 
     // Build AstBundle from the result
     println!("\n=== Building AstBundle ===");
@@ -236,13 +239,12 @@ fn main() {
     }
 
     // Add constraints with their assertion types
+    // 1. Power sum check (uni-skip first round)
     bundle.add_constraint_eq_zero("power_sum_check", result.power_sum_check.root());
 
-    for (i, check) in result.sumcheck_consistency_checks.iter().enumerate() {
-        bundle.add_constraint_eq_zero(format!("sumcheck_consistency_{}", i), check.root());
-    }
-
-    bundle.add_constraint_eq_public("final_claim", result.final_claim.root(), "expected_final_claim");
+    // 2. Final check: final_claim == expected_output_claim
+    // This is the FULL verification including R1CS evaluation
+    bundle.add_constraint_eq_zero("final_check", result.final_check.root());
 
     println!("  Nodes in arena: {}", bundle.nodes.len());
     println!("  Constraints: {}", bundle.constraints.len());
@@ -271,8 +273,10 @@ fn main() {
         .expect("Failed to write JSON file");
     println!("✓ AstBundle written to: {}", json_path);
 
-    println!("\n✓ SUCCESS: Stage 1 verifier transpiled to Gnark circuit!");
+    println!("\n✓ SUCCESS: Full Stage 1 verifier transpiled to Gnark circuit!");
     println!("  - {} symbolic input variables (proof data)", bundle.num_proof_inputs());
     println!("  - {} constraints", bundle.constraints.len());
+    println!("  - Includes R1CS evaluation (Az(r) * Bz(r))");
+    println!("  - Includes expected_output_claim computation");
     println!("  - Challenges derived via Poseidon transcript (in-circuit)");
 }

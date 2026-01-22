@@ -670,6 +670,49 @@ fn verify_sumcheck_rounds<F: JoltField>(
     (claim, consistency_checks)
 }
 
+/// Verify sumcheck rounds with COMPRESSED polynomials.
+///
+/// The compressed polynomial stores [c0, c2, c3, ...] (missing c1).
+/// The linear term c1 is derived from the claim (hint):
+///   c1 = claim - 2*c0 - c2 - c3 - ...
+///
+/// This is because: p(0) + p(1) = claim
+///   p(0) = c0
+///   p(1) = c0 + c1 + c2 + c3 + ...
+///   So: claim = 2*c0 + c1 + c2 + c3 + ...
+///   Therefore: c1 = claim - 2*c0 - c2 - c3 - ...
+///
+/// Returns:
+/// - final_claim: The claim after all rounds
+/// - consistency_checks: Empty vec (consistency is guaranteed by construction)
+fn verify_sumcheck_rounds_compressed<F: JoltField>(
+    initial_claim: F,
+    challenges: &[F],
+    compressed_polys: &[Vec<F>],  // Each is [c0, c2, c3, ...]
+) -> (F, Vec<F>) {
+    let mut claim = initial_claim;
+    let consistency_checks = Vec::new();  // No checks needed - consistency built into decompress
+
+    for (challenge, compressed) in challenges.iter().zip(compressed_polys) {
+        // Decompress: compute linear term c1 from hint (claim)
+        // c1 = claim - 2*c0 - c2 - c3 - ...
+        let c0 = compressed[0];
+        let mut linear_term = claim - c0 - c0;  // claim - 2*c0
+        for coeff in compressed.iter().skip(1) {
+            linear_term -= *coeff;
+        }
+
+        // Build full coefficients: [c0, c1, c2, c3, ...]
+        let mut full_coeffs = vec![c0, linear_term];
+        full_coeffs.extend(compressed.iter().skip(1).cloned());
+
+        // Evaluate at challenge to get next claim
+        claim = evaluate_polynomial(&full_coeffs, challenge);
+    }
+
+    (claim, consistency_checks)
+}
+
 /// Evaluate polynomial using Horner's method (pure field arithmetic).
 ///
 /// Computes: Σ_i coeff[i] * x^i
@@ -867,8 +910,10 @@ pub fn verify_stage1_with_transcript<F: JoltField + Clone, T: Transcript>(
         derived_sumcheck_challenges.push(transcript.challenge_scalar::<F>());
     }
 
-    // Verify sumcheck rounds
-    let (final_claim, sumcheck_consistency_checks) = verify_sumcheck_rounds(
+    // Verify sumcheck rounds using COMPRESSED polynomial format
+    // The sumcheck_round_polys contain [c0, c2, c3, ...] (missing c1)
+    // The linear term c1 is derived on-the-fly from the claim
+    let (final_claim, sumcheck_consistency_checks) = verify_sumcheck_rounds_compressed(
         claim_after_first,
         &derived_sumcheck_challenges,
         &data.sumcheck_round_polys,

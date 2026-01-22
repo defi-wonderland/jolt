@@ -12,6 +12,29 @@ use zklean_extractor::mle_ast::{
     insert_node, Atom, Bindings, Edge, Node,
 };
 
+/// Format a scalar value ([u64; 4]) for Gnark code generation.
+/// Large values (that overflow Go's int64) are formatted as bigInt("...") calls.
+fn format_scalar_for_gnark(limbs: [u64; 4]) -> String {
+    // Check if it fits in u64 (only limb[0] is non-zero)
+    if limbs[1] == 0 && limbs[2] == 0 && limbs[3] == 0 {
+        let value = limbs[0];
+        // Go's int64 max is 9223372036854775807
+        if value <= i64::MAX as u64 {
+            return format!("{}", value);
+        }
+    }
+
+    // Too large for int64, convert to decimal string and use bigInt helper
+    use num_bigint::BigUint;
+
+    let mut value = BigUint::from(limbs[3]);
+    value = (value << 64) + limbs[2];
+    value = (value << 64) + limbs[1];
+    value = (value << 64) + limbs[0];
+
+    format!("bigInt(\"{}\")", value)
+}
+
 /// State for memoized code generation with reference counting
 pub struct MemoizedCodeGen {
     /// Reference counts for each NodeId (computed in first pass)
@@ -76,7 +99,7 @@ impl MemoizedCodeGen {
             let node = get_node(node_id);
             match node {
                 Node::Atom(_) => {}
-                Node::Neg(e) | Node::Inv(e) | Node::Keccak256(e) => {
+                Node::Neg(e) | Node::Inv(e) | Node::Keccak256(e) | Node::ByteReverse(e) | Node::Truncate128Reverse(e) | Node::Truncate128(e) | Node::MulTwoPow192(e) => {
                     self.count_refs_edge(e);
                 }
                 Node::Add(e1, e2) | Node::Mul(e1, e2) | Node::Sub(e1, e2) | Node::Div(e1, e2) => {
@@ -109,7 +132,7 @@ impl MemoizedCodeGen {
     /// Generate Gnark expression for an atom
     fn atom_to_gnark(&mut self, atom: Atom) -> String {
         match atom {
-            Atom::Scalar(value) => format!("{}", value),
+            Atom::Scalar(value) => format_scalar_for_gnark(value),
             Atom::Var(index) => {
                 self.vars.insert(index);
                 // Use custom variable name if available, otherwise fall back to X_{index}
@@ -178,6 +201,22 @@ impl MemoizedCodeGen {
                 let i = self.edge_to_gnark(input);
                 format!("keccak.Keccak256(api, {})", i)
             }
+            Node::ByteReverse(input) => {
+                let i = self.edge_to_gnark(input);
+                format!("poseidon.ByteReverse(api, {})", i)
+            }
+            Node::Truncate128Reverse(input) => {
+                let i = self.edge_to_gnark(input);
+                format!("poseidon.Truncate128Reverse(api, {})", i)
+            }
+            Node::Truncate128(input) => {
+                let i = self.edge_to_gnark(input);
+                format!("poseidon.Truncate128(api, {})", i)
+            }
+            Node::MulTwoPow192(input) => {
+                let i = self.edge_to_gnark(input);
+                format!("poseidon.AppendU64Transform(api, {})", i)
+            }
         };
 
         // Hoist to CSE variable if referenced more than once
@@ -234,7 +273,7 @@ pub fn generate_stage1_circuit_memoized(
     output.push_str("import (\n");
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     if bindings_code.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
+        output.push_str("\t\"jolt_verifier/poseidon\"\n");
     }
     output.push_str(")\n\n");
 
@@ -332,13 +371,22 @@ pub fn generate_circuit_from_bundle(
     // Package and imports
     output.push_str("package jolt_verifier\n\n");
     output.push_str("import (\n");
+    output.push_str("\t\"math/big\"\n");
+    output.push_str("\n");
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     if bindings_code.contains("poseidon.Hash")
         || constraint_exprs.iter().any(|(_, e, _)| e.contains("poseidon.Hash"))
     {
-        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
+        output.push_str("\t\"jolt_verifier/poseidon\"\n");
     }
     output.push_str(")\n\n");
+
+    // bigInt helper for large constants that overflow Go's int64
+    output.push_str("// bigInt creates a *big.Int from a string, for constants too large for int64\n");
+    output.push_str("func bigInt(s string) *big.Int {\n");
+    output.push_str("\tn, _ := new(big.Int).SetString(s, 10)\n");
+    output.push_str("\treturn n\n");
+    output.push_str("}\n\n");
 
     // Circuit struct - use input descriptions from bundle
     output.push_str(&format!("type {} struct {{\n", circuit_name));
@@ -455,10 +503,7 @@ fn edge_to_gnark_with_vars(edge: Edge, vars: &mut BTreeSet<u16>) -> String {
 /// Convert an Atom to Gnark code
 fn atom_to_gnark(atom: Atom) -> String {
     match atom {
-        Atom::Scalar(value) => {
-            // Field constant
-            format!("{}", value)
-        }
+        Atom::Scalar(value) => format_scalar_for_gnark(value),
         Atom::Var(index) => {
             // Variable reference - maps to circuit input
             format!("circuit.X_{}", index)
@@ -473,7 +518,7 @@ fn atom_to_gnark(atom: Atom) -> String {
 /// Convert an Atom to Gnark code, collecting variable indices
 fn atom_to_gnark_with_vars(atom: Atom, vars: &mut BTreeSet<u16>) -> String {
     match atom {
-        Atom::Scalar(value) => format!("{}", value),
+        Atom::Scalar(value) => format_scalar_for_gnark(value),
         Atom::Var(index) => {
             vars.insert(index);
             format!("circuit.X_{}", index)
@@ -529,6 +574,22 @@ pub fn generate_gnark_expr(node_id: usize) -> String {
 
         Node::Keccak256(input) => {
             format!("keccak.Keccak256(api, {})", edge_to_gnark(input))
+        }
+
+        Node::ByteReverse(input) => {
+            format!("poseidon.ByteReverse(api, {})", edge_to_gnark(input))
+        }
+
+        Node::Truncate128Reverse(input) => {
+            format!("poseidon.Truncate128Reverse(api, {})", edge_to_gnark(input))
+        }
+
+        Node::Truncate128(input) => {
+            format!("poseidon.Truncate128(api, {})", edge_to_gnark(input))
+        }
+
+        Node::MulTwoPow192(input) => {
+            format!("poseidon.AppendU64Transform(api, {})", edge_to_gnark(input))
         }
     }
 }
@@ -595,6 +656,22 @@ fn generate_gnark_expr_with_vars(node_id: usize, vars: &mut BTreeSet<u16>) -> St
                 edge_to_gnark_with_vars(input, vars)
             )
         }
+
+        Node::ByteReverse(input) => {
+            format!("poseidon.ByteReverse(api, {})", edge_to_gnark_with_vars(input, vars))
+        }
+
+        Node::Truncate128Reverse(input) => {
+            format!("poseidon.Truncate128Reverse(api, {})", edge_to_gnark_with_vars(input, vars))
+        }
+
+        Node::Truncate128(input) => {
+            format!("poseidon.Truncate128(api, {})", edge_to_gnark_with_vars(input, vars))
+        }
+
+        Node::MulTwoPow192(input) => {
+            format!("poseidon.AppendU64Transform(api, {})", edge_to_gnark_with_vars(input, vars))
+        }
     }
 }
 
@@ -613,7 +690,15 @@ pub fn generate_circuit(root_node_id: usize, circuit_name: &str) -> String {
 
     // Package and imports
     output.push_str("package jolt_verifier\n\n");
-    output.push_str("import \"github.com/consensys/gnark/frontend\"\n\n");
+    // Check if we need poseidon import
+    if expr.contains("poseidon.") {
+        output.push_str("import (\n");
+        output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
+        output.push_str("\t\"jolt_verifier/poseidon\"\n");
+        output.push_str(")\n\n");
+    } else {
+        output.push_str("import \"github.com/consensys/gnark/frontend\"\n\n");
+    }
 
     // Circuit struct with all used variables
     output.push_str(&format!("type {} struct {{\n", circuit_name));
@@ -719,7 +804,7 @@ pub fn generate_stage1_circuit(
 /// Convert an Atom to Gnark code with CSE offset for NamedVar indices
 fn atom_to_gnark_with_offset(atom: Atom, vars: &mut BTreeSet<u16>, cse_offset: usize) -> String {
     match atom {
-        Atom::Scalar(value) => format!("{}", value),
+        Atom::Scalar(value) => format_scalar_for_gnark(value),
         Atom::Var(index) => {
             vars.insert(index);
             format!("circuit.X_{}", index)
@@ -810,6 +895,34 @@ fn generate_gnark_expr_with_vars_and_offset(
                 edge_to_gnark_with_offset(input, vars, cse_offset)
             )
         }
+
+        Node::ByteReverse(input) => {
+            format!(
+                "ByteReverse(api, {})",
+                edge_to_gnark_with_offset(input, vars, cse_offset)
+            )
+        }
+
+        Node::Truncate128Reverse(input) => {
+            format!(
+                "Truncate128Reverse(api, {})",
+                edge_to_gnark_with_offset(input, vars, cse_offset)
+            )
+        }
+
+        Node::Truncate128(input) => {
+            format!(
+                "Truncate128(api, {})",
+                edge_to_gnark_with_offset(input, vars, cse_offset)
+            )
+        }
+
+        Node::MulTwoPow192(input) => {
+            format!(
+                "AppendU64Transform(api, {})",
+                edge_to_gnark_with_offset(input, vars, cse_offset)
+            )
+        }
     }
 }
 
@@ -881,6 +994,34 @@ fn generate_gnark_expr_for_node_with_offset(
         Node::Keccak256(input) => {
             format!(
                 "keccak.Keccak256(api, {})",
+                edge_to_gnark_with_offset(*input, vars, cse_offset)
+            )
+        }
+
+        Node::ByteReverse(input) => {
+            format!(
+                "ByteReverse(api, {})",
+                edge_to_gnark_with_offset(*input, vars, cse_offset)
+            )
+        }
+
+        Node::Truncate128Reverse(input) => {
+            format!(
+                "Truncate128Reverse(api, {})",
+                edge_to_gnark_with_offset(*input, vars, cse_offset)
+            )
+        }
+
+        Node::Truncate128(input) => {
+            format!(
+                "Truncate128(api, {})",
+                edge_to_gnark_with_offset(*input, vars, cse_offset)
+            )
+        }
+
+        Node::MulTwoPow192(input) => {
+            format!(
+                "AppendU64Transform(api, {})",
                 edge_to_gnark_with_offset(*input, vars, cse_offset)
             )
         }
@@ -962,7 +1103,7 @@ pub fn generate_stage1_circuit_with_cse(
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     // Check if we use Poseidon
     if all_bindings.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
+        output.push_str("\t\"jolt_verifier/poseidon\"\n");
     }
     output.push_str(")\n\n");
 
@@ -1085,7 +1226,7 @@ pub fn generate_stage1_circuit_with_global_cse(
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     // Check if we use Poseidon
     if bindings_code.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"github.com/vocdoni/gnark-prover-tinygo/std/hash/poseidon\"\n");
+        output.push_str("\t\"jolt_verifier/poseidon\"\n");
     }
     output.push_str(")\n\n");
 

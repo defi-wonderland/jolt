@@ -12,15 +12,32 @@ use zklean_extractor::mle_ast::{get_node, Atom, Edge, Node};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AtomJson {
-    Scalar { value: i128 },
+    /// Scalar value as decimal string (to handle values > 128 bits)
+    Scalar { value: String },
     Var { index: u16 },
     NamedVar { index: usize },
+}
+
+/// Convert [u64; 4] limbs to decimal string
+fn limbs_to_decimal(limbs: [u64; 4]) -> String {
+    use num_bigint::BigUint;
+
+    if limbs == [0, 0, 0, 0] {
+        return "0".to_string();
+    }
+
+    let mut value = BigUint::from(limbs[3]);
+    value = (value << 64) + limbs[2];
+    value = (value << 64) + limbs[1];
+    value = (value << 64) + limbs[0];
+
+    value.to_string()
 }
 
 impl From<Atom> for AtomJson {
     fn from(atom: Atom) -> Self {
         match atom {
-            Atom::Scalar(value) => AtomJson::Scalar { value },
+            Atom::Scalar(value) => AtomJson::Scalar { value: limbs_to_decimal(value) },
             Atom::Var(index) => AtomJson::Var { index },
             Atom::NamedVar(index) => AtomJson::NamedVar { index },
         }
@@ -82,6 +99,18 @@ pub enum NodeJson {
     Keccak256 {
         input: EdgeJson,
     },
+    ByteReverse {
+        input: EdgeJson,
+    },
+    Truncate128Reverse {
+        input: EdgeJson,
+    },
+    Truncate128 {
+        input: EdgeJson,
+    },
+    MulTwoPow192 {
+        input: EdgeJson,
+    },
 }
 
 impl From<Node> for NodeJson {
@@ -118,6 +147,18 @@ impl From<Node> for NodeJson {
             Node::Keccak256(input) => NodeJson::Keccak256 {
                 input: input.into(),
             },
+            Node::ByteReverse(input) => NodeJson::ByteReverse {
+                input: input.into(),
+            },
+            Node::Truncate128Reverse(input) => NodeJson::Truncate128Reverse {
+                input: input.into(),
+            },
+            Node::Truncate128(input) => NodeJson::Truncate128 {
+                input: input.into(),
+            },
+            Node::MulTwoPow192(input) => NodeJson::MulTwoPow192 {
+                input: input.into(),
+            },
         }
     }
 }
@@ -151,7 +192,7 @@ fn collect_nodes_from_root(root_id: usize, max_id: &mut usize) {
     let node = get_node(root_id);
     match node {
         Node::Atom(_) => {}
-        Node::Neg(edge) | Node::Inv(edge) => {
+        Node::Neg(edge) | Node::Inv(edge) | Node::ByteReverse(edge) | Node::Truncate128Reverse(edge) | Node::Truncate128(edge) | Node::MulTwoPow192(edge) => {
             if let Edge::NodeRef(id) = edge {
                 collect_nodes_from_root(id, max_id);
             }
@@ -249,7 +290,7 @@ fn collect_vars_from_node(node_id: usize, vars: &mut std::collections::BTreeSet<
             vars.insert(index);
         }
         Node::Atom(_) => {}
-        Node::Neg(edge) | Node::Inv(edge) => {
+        Node::Neg(edge) | Node::Inv(edge) | Node::ByteReverse(edge) | Node::Truncate128Reverse(edge) | Node::Truncate128(edge) | Node::MulTwoPow192(edge) => {
             collect_vars_from_edge(edge, vars);
         }
         Node::Add(left, right)
@@ -329,7 +370,12 @@ impl Stage1AstJson {
 
         match node {
             NodeJson::Atom { .. } => {}
-            NodeJson::Neg { child } | NodeJson::Inv { child } => {
+            NodeJson::Neg { child }
+            | NodeJson::Inv { child }
+            | NodeJson::ByteReverse { input: child }
+            | NodeJson::Truncate128Reverse { input: child }
+            | NodeJson::Truncate128 { input: child }
+            | NodeJson::MulTwoPow192 { input: child } => {
                 if let Some(child_id) = self.edge_to_id(child) {
                     output.push_str(&format!("    N{} --> N{}\n", node_id, child_id));
                     self.render_node_mermaid(child_id, output, visited);
@@ -410,6 +456,10 @@ impl Stage1AstJson {
             NodeJson::Div { .. } => "÷".to_string(),
             NodeJson::Poseidon { .. } => "POSEIDON".to_string(),
             NodeJson::Keccak256 { .. } => "KECCAK256".to_string(),
+            NodeJson::ByteReverse { .. } => "BYTE_REV".to_string(),
+            NodeJson::Truncate128Reverse { .. } => "TRUNC128_REV".to_string(),
+            NodeJson::Truncate128 { .. } => "TRUNC128".to_string(),
+            NodeJson::MulTwoPow192 { .. } => "MUL_2^192".to_string(),
         }
     }
 
