@@ -98,10 +98,10 @@ pub fn gen_ra_one_hot_provers<F: JoltField>(
     )
 }
 
-pub fn new_ra_one_hot_verifiers<F: JoltField>(
+pub fn new_ra_one_hot_verifiers<F: JoltField, A: OpeningAccumulator<F>>(
     trace_len: usize,
     one_hot_params: &OneHotParams,
-    opening_accumulator: &VerifierOpeningAccumulator<F>,
+    opening_accumulator: &A,
     transcript: &mut impl Transcript,
 ) -> (
     HammingWeightSumcheckVerifier<F>,

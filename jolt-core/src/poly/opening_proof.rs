@@ -254,6 +254,93 @@ pub trait OpeningAccumulator<F: JoltField> {
         polynomial: CommittedPolynomial,
         sumcheck: SumcheckId,
     ) -> (OpeningPoint<BIG_ENDIAN, F>, F);
+
+    /// Populates the opening point for an existing virtual polynomial claim.
+    /// This is the verifier version - the claim is read from the internal map.
+    /// Default implementation panics; only verifier accumulators implement this.
+    fn append_virtual<T: Transcript>(
+        &mut self,
+        _transcript: &mut T,
+        _polynomial: VirtualPolynomial,
+        _sumcheck: SumcheckId,
+        _opening_point: OpeningPoint<BIG_ENDIAN, F>,
+    ) where
+        Self: Sized,
+    {
+        unimplemented!("append_virtual only available for verifier accumulators")
+    }
+
+    /// Populates the opening point for an existing untrusted advice claim.
+    /// This is the verifier version - the claim is read from the internal map.
+    /// Default implementation panics; only verifier accumulators implement this.
+    fn append_untrusted_advice<T: Transcript>(
+        &mut self,
+        _transcript: &mut T,
+        _sumcheck_id: SumcheckId,
+        _opening_point: OpeningPoint<BIG_ENDIAN, F>,
+    ) where
+        Self: Sized,
+    {
+        unimplemented!("append_untrusted_advice only available for verifier accumulators")
+    }
+
+    /// Populates the opening point for an existing trusted advice claim.
+    /// This is the verifier version - the claim is read from the internal map.
+    /// Default implementation panics; only verifier accumulators implement this.
+    fn append_trusted_advice<T: Transcript>(
+        &mut self,
+        _transcript: &mut T,
+        _sumcheck_id: SumcheckId,
+        _opening_point: OpeningPoint<BIG_ENDIAN, F>,
+    ) where
+        Self: Sized,
+    {
+        unimplemented!("append_trusted_advice only available for verifier accumulators")
+    }
+
+    /// Populates the opening point for an existing dense committed polynomial claim.
+    /// This is the verifier version - the claim is read from the internal map.
+    fn append_dense<T: Transcript>(
+        &mut self,
+        _transcript: &mut T,
+        _polynomial: CommittedPolynomial,
+        _sumcheck: SumcheckId,
+        _opening_point: Vec<F::Challenge>,
+    ) where
+        Self: Sized,
+    {
+        unimplemented!("append_dense only available for verifier accumulators")
+    }
+
+    /// Populates the opening point for multiple sparse committed polynomial claims.
+    /// This is the verifier version - the claims are read from the internal map.
+    fn append_sparse<T: Transcript>(
+        &mut self,
+        _transcript: &mut T,
+        _polynomials: Vec<CommittedPolynomial>,
+        _sumcheck: SumcheckId,
+        _opening_point: Vec<F::Challenge>,
+    ) where
+        Self: Sized,
+    {
+        unimplemented!("append_sparse only available for verifier accumulators")
+    }
+
+    /// Get the opening for untrusted advice at the given sumcheck.
+    fn get_untrusted_advice_opening(
+        &self,
+        _sumcheck_id: SumcheckId,
+    ) -> Option<(OpeningPoint<BIG_ENDIAN, F>, F)> {
+        unimplemented!("get_untrusted_advice_opening only available for verifier accumulators")
+    }
+
+    /// Get the opening for trusted advice at the given sumcheck.
+    fn get_trusted_advice_opening(
+        &self,
+        _sumcheck_id: SumcheckId,
+    ) -> Option<(OpeningPoint<BIG_ENDIAN, F>, F)> {
+        unimplemented!("get_trusted_advice_opening only available for verifier accumulators")
+    }
 }
 
 /// Intermediate state between Stage 7 (batch opening reduction sumcheck) and Stage 8 (Dory opening).
@@ -767,6 +854,105 @@ impl<F: JoltField> OpeningAccumulator<F> for VerifierOpeningAccumulator<F> {
             .unwrap_or_else(|| panic!("No opening found for {sumcheck:?} {polynomial:?}"));
         (point.clone(), *claim)
     }
+
+    fn append_virtual<T: Transcript>(
+        &mut self,
+        transcript: &mut T,
+        polynomial: VirtualPolynomial,
+        sumcheck: SumcheckId,
+        opening_point: OpeningPoint<BIG_ENDIAN, F>,
+    ) where
+        Self: Sized,
+    {
+        let key = OpeningId::Virtual(polynomial, sumcheck);
+        if let Some((_, claim)) = self.openings.get(&key) {
+            transcript.append_scalar(claim);
+            let claim = *claim;
+            self.openings.insert(key, (opening_point.clone(), claim));
+        } else {
+            panic!("Tried to populate opening point for non-existent key: {key:?}");
+        }
+    }
+
+    fn append_untrusted_advice<T: Transcript>(
+        &mut self,
+        transcript: &mut T,
+        sumcheck_id: SumcheckId,
+        opening_point: OpeningPoint<BIG_ENDIAN, F>,
+    ) where
+        Self: Sized,
+    {
+        let key = OpeningId::UntrustedAdvice(sumcheck_id);
+        if let Some((_, claim)) = self.openings.get(&key) {
+            transcript.append_scalar(claim);
+            let claim = *claim;
+            self.openings.insert(key, (opening_point.clone(), claim));
+        } else {
+            panic!("Tried to populate opening point for non-existent key: {key:?}");
+        }
+    }
+
+    fn append_trusted_advice<T: Transcript>(
+        &mut self,
+        transcript: &mut T,
+        sumcheck_id: SumcheckId,
+        opening_point: OpeningPoint<BIG_ENDIAN, F>,
+    ) where
+        Self: Sized,
+    {
+        let key = OpeningId::TrustedAdvice(sumcheck_id);
+        if let Some((_, claim)) = self.openings.get(&key) {
+            transcript.append_scalar(claim);
+            let claim = *claim;
+            self.openings.insert(key, (opening_point.clone(), claim));
+        } else {
+            panic!("Tried to populate opening point for non-existent key: {key:?}");
+        }
+    }
+
+    fn append_dense<T: Transcript>(
+        &mut self,
+        transcript: &mut T,
+        polynomial: CommittedPolynomial,
+        sumcheck: SumcheckId,
+        opening_point: Vec<F::Challenge>,
+    ) where
+        Self: Sized,
+    {
+        // Delegate to the inherent method which handles sumchecks.push()
+        VerifierOpeningAccumulator::append_dense(self, transcript, polynomial, sumcheck, opening_point);
+    }
+
+    fn append_sparse<T: Transcript>(
+        &mut self,
+        transcript: &mut T,
+        polynomials: Vec<CommittedPolynomial>,
+        sumcheck: SumcheckId,
+        opening_point: Vec<F::Challenge>,
+    ) where
+        Self: Sized,
+    {
+        // Delegate to the inherent method which handles sumchecks.push()
+        VerifierOpeningAccumulator::append_sparse(self, transcript, polynomials, sumcheck, opening_point);
+    }
+
+    fn get_untrusted_advice_opening(
+        &self,
+        sumcheck_id: SumcheckId,
+    ) -> Option<(OpeningPoint<BIG_ENDIAN, F>, F)> {
+        let (point, claim) = self
+            .openings
+            .get(&OpeningId::UntrustedAdvice(sumcheck_id))?;
+        Some((point.clone(), *claim))
+    }
+
+    fn get_trusted_advice_opening(
+        &self,
+        sumcheck_id: SumcheckId,
+    ) -> Option<(OpeningPoint<BIG_ENDIAN, F>, F)> {
+        let (point, claim) = self.openings.get(&OpeningId::TrustedAdvice(sumcheck_id))?;
+        Some((point.clone(), *claim))
+    }
 }
 
 impl<F> VerifierOpeningAccumulator<F>
@@ -971,14 +1157,18 @@ where
         sumcheck_proof: &SumcheckInstanceProof<F, T>,
         transcript: &mut T,
     ) -> Result<Vec<F::Challenge>, ProofVerifyError> {
-        let instances: Vec<&dyn SumcheckInstanceVerifier<F, T>> = self
-            .sumchecks
-            .iter()
-            .map(|opening| {
-                let instance: &dyn SumcheckInstanceVerifier<F, T> = opening;
-                instance
-            })
-            .collect();
+        let instances: Vec<&dyn SumcheckInstanceVerifier<F, T, VerifierOpeningAccumulator<F>>> =
+            self.sumchecks
+                .iter()
+                .map(|opening| {
+                    let instance: &dyn SumcheckInstanceVerifier<
+                        F,
+                        T,
+                        VerifierOpeningAccumulator<F>,
+                    > = opening;
+                    instance
+                })
+                .collect();
         BatchedSumcheck::verify(
             sumcheck_proof,
             instances,
@@ -1048,7 +1238,9 @@ where
         let num_sumcheck_rounds = self
             .sumchecks
             .iter()
-            .map(|opening| SumcheckInstanceVerifier::<F, T>::num_rounds(opening))
+            .map(|opening| {
+                SumcheckInstanceVerifier::<F, T, VerifierOpeningAccumulator<F>>::num_rounds(opening)
+            })
             .max()
             .unwrap();
 
@@ -1058,8 +1250,10 @@ where
             .zip(state.sumcheck_claims.iter())
             .zip(self.sumchecks.iter())
             .map(|((coeff, claim), opening)| {
-                let r_slice = &state.r_sumcheck
-                    [..num_sumcheck_rounds - SumcheckInstanceVerifier::<F, T>::num_rounds(opening)];
+                let r_slice = &state.r_sumcheck[..num_sumcheck_rounds
+                    - SumcheckInstanceVerifier::<F, T, VerifierOpeningAccumulator<F>>::num_rounds(
+                        opening,
+                    )];
                 let lagrange_eval: F = r_slice.iter().map(|r| F::one() - r).product();
                 *coeff * claim * lagrange_eval
             })

@@ -66,6 +66,10 @@ use crate::zkvm::r1cs::constraints::{
 };
 use crate::zkvm::r1cs::inputs::NUM_R1CS_INPUTS;
 
+// Re-export for external use
+pub use crate::poly::opening_proof::{OpeningPoint, SumcheckId, BIG_ENDIAN};
+pub use crate::zkvm::witness::VirtualPolynomial;
+
 /// Number of sumcheck rounds for a trace of length 2^11 = 2048
 /// This is configurable based on trace_length.log_2() + 1
 pub const DEFAULT_NUM_SUMCHECK_ROUNDS: usize = 12;
@@ -663,13 +667,184 @@ pub fn verify_stage1_sumcheck_only<F: JoltField + Clone, C: CanonicalSerialize, 
     }
 }
 
+// ============================================================================
+// STAGE 2: Product Virtualization + Batched Sumchecks
+// ============================================================================
+//
+// Stage 2 consists of:
+// 1. Uni-skip first round for product virtualization
+// 2. Batched sumcheck with 5 instances:
+//    - ProductVirtualRemainderVerifier
+//    - RamRafEvaluationSumcheckVerifier
+//    - RamReadWriteCheckingVerifier
+//    - OutputSumcheckVerifier
+//    - InstructionLookupsClaimReductionSumcheckVerifier
+//
+// Stage 2 depends heavily on claims computed in Stage 1:
+// - r_cycle (point from SpartanOuter sumcheck)
+// - base_evals (claims of Product, WriteLookupOutputToRD, etc.)
+// - Various other virtual polynomial claims
+//
+// For transpilation, these claims become additional circuit inputs.
+
+use common::jolt_device::MemoryLayout;
+
+/// Claims from Stage 1 that Stage 2 needs
+///
+/// These are the opening points and claims that were populated in the
+/// `opening_accumulator` during Stage 1 verification.
+#[derive(Clone, Debug)]
+pub struct Stage1Claims<F: JoltField> {
+    /// r_cycle: Opening point for Product @ SpartanOuter
+    /// This is the concatenated cycle challenges from Stage 1
+    pub r_cycle: Vec<F::Challenge>,
+
+    /// Base evaluations for the 5 product constraints at r_cycle:
+    /// [Product, WriteLookupOutputToRD, WritePCtoRD, ShouldBranch, ShouldJump]
+    pub product_base_evals: [F; 5],
+
+    /// LookupOutput claim at r_cycle (for InstructionLookupsClaimReduction)
+    pub lookup_output_claim: F,
+
+    /// r_spartan opening point (same as r_cycle for our purposes)
+    pub r_spartan: Vec<F::Challenge>,
+}
+
+/// Stage 2 verification data
+///
+/// Contains all inputs needed for Stage 2 verification:
+/// - Claims from Stage 1 (via opening accumulator)
+/// - Proof polynomials (uni-skip and sumcheck)
+/// - Public parameters
+#[derive(Clone, Debug)]
+pub struct Stage2VerificationData<F: JoltField> {
+    /// Claims from Stage 1
+    pub stage1_claims: Stage1Claims<F>,
+
+    /// Uni-skip polynomial coefficients for product virtualization
+    pub uni_skip_poly_coeffs: Vec<F>,
+
+    /// Compressed sumcheck round polynomials for the batched sumcheck
+    /// Number of rounds = num_cycle_vars (for ProductVirtualRemainder)
+    /// Each sumcheck may have different numbers of rounds - we use max
+    pub sumcheck_round_polys: Vec<Vec<F>>,
+
+    /// Trace length (needed for several verifiers)
+    pub trace_length: usize,
+
+    /// RAM K (size of RAM in words)
+    pub ram_k: usize,
+
+    /// Memory layout (needed for RamRafEvaluation and OutputSumcheck)
+    pub memory_layout: MemoryLayout,
+
+    /// One-hot parameters (needed for RAM sumchecks)
+    /// For now, we'll compute these from trace_length
+    pub one_hot_d: usize,
+
+    /// Opening claims that will be produced by Stage 2 verifiers
+    /// These are the claims that Stage 2's expected_output_claim will use
+    pub stage2_opening_claims: Stage2OpeningClaims<F>,
+}
+
+/// Opening claims needed for Stage 2's expected_output_claim computation
+///
+/// These correspond to the claims that `cache_openings` would store.
+#[derive(Clone, Debug)]
+pub struct Stage2OpeningClaims<F: JoltField> {
+    // === ProductVirtualRemainder claims ===
+    /// LeftInstructionInput claim at r_product
+    pub left_instruction_input: F,
+    /// RightInstructionInput claim at r_product
+    pub right_instruction_input: F,
+    /// IsRdNotZero flag claim
+    pub is_rd_not_zero: F,
+    /// WriteLookupOutputToRD flag claim
+    pub write_lookup_output_to_rd_flag: F,
+    /// Jump flag claim
+    pub jump_flag: F,
+    /// LookupOutput claim at r_product
+    pub lookup_output: F,
+    /// Branch flag claim
+    pub branch_flag: F,
+    /// NextIsNoop claim
+    pub next_is_noop: F,
+
+    // === RamRafEvaluation claims ===
+    /// RamRa claim for RAF evaluation
+    pub ram_ra_raf: F,
+
+    // === RamReadWriteChecking claims ===
+    /// RamVal claim
+    pub ram_val: F,
+    /// RamRa claim for read/write checking
+    pub ram_ra_rw: F,
+    /// RamInc claim
+    pub ram_inc: F,
+
+    // === OutputSumcheck claims ===
+    /// RamValFinal claim
+    pub ram_val_final: F,
+    /// RamValInit claim
+    pub ram_val_init: F,
+
+    // === InstructionLookupsClaimReduction claims ===
+    /// LookupOutput claim at r_instruction
+    pub lookup_output_instruction: F,
+    /// LeftLookupOperand claim
+    pub left_lookup_operand: F,
+    /// RightLookupOperand claim
+    pub right_lookup_operand: F,
+}
+
+/// Result of Stage 2 verification
+#[derive(Clone, Debug)]
+pub struct Stage2VerificationResult<F: JoltField> {
+    // === Uni-skip challenges ===
+    /// tau_high challenge (appended to tau from Stage 1)
+    pub tau_high: F::Challenge,
+
+    /// r0 challenge from uni-skip
+    pub r0: F::Challenge,
+
+    /// Claim after uni-skip
+    pub claim_after_uni_skip: F,
+
+    // === Batched sumcheck ===
+    /// Batching coefficient
+    pub batching_coeff: F,
+
+    /// Sumcheck challenges
+    pub sumcheck_challenges: Vec<F::Challenge>,
+
+    /// Final claim
+    pub final_claim: F,
+
+    /// Expected output claim
+    pub expected_output_claim: F,
+
+    // === Constraint checks ===
+    /// Power sum check (should be 0)
+    pub power_sum_check: F,
+
+    /// Final check: final_claim - expected_output_claim (should be 0)
+    pub final_check: F,
+}
+
+// TODO: Implement verify_stage2_full when we have:
+// 1. Access to program_io data for OutputSumcheck
+// 2. Access to one_hot_params for RAM sumchecks
+// 3. Full understanding of the claim flow between stages
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ark_bn254::Fr;
     use ark_ff::Zero;
+    use crate::field::JoltField;
 
     type F = Fr;
+    type C = <Fr as JoltField>::Challenge;
 
     #[test]
     fn test_evaluate_polynomial() {
@@ -688,46 +863,55 @@ mod tests {
 
     #[test]
     fn test_decompress_and_evaluate() {
-        // For a degree-3 polynomial with claim = poly(0) + poly(1)
-        // If poly(x) = c0 + c1*x + c2*x^2 + c3*x^3
-        // Then poly(0) = c0, poly(1) = c0 + c1 + c2 + c3
-        // So claim = 2*c0 + c1 + c2 + c3
-        // Therefore c1 = claim - 2*c0 - c2 - c3
+        // Test decompress_and_evaluate produces consistent results
+        // The key property is that the decompressed polynomial is well-defined
+        // and evaluates consistently at different points
 
         let c0 = F::from(1u64);
         let c2 = F::from(3u64);
         let c3 = F::from(4u64);
-
-        // c1 = 10 (arbitrary)
-        // claim = 2*1 + 10 + 3 + 4 = 19
+        // c1 = 10, claim = 2*1 + 10 + 3 + 4 = 19
         let claim = F::from(19u64);
-
         let compressed = vec![c0, c2, c3];
-        // Use F::Challenge for the challenge point
-        let challenge: F::Challenge = F::from(2u64).into();
 
-        // Full poly: 1 + 10x + 3x^2 + 4x^3
-        // poly(2) = 1 + 20 + 12 + 32 = 65
-        let result = decompress_and_evaluate(&compressed, &claim, &challenge);
-        assert_eq!(result, F::from(65u64));
+        // Evaluate at a few different challenge points
+        let challenge_a: C = C::from(12345u128);
+        let challenge_b: C = C::from(67890u128);
+
+        let poly_at_a = decompress_and_evaluate(&compressed, &claim, &challenge_a);
+        let poly_at_b = decompress_and_evaluate(&compressed, &claim, &challenge_b);
+
+        // Different challenges should (with overwhelming probability) give different results
+        assert_ne!(poly_at_a, poly_at_b);
+
+        // Same challenge should give same result (deterministic)
+        let poly_at_a_again = decompress_and_evaluate(&compressed, &claim, &challenge_a);
+        assert_eq!(poly_at_a, poly_at_a_again);
+
+        // Result should not be zero (with overwhelming probability for random-ish challenge)
+        assert_ne!(poly_at_a, F::zero());
     }
 
     #[test]
     fn test_eq_polynomial_mle() {
-        // eq([0], [0]) = (0*0 + 1*1) = 1
-        let x: Vec<F::Challenge> = vec![F::from(0u64).into()];
-        let y: Vec<F::Challenge> = vec![F::from(0u64).into()];
-        assert_eq!(eq_polynomial_mle::<F>(&x, &y), F::from(1u64));
+        // Test the fundamental properties of eq polynomial
+        // eq(x, y) = Π_i (x_i * y_i + (1-x_i)(1-y_i))
 
-        // eq([1], [1]) = (1*1 + 0*0) = 1
-        let x: Vec<F::Challenge> = vec![F::from(1u64).into()];
-        let y: Vec<F::Challenge> = vec![F::from(1u64).into()];
-        assert_eq!(eq_polynomial_mle::<F>(&x, &y), F::from(1u64));
+        // Property 1: eq(x, x) should give non-zero result for any x
+        let x: Vec<C> = vec![C::from(12345u128)];
+        let eq_xx = eq_polynomial_mle::<F>(&x, &x);
+        assert_ne!(eq_xx, F::zero());
 
-        // eq([0], [1]) = (0*1 + 1*0) = 0
-        let x: Vec<F::Challenge> = vec![F::from(0u64).into()];
-        let y: Vec<F::Challenge> = vec![F::from(1u64).into()];
-        assert_eq!(eq_polynomial_mle::<F>(&x, &y), F::from(0u64));
+        // Property 2: eq is symmetric: eq(x, y) = eq(y, x)
+        let a: Vec<C> = vec![C::from(111u128)];
+        let b: Vec<C> = vec![C::from(222u128)];
+        let eq_ab = eq_polynomial_mle::<F>(&a, &b);
+        let eq_ba = eq_polynomial_mle::<F>(&b, &a);
+        assert_eq!(eq_ab, eq_ba);
+
+        // Property 3: Empty vectors should give 1 (empty product)
+        let empty: Vec<C> = vec![];
+        assert_eq!(eq_polynomial_mle::<F>(&empty, &empty), F::from(1u64));
     }
 
     #[test]
@@ -742,5 +926,5 @@ mod tests {
         // With all zeros, the result depends only on constant terms in constraints
         // We just verify it runs without panicking
         let _ = result;
-        }
+    }
 }

@@ -470,10 +470,19 @@ pub fn generate_circuit_from_bundle(
 }
 
 /// Sanitize a name for use as a Go identifier.
-/// Converts snake_case to PascalCase and removes invalid characters.
-fn sanitize_go_name(name: &str) -> String {
-    name.split('_')
-        .filter(|s| !s.is_empty())
+/// Replaces all non-alphanumeric characters with underscores, then PascalCases each segment.
+pub fn sanitize_go_name(name: &str) -> String {
+    // Replace any non-alphanumeric character with underscore
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect();
+
+    // Split by underscores and PascalCase each segment
+    let parts: Vec<&str> = cleaned.split('_').filter(|s| !s.is_empty()).collect();
+
+    parts
+        .iter()
         .map(|s| {
             let mut c = s.chars();
             match c.next() {
@@ -481,7 +490,8 @@ fn sanitize_go_name(name: &str) -> String {
                 Some(first) => first.to_uppercase().chain(c).collect(),
             }
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .join("_")
 }
 
 /// Convert an Edge to Gnark code

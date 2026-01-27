@@ -18,8 +18,7 @@ use crate::{
         multilinear_polynomial::{BindingOrder, MultilinearPolynomial, PolynomialBinding},
         one_hot_polynomial::{EqAddressState, EqCycleState, OneHotPolynomialProverOpening},
         opening_proof::{
-            Opening, OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
-            VerifierOpeningAccumulator, BIG_ENDIAN,
+            Opening, OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId, BIG_ENDIAN,
         },
         unipoly::UniPoly,
     },
@@ -326,7 +325,7 @@ impl<F: JoltField> OpeningProofReductionSumcheckVerifier<F> {
     }
 }
 
-impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
+impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> SumcheckInstanceVerifier<F, T, A>
     for OpeningProofReductionSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
@@ -335,7 +334,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
 
     fn expected_output_claim(
         &self,
-        _accumulator: &VerifierOpeningAccumulator<F>,
+        _accumulator: &A,
         sumcheck_challenges: &[F::Challenge],
     ) -> F {
         let mut r = sumcheck_challenges.to_vec();
@@ -355,7 +354,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
 
     fn cache_openings(
         &self,
-        _accumulator: &mut VerifierOpeningAccumulator<F>,
+        _accumulator: &mut A,
         _transcript: &mut T,
         _sumcheck_challenges: &[F::Challenge],
     ) {

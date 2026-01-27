@@ -1,6 +1,7 @@
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, SerializationError, Valid};
 use ark_std::{One, Zero};
 use jolt_core::field::{FieldOps, JoltField};
+use jolt_core::transcripts::AppendToTranscript;
 use serde::{Deserialize, Serialize};
 
 use std::cell::RefCell;
@@ -78,6 +79,58 @@ pub fn set_pending_commitment_chunks(chunks: Vec<MleAst>) {
 /// Called by PoseidonAstTranscript::append_serializable to get the 12 MleAst chunks.
 pub fn take_pending_commitment_chunks() -> Option<Vec<MleAst>> {
     PENDING_COMMITMENT_CHUNKS.with(|cell| cell.borrow_mut().take())
+}
+
+// =============================================================================
+// Symbolic constraint accumulation for transpilation
+// =============================================================================
+
+thread_local! {
+    /// Accumulated constraints during symbolic execution.
+    /// Each constraint is an MleAst that should equal zero.
+    static SYMBOLIC_CONSTRAINTS: RefCell<Vec<MleAst>> = RefCell::new(Vec::new());
+
+    /// Flag to enable constraint accumulation mode.
+    /// When true, PartialEq comparisons register constraints instead of comparing NodeIds.
+    static CONSTRAINT_MODE: RefCell<bool> = RefCell::new(false);
+}
+
+/// Enable constraint accumulation mode.
+/// In this mode, `MleAst == MleAst` registers `(lhs - rhs) == 0` as a constraint
+/// and returns `true` to allow verification to continue.
+pub fn enable_constraint_mode() {
+    CONSTRAINT_MODE.with(|cell| {
+        *cell.borrow_mut() = true;
+    });
+}
+
+/// Disable constraint accumulation mode.
+pub fn disable_constraint_mode() {
+    CONSTRAINT_MODE.with(|cell| {
+        *cell.borrow_mut() = false;
+    });
+}
+
+/// Check if constraint mode is enabled.
+pub fn is_constraint_mode() -> bool {
+    CONSTRAINT_MODE.with(|cell| *cell.borrow())
+}
+
+/// Take all accumulated constraints, clearing the list.
+pub fn take_constraints() -> Vec<MleAst> {
+    SYMBOLIC_CONSTRAINTS.with(|cell| cell.borrow_mut().drain(..).collect())
+}
+
+/// Get the number of accumulated constraints.
+pub fn num_constraints() -> usize {
+    SYMBOLIC_CONSTRAINTS.with(|cell| cell.borrow().len())
+}
+
+/// Add a constraint that should equal zero.
+fn add_constraint(constraint: MleAst) {
+    SYMBOLIC_CONSTRAINTS.with(|cell| {
+        cell.borrow_mut().push(constraint);
+    });
 }
 
 #[cfg(test)]
@@ -228,7 +281,7 @@ pub enum Node {
 /// An AST intended for representing an MLE computation (although it will actually work for any
 /// multivariate polynomial). The nodes are stored in a global arena, which allows each AST handle
 /// to remain [`Copy`] and [`Sized`] while supporting unbounded growth of the underlying graph.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, PartialOrd, Ord, Clone, Copy)]
 pub struct MleAst {
     /// Index of the root node in the arena.
     /// nodes: [ ]
@@ -849,6 +902,28 @@ const SCALAR_ZERO: Scalar = [0, 0, 0, 0];
 /// One scalar: [1, 0, 0, 0]
 const SCALAR_ONE: Scalar = [1, 0, 0, 0];
 
+impl PartialEq for MleAst {
+    fn eq(&self, other: &Self) -> bool {
+        // If both are the same node, they're trivially equal
+        if self.root == other.root {
+            return true;
+        }
+
+        // In constraint mode, register constraint and return true
+        if is_constraint_mode() {
+            // Constraint: (self - other) == 0
+            let diff = *self - *other;
+            add_constraint(diff);
+            return true;
+        }
+
+        // Normal mode: compare NodeIds (original behavior)
+        false
+    }
+}
+
+impl Eq for MleAst {}
+
 impl Zero for MleAst {
     fn zero() -> Self {
         Self::new_scalar(SCALAR_ZERO)
@@ -933,6 +1008,12 @@ impl std::ops::Mul<&Self> for MleAst {
     type Output = Self;
 
     fn mul(mut self, rhs: &Self) -> Self::Output {
+        // Optimization: x * 0 = 0, 0 * x = 0
+        // This prevents constant-vs-constant assertions in Gnark when
+        // EqPolynomial::evals expands to terms multiplied by zero coefficients.
+        if self.is_zero() || rhs.is_zero() {
+            return Self::zero();
+        }
         self.binop(Node::Mul, rhs);
         self
     }
@@ -975,12 +1056,22 @@ impl<'a> std::ops::SubAssign<&'a Self> for MleAst {
 
 impl std::ops::MulAssign for MleAst {
     fn mul_assign(&mut self, rhs: Self) {
+        // Optimization: x *= 0 => x = 0, 0 *= x => stays 0
+        if self.is_zero() || rhs.is_zero() {
+            *self = Self::zero();
+            return;
+        }
         self.binop(Node::Mul, &rhs);
     }
 }
 
 impl<'a> std::ops::MulAssign<&'a Self> for MleAst {
     fn mul_assign(&mut self, rhs: &'a Self) {
+        // Optimization: x *= 0 => x = 0, 0 *= x => stays 0
+        if self.is_zero() || rhs.is_zero() {
+            *self = Self::zero();
+            return;
+        }
         self.binop(Node::Mul, rhs);
     }
 }
@@ -1624,6 +1715,36 @@ impl CanonicalDeserialize for AstCommitment {
 impl Valid for AstCommitment {
     fn check(&self) -> Result<(), SerializationError> {
         Ok(())
+    }
+}
+
+impl Default for AstCommitment {
+    fn default() -> Self {
+        // Create 12 zero chunks
+        Self {
+            chunks: vec![MleAst::zero(); 12],
+        }
+    }
+}
+
+impl PartialEq for AstCommitment {
+    fn eq(&self, other: &Self) -> bool {
+        // Compare by root indices - this is sufficient for symbolic equality
+        self.chunks.len() == other.chunks.len()
+            && self
+                .chunks
+                .iter()
+                .zip(other.chunks.iter())
+                .all(|(a, b)| a.root() == b.root())
+    }
+}
+
+impl AppendToTranscript for AstCommitment {
+    fn append_to_transcript<T: jolt_core::transcripts::Transcript>(&self, transcript: &mut T) {
+        // Store chunks in thread-local for transcript to retrieve
+        set_pending_commitment_chunks(self.chunks.clone());
+        // The transcript's append_serializable will handle the actual hashing
+        transcript.append_serializable(self);
     }
 }
 

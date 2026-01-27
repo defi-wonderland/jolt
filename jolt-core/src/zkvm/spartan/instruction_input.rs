@@ -478,8 +478,8 @@ pub struct InstructionInputSumcheckVerifier<F: JoltField> {
 }
 
 impl<F: JoltField> InstructionInputSumcheckVerifier<F> {
-    pub fn new(
-        opening_accumulator: &VerifierOpeningAccumulator<F>,
+    pub fn new<A: OpeningAccumulator<F>>(
+        opening_accumulator: &A,
         transcript: &mut impl Transcript,
     ) -> Self {
         let params = InstructionInputParams::new(opening_accumulator, transcript);
@@ -487,7 +487,7 @@ impl<F: JoltField> InstructionInputSumcheckVerifier<F> {
     }
 }
 
-impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
+impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> SumcheckInstanceVerifier<F, T, A>
     for InstructionInputSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
@@ -496,7 +496,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
 
     fn expected_output_claim(
         &self,
-        accumulator: &VerifierOpeningAccumulator<F>,
+        accumulator: &A,
         sumcheck_challenges: &[F::Challenge],
     ) -> F {
         let r = self.params.normalize_opening_point(sumcheck_challenges);
@@ -547,7 +547,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
 
     fn cache_openings(
         &self,
-        accumulator: &mut VerifierOpeningAccumulator<F>,
+        accumulator: &mut A,
         transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     ) {
