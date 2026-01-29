@@ -193,7 +193,28 @@ impl BatchedSumcheck {
             transcript.append_scalar(&input_claim);
         });
 
+        #[cfg(feature = "debug-expected-output")]
+        {
+            transcript.debug_state("before_batching_coeffs");
+        }
         let batching_coeffs: Vec<F> = transcript.challenge_vector(sumcheck_instances.len());
+
+        #[cfg(feature = "debug-expected-output")]
+        {
+            use ark_serialize::CanonicalSerialize;
+            fn to_decimal<T: CanonicalSerialize>(val: &T) -> String {
+                let mut bytes = Vec::new();
+                val.serialize_compressed(&mut bytes).unwrap();
+                num_bigint::BigUint::from_bytes_le(&bytes).to_string()
+            }
+            eprintln!("=== BATCHING COEFFS DEBUG ===");
+            eprintln!("num_sumcheck_instances = {}", sumcheck_instances.len());
+            for (i, coeff) in batching_coeffs.iter().enumerate() {
+                eprintln!("batching_coeff[{}] = {}", i, to_decimal(coeff));
+            }
+            transcript.debug_state("after_batching_coeffs");
+            eprintln!("=== END BATCHING DEBUG ===");
+        }
 
         // To see why we may need to scale by a power of two, consider a batch of
         // two sumchecks:
@@ -236,6 +257,22 @@ impl BatchedSumcheck {
                 claim * coeff
             })
             .sum();
+
+        // Debug output for concrete Fr types
+        #[cfg(feature = "debug-expected-output")]
+        {
+            use ark_serialize::CanonicalSerialize;
+            fn to_decimal<T: CanonicalSerialize>(val: &T) -> String {
+                let mut bytes = Vec::new();
+                val.serialize_compressed(&mut bytes).unwrap();
+                num_bigint::BigUint::from_bytes_le(&bytes).to_string()
+            }
+            eprintln!("=== SUMCHECK VERIFY DEBUG ===");
+            eprintln!("output_claim (from sumcheck) = {}", to_decimal(&output_claim));
+            eprintln!("expected_output_claim (batched) = {}", to_decimal(&expected_output_claim));
+            eprintln!("difference = {}", to_decimal(&(output_claim - expected_output_claim)));
+            eprintln!("=== END SUMCHECK DEBUG ===");
+        }
 
         if output_claim != expected_output_claim {
             return Err(ProofVerifyError::SumcheckVerificationError);
@@ -304,6 +341,22 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
 
             // evaluate the claimed degree-ell polynomial at r_i using the hint
             e = self.compressed_polys[i].eval_from_hint(&e, &r_i);
+        }
+
+        #[cfg(feature = "debug-expected-output")]
+        {
+            use ark_serialize::CanonicalSerialize;
+            fn to_decimal<T: CanonicalSerialize>(val: &T) -> String {
+                let mut bytes = Vec::new();
+                val.serialize_compressed(&mut bytes).unwrap();
+                num_bigint::BigUint::from_bytes_le(&bytes).to_string()
+            }
+            eprintln!("=== SUMCHECK CHALLENGES DEBUG ===");
+            eprintln!("num_rounds = {}", num_rounds);
+            for (i, r_i) in r.iter().enumerate() {
+                eprintln!("sumcheck_challenge[{}] = {}", i, to_decimal(r_i));
+            }
+            eprintln!("=== END CHALLENGES DEBUG ===");
         }
 
         Ok((e, r))
