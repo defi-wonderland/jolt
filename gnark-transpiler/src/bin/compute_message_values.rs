@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 //! Compute exact message values for Go tests
 //!
 //! Usage: cargo run -p gnark-transpiler --bin compute_message_values --release
