@@ -408,8 +408,8 @@ impl Transcript for PoseidonAstTranscript {
         vec![F::zero(); len]
     }
 
-    fn debug_state(&self, label: &str) {
-        println!("TRANSCRIPT DEBUG [{}]: n_rounds={}", label, self.n_rounds);
+    fn debug_state(&self, _label: &str) {
+        // No-op: debug output disabled for transpiler
     }
 }
 

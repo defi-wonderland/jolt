@@ -134,8 +134,8 @@ impl Transcript for KeccakMleTranscript {
         vec![F::zero(); len]
     }
 
-    fn debug_state(&self, label: &str) {
-        println!("TRANSCRIPT DEBUG [{}]: (keccak)", label);
+    fn debug_state(&self, _label: &str) {
+        // No-op: debug output disabled for transpiler
     }
 }
 
