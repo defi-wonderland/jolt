@@ -1,4 +1,3 @@
-#![allow(dead_code, unused_variables, unused_imports)]
 //! Compute R and R^-1 for BN254 Fr Montgomery arithmetic
 //!
 //! In ark-ff, Fr elements are stored in Montgomery form internally.

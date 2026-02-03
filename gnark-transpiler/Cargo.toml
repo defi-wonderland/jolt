@@ -2,7 +2,8 @@
 name = "gnark-transpiler"
 version = "0.1.0"
 edition = "2021"
-description = "Transpiles Jolt's Stage 1 verifier into Gnark circuits for Groth16 proving"
+description = "Transpiles Jolt verifier (stages 1-6) into Gnark circuits for Groth16 proving"
+default-run = "gnark-transpiler"
 
 [dependencies]
 ark-std.workspace = true
@@ -22,7 +23,3 @@ num-bigint = "0.4"
 [[bin]]
 name = "gnark-transpiler"
 path = "src/main.rs"
-
-[[bin]]
-name = "debug_transcript_full"
-path = "src/bin/debug_transcript_full.rs"

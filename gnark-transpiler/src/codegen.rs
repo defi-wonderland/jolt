@@ -7,10 +7,7 @@
 //! by hoisting repeated subexpressions into named variables.
 
 use std::collections::{BTreeSet, HashMap};
-use zklean_extractor::mle_ast::{
-    common_subexpression_elimination, common_subexpression_elimination_incremental, get_node,
-    insert_node, Atom, Bindings, Edge, Node,
-};
+use zklean_extractor::mle_ast::{get_node, Atom, Edge, MleAst, Node};
 
 /// Format a scalar value ([u64; 4]) for Gnark code generation.
 /// Large values (that overflow Go's int64) are formatted as bigInt("...") calls.
@@ -39,7 +36,7 @@ fn format_scalar_for_gnark(limbs: [u64; 4]) -> String {
 pub struct MemoizedCodeGen {
     /// Reference counts for each NodeId (computed in first pass)
     ref_counts: HashMap<usize, usize>,
-    /// Maps NodeId to CSE variable name (e.g., "cse_0")
+    /// Maps NodeId to CSE variable name (e.g., "cse_0" or "cse_3_0" for constraint 3)
     generated: HashMap<usize, String>,
     /// CSE variable definitions in order
     bindings: Vec<String>,
@@ -49,6 +46,8 @@ pub struct MemoizedCodeGen {
     vars: BTreeSet<u16>,
     /// Maps variable index to input name (e.g., 0 -> "UniSkipCoeff0")
     var_names: HashMap<u16, String>,
+    /// Optional constraint index for per-constraint CSE naming (None = global CSE)
+    constraint_idx: Option<usize>,
 }
 
 impl MemoizedCodeGen {
@@ -60,6 +59,7 @@ impl MemoizedCodeGen {
             cse_counter: 0,
             vars: BTreeSet::new(),
             var_names: HashMap::new(),
+            constraint_idx: None,
         }
     }
 
@@ -72,6 +72,29 @@ impl MemoizedCodeGen {
             cse_counter: 0,
             vars: BTreeSet::new(),
             var_names,
+            constraint_idx: None,
+        }
+    }
+
+    /// Create a new MemoizedCodeGen with custom variable names and a constraint index.
+    /// CSE variable names will be prefixed with the constraint index (e.g., "cse_3_0" for constraint 3).
+    pub fn with_var_names_and_constraint_idx(var_names: HashMap<u16, String>, constraint_idx: usize) -> Self {
+        Self {
+            ref_counts: HashMap::new(),
+            generated: HashMap::new(),
+            bindings: Vec::new(),
+            cse_counter: 0,
+            vars: BTreeSet::new(),
+            var_names,
+            constraint_idx: Some(constraint_idx),
+        }
+    }
+
+    /// Generate a CSE variable name using the configured prefix
+    fn make_cse_name(&self) -> String {
+        match self.constraint_idx {
+            Some(idx) => format!("cse_{}_{}", idx, self.cse_counter),
+            None => format!("cse_{}", self.cse_counter),
         }
     }
 
@@ -85,50 +108,52 @@ impl MemoizedCodeGen {
         self.bindings.join("")
     }
 
+
     /// Debug: get reference counts for all nodes
     pub fn ref_counts(&self) -> &HashMap<usize, usize> {
         &self.ref_counts
     }
 
-    /// First pass: count references to each node
-    pub fn count_refs(&mut self, node_id: usize) {
-        *self.ref_counts.entry(node_id).or_insert(0) += 1;
+    /// First pass: count references to each node (iterative to avoid stack overflow)
+    pub fn count_refs(&mut self, root_node_id: usize) {
+        let mut stack = vec![root_node_id];
 
-        // Only traverse children on first visit
-        if self.ref_counts[&node_id] == 1 {
-            let node = get_node(node_id);
-            match node {
-                Node::Atom(_) => {}
-                Node::Neg(e) | Node::Inv(e) | Node::Keccak256(e) | Node::ByteReverse(e) | Node::Truncate128Reverse(e) | Node::Truncate128(e) | Node::MulTwoPow192(e) => {
-                    self.count_refs_edge(e);
-                }
-                Node::Add(e1, e2) | Node::Mul(e1, e2) | Node::Sub(e1, e2) | Node::Div(e1, e2) => {
-                    self.count_refs_edge(e1);
-                    self.count_refs_edge(e2);
-                }
-                Node::Poseidon(e1, e2, e3) => {
-                    self.count_refs_edge(e1);
-                    self.count_refs_edge(e2);
-                    self.count_refs_edge(e3);
+        while let Some(node_id) = stack.pop() {
+            *self.ref_counts.entry(node_id).or_insert(0) += 1;
+
+            // Only traverse children on first visit
+            if self.ref_counts[&node_id] == 1 {
+                let node = get_node(node_id);
+                match node {
+                    Node::Atom(_) => {}
+                    Node::Neg(e) | Node::Inv(e) | Node::Keccak256(e) | Node::ByteReverse(e) | Node::Truncate128Reverse(e) | Node::Truncate128(e) | Node::MulTwoPow192(e) => {
+                        if let Edge::NodeRef(id) = e {
+                            stack.push(id);
+                        }
+                    }
+                    Node::Add(e1, e2) | Node::Mul(e1, e2) | Node::Sub(e1, e2) | Node::Div(e1, e2) => {
+                        if let Edge::NodeRef(id) = e1 {
+                            stack.push(id);
+                        }
+                        if let Edge::NodeRef(id) = e2 {
+                            stack.push(id);
+                        }
+                    }
+                    Node::Poseidon(e1, e2, e3) => {
+                        if let Edge::NodeRef(id) = e1 {
+                            stack.push(id);
+                        }
+                        if let Edge::NodeRef(id) = e2 {
+                            stack.push(id);
+                        }
+                        if let Edge::NodeRef(id) = e3 {
+                            stack.push(id);
+                        }
+                    }
                 }
             }
         }
     }
-
-    fn count_refs_edge(&mut self, edge: Edge) {
-        if let Edge::NodeRef(id) = edge {
-            self.count_refs(id);
-        }
-    }
-
-    /// Generate Gnark expression for an edge
-    fn edge_to_gnark(&mut self, edge: Edge) -> String {
-        match edge {
-            Edge::Atom(atom) => self.atom_to_gnark(atom),
-            Edge::NodeRef(node_id) => self.generate_expr(node_id),
-        }
-    }
-
     /// Generate Gnark expression for an atom
     fn atom_to_gnark(&mut self, atom: Atom) -> String {
         match atom {
@@ -142,187 +167,219 @@ impl MemoizedCodeGen {
                     format!("circuit.X_{}", index)
                 }
             }
-            Atom::NamedVar(index) => format!("cse_{}", index),
+            Atom::NamedVar(index) => {
+                // Use constraint-prefixed name if available
+                match self.constraint_idx {
+                    Some(constraint_idx) => format!("cse_{}_{}", constraint_idx, index),
+                    None => format!("cse_{}", index),
+                }
+            }
         }
     }
 
     /// Generate Gnark expression for a node, with memoization based on ref count
-    pub fn generate_expr(&mut self, node_id: usize) -> String {
-        // Check if already generated
-        if let Some(var_name) = self.generated.get(&node_id) {
-            return var_name.clone();
+    /// (Iterative implementation to avoid stack overflow on deep ASTs)
+    pub fn generate_expr(&mut self, root_node_id: usize) -> String {
+        // Phase 1: Build post-order traversal (children before parents)
+        // We need to process nodes in an order where all children are processed before their parent
+        let mut post_order: Vec<usize> = Vec::new();
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut stack: Vec<(usize, bool)> = vec![(root_node_id, false)];
+
+        while let Some((node_id, children_processed)) = stack.pop() {
+            if children_processed {
+                // All children have been processed, add this node to post_order
+                post_order.push(node_id);
+                continue;
+            }
+
+            // Skip if already in post_order (already fully processed)
+            if visited.contains(&node_id) {
+                continue;
+            }
+            visited.insert(node_id);
+
+            // Push this node back with children_processed = true
+            stack.push((node_id, true));
+
+            // Push children (they'll be processed first due to stack LIFO)
+            let node = get_node(node_id);
+            match node {
+                Node::Atom(_) => {}
+                Node::Neg(e) | Node::Inv(e) | Node::Keccak256(e) | Node::ByteReverse(e)
+                | Node::Truncate128Reverse(e) | Node::Truncate128(e) | Node::MulTwoPow192(e) => {
+                    if let Edge::NodeRef(id) = e {
+                        if !visited.contains(&id) {
+                            stack.push((id, false));
+                        }
+                    }
+                }
+                Node::Add(e1, e2) | Node::Mul(e1, e2) | Node::Sub(e1, e2) | Node::Div(e1, e2) => {
+                    if let Edge::NodeRef(id) = e2 {
+                        if !visited.contains(&id) {
+                            stack.push((id, false));
+                        }
+                    }
+                    if let Edge::NodeRef(id) = e1 {
+                        if !visited.contains(&id) {
+                            stack.push((id, false));
+                        }
+                    }
+                }
+                Node::Poseidon(e1, e2, e3) => {
+                    if let Edge::NodeRef(id) = e3 {
+                        if !visited.contains(&id) {
+                            stack.push((id, false));
+                        }
+                    }
+                    if let Edge::NodeRef(id) = e2 {
+                        if !visited.contains(&id) {
+                            stack.push((id, false));
+                        }
+                    }
+                    if let Edge::NodeRef(id) = e1 {
+                        if !visited.contains(&id) {
+                            stack.push((id, false));
+                        }
+                    }
+                }
+            }
         }
 
-        let node = get_node(node_id);
+        // Phase 2: Generate expressions in post-order (children before parents)
+        for node_id in post_order {
+            // Skip if already generated
+            if self.generated.contains_key(&node_id) {
+                continue;
+            }
 
-        // For atoms, just return directly without hoisting
-        if let Node::Atom(atom) = node {
-            return self.atom_to_gnark(atom);
+            let node = get_node(node_id);
+
+            // For atoms, just generate directly without hoisting
+            if matches!(node, Node::Atom(_)) {
+                // Don't store atoms in generated - they're always inlined
+                continue;
+            }
+
+            // Generate the expression for this node (children are already in self.generated or are atoms)
+            let expr = match node {
+                Node::Atom(atom) => self.atom_to_gnark(atom),
+                Node::Add(left, right) => {
+                    let l = self.edge_to_gnark_iterative(left);
+                    let r = self.edge_to_gnark_iterative(right);
+                    format!("api.Add({}, {})", l, r)
+                }
+                Node::Mul(left, right) => {
+                    let l = self.edge_to_gnark_iterative(left);
+                    let r = self.edge_to_gnark_iterative(right);
+                    format!("api.Mul({}, {})", l, r)
+                }
+                Node::Sub(left, right) => {
+                    let l = self.edge_to_gnark_iterative(left);
+                    let r = self.edge_to_gnark_iterative(right);
+                    format!("api.Sub({}, {})", l, r)
+                }
+                Node::Div(left, right) => {
+                    let l = self.edge_to_gnark_iterative(left);
+                    let r = self.edge_to_gnark_iterative(right);
+                    format!("api.Div({}, {})", l, r)
+                }
+                Node::Neg(child) => {
+                    let c = self.edge_to_gnark_iterative(child);
+                    format!("api.Neg({})", c)
+                }
+                Node::Inv(child) => {
+                    let c = self.edge_to_gnark_iterative(child);
+                    format!("api.Inverse({})", c)
+                }
+                Node::Poseidon(state, n_rounds, data) => {
+                    let s = self.edge_to_gnark_iterative(state);
+                    let r = self.edge_to_gnark_iterative(n_rounds);
+                    let d = self.edge_to_gnark_iterative(data);
+                    format!("poseidon.Hash(api, {}, {}, {})", s, r, d)
+                }
+                Node::Keccak256(input) => {
+                    let i = self.edge_to_gnark_iterative(input);
+                    format!("keccak.Keccak256(api, {})", i)
+                }
+                Node::ByteReverse(input) => {
+                    let i = self.edge_to_gnark_iterative(input);
+                    format!("poseidon.ByteReverse(api, {})", i)
+                }
+                Node::Truncate128Reverse(input) => {
+                    let i = self.edge_to_gnark_iterative(input);
+                    format!("poseidon.Truncate128Reverse(api, {})", i)
+                }
+                Node::Truncate128(input) => {
+                    let i = self.edge_to_gnark_iterative(input);
+                    format!("poseidon.Truncate128(api, {})", i)
+                }
+                Node::MulTwoPow192(input) => {
+                    let i = self.edge_to_gnark_iterative(input);
+                    format!("poseidon.AppendU64Transform(api, {})", i)
+                }
+            };
+
+            // Hoist to CSE variable if referenced more than once
+            let ref_count = self.ref_counts.get(&node_id).copied().unwrap_or(1);
+            if ref_count > 1 {
+                let var_name = self.make_cse_name();
+                self.cse_counter += 1;
+                self.bindings.push(format!("\t{} := {}\n", var_name, expr));
+                self.generated.insert(node_id, var_name);
+            } else {
+                // Store the expression for single-use nodes too, so children can reference it
+                self.generated.insert(node_id, expr);
+            }
         }
 
-        // Generate the expression for this node
-        let expr = match node {
-            Node::Atom(atom) => self.atom_to_gnark(atom),
-            Node::Add(left, right) => {
-                let l = self.edge_to_gnark(left);
-                let r = self.edge_to_gnark(right);
-                format!("api.Add({}, {})", l, r)
-            }
-            Node::Mul(left, right) => {
-                let l = self.edge_to_gnark(left);
-                let r = self.edge_to_gnark(right);
-                format!("api.Mul({}, {})", l, r)
-            }
-            Node::Sub(left, right) => {
-                let l = self.edge_to_gnark(left);
-                let r = self.edge_to_gnark(right);
-                format!("api.Sub({}, {})", l, r)
-            }
-            Node::Div(left, right) => {
-                let l = self.edge_to_gnark(left);
-                let r = self.edge_to_gnark(right);
-                format!("api.Div({}, {})", l, r)
-            }
-            Node::Neg(child) => {
-                let c = self.edge_to_gnark(child);
-                format!("api.Neg({})", c)
-            }
-            Node::Inv(child) => {
-                let c = self.edge_to_gnark(child);
-                format!("api.Inverse({})", c)
-            }
-            Node::Poseidon(state, n_rounds, data) => {
-                let s = self.edge_to_gnark(state);
-                let r = self.edge_to_gnark(n_rounds);
-                let d = self.edge_to_gnark(data);
-                format!("poseidon.Hash(api, {}, {}, {})", s, r, d)
-            }
-            Node::Keccak256(input) => {
-                let i = self.edge_to_gnark(input);
-                format!("keccak.Keccak256(api, {})", i)
-            }
-            Node::ByteReverse(input) => {
-                let i = self.edge_to_gnark(input);
-                format!("poseidon.ByteReverse(api, {})", i)
-            }
-            Node::Truncate128Reverse(input) => {
-                let i = self.edge_to_gnark(input);
-                format!("poseidon.Truncate128Reverse(api, {})", i)
-            }
-            Node::Truncate128(input) => {
-                let i = self.edge_to_gnark(input);
-                format!("poseidon.Truncate128(api, {})", i)
-            }
-            Node::MulTwoPow192(input) => {
-                let i = self.edge_to_gnark(input);
-                format!("poseidon.AppendU64Transform(api, {})", i)
-            }
-        };
-
-        // Hoist to CSE variable if referenced more than once
-        let ref_count = self.ref_counts.get(&node_id).copied().unwrap_or(1);
-        if ref_count > 1 {
-            let var_name = format!("cse_{}", self.cse_counter);
-            self.cse_counter += 1;
-            self.bindings.push(format!("\t{} := {}\n", var_name, expr));
-            self.generated.insert(node_id, var_name.clone());
-            var_name
+        // Return the expression for the root node
+        if let Some(expr) = self.generated.get(&root_node_id) {
+            expr.clone()
         } else {
-            expr
+            // Root was an atom
+            let node = get_node(root_node_id);
+            if let Node::Atom(atom) = node {
+                self.atom_to_gnark(atom)
+            } else {
+                panic!("Root node {} not found in generated expressions", root_node_id)
+            }
+        }
+    }
+
+    /// Non-recursive edge_to_gnark that looks up already-generated expressions
+    fn edge_to_gnark_iterative(&mut self, edge: Edge) -> String {
+        match edge {
+            Edge::Atom(atom) => self.atom_to_gnark(atom),
+            Edge::NodeRef(node_id) => {
+                // Child should already be generated (we're in post-order)
+                if let Some(expr) = self.generated.get(&node_id) {
+                    expr.clone()
+                } else {
+                    // Must be an atom node
+                    let node = get_node(node_id);
+                    if let Node::Atom(atom) = node {
+                        self.atom_to_gnark(atom)
+                    } else {
+                        panic!("Node {} not found in generated - post-order traversal bug?", node_id)
+                    }
+                }
+            }
         }
     }
 }
 
-/// Generate a complete Gnark circuit for Stage 1 verification with memoization.
-///
-/// This uses reference counting to create CSE variables only for nodes that
-/// are referenced more than once, eliminating redundant computations.
-pub fn generate_stage1_circuit_memoized(
-    result: &jolt_core::zkvm::stage1_only_verifier::Stage1TranscriptVerificationResult<
-        zklean_extractor::mle_ast::MleAst,
-    >,
-    circuit_name: &str,
-) -> String {
-    let mut codegen = MemoizedCodeGen::new();
-
-    // First pass: count references to all nodes
-    codegen.count_refs(result.power_sum_check.root());
-    for check in &result.sumcheck_consistency_checks {
-        codegen.count_refs(check.root());
-    }
-    codegen.count_refs(result.final_claim.root());
-
-    // Second pass: generate code (CSE for nodes with refcount > 1)
-    let power_sum_expr = codegen.generate_expr(result.power_sum_check.root());
-
-    let consistency_exprs: Vec<String> = result
-        .sumcheck_consistency_checks
-        .iter()
-        .map(|check| codegen.generate_expr(check.root()))
-        .collect();
-
-    let final_claim_expr = codegen.generate_expr(result.final_claim.root());
-
-    let bindings_code = codegen.bindings_code();
-    let vars = codegen.vars();
-
-    let mut output = String::new();
-
-    // Package and imports
-    output.push_str("package jolt_verifier\n\n");
-    output.push_str("import (\n");
-    output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
-    if bindings_code.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"jolt_verifier/poseidon\"\n");
-    }
-    output.push_str(")\n\n");
-
-    // Circuit struct
-    output.push_str(&format!("type {} struct {{\n", circuit_name));
-    for var_idx in vars {
-        output.push_str(&format!(
-            "\tX_{} frontend.Variable `gnark:\",public\"`\n",
-            var_idx
-        ));
-    }
-    output.push_str("\tExpectedFinalClaim frontend.Variable `gnark:\",public\"`\n");
-    output.push_str("}\n\n");
-
-    // Define method
-    output.push_str(&format!(
-        "func (circuit *{}) Define(api frontend.API) error {{\n",
-        circuit_name
-    ));
-
-    // CSE bindings
-    if !bindings_code.is_empty() {
-        output.push_str("\t// Memoized subexpressions\n");
-        output.push_str(&bindings_code);
-        output.push_str("\n");
-    }
-
-    // Constraints
-    output.push_str("\t// Power sum check\n");
-    output.push_str(&format!("\tpowerSumCheck := {}\n", power_sum_expr));
-    output.push_str("\tapi.AssertIsEqual(powerSumCheck, 0)\n\n");
-
-    for (i, expr) in consistency_exprs.iter().enumerate() {
-        output.push_str(&format!("\t// Sumcheck round {}\n", i));
-        output.push_str(&format!("\tconsistencyCheck{} := {}\n", i, expr));
-        output.push_str(&format!(
-            "\tapi.AssertIsEqual(consistencyCheck{}, 0)\n\n",
-            i
-        ));
-    }
-
-    output.push_str("\t// Final claim\n");
-    output.push_str(&format!("\tfinalClaim := {}\n", final_claim_expr));
-    output.push_str("\tapi.AssertIsEqual(finalClaim, circuit.ExpectedFinalClaim)\n\n");
-
-    output.push_str("\treturn nil\n");
-    output.push_str("}\n");
-
-    output
+/// Statistics about constant assertions detected during codegen
+#[derive(Debug, Default)]
+pub struct ConstantAssertionStats {
+    /// Total number of constraints processed
+    pub total_constraints: usize,
+    /// Number of constant assertions that were skipped
+    pub constant_skipped: usize,
+    /// Number of constant assertions that failed (non-zero constant)
+    pub constant_failed: usize,
+    /// Names of failed constant assertions
+    pub failed_names: Vec<String>,
 }
 
 /// Generate a complete Gnark circuit from an AstBundle.
@@ -330,11 +387,55 @@ pub fn generate_stage1_circuit_memoized(
 /// This is the generic codegen that works with any stage/verifier.
 /// It reads constraints and inputs from the bundle and generates
 /// appropriate gnark code based on the Assertion types.
+///
+/// **Constant Assertion Handling**: If a constraint expression is entirely
+/// constant (contains no variables), the assertion is verified at compile-time:
+/// - If constant == 0 for EqualZero assertions, the constraint is SKIPPED
+/// - If constant != 0, the function PANICS (static verification failure)
+///
+/// Returns the generated Go code and statistics about constant assertions.
 pub fn generate_circuit_from_bundle(
     bundle: &zklean_extractor::mle_ast::AstBundle,
     circuit_name: &str,
 ) -> String {
+    let (code, stats) = generate_circuit_from_bundle_with_stats(bundle, circuit_name);
+
+    // Log statistics
+    if stats.constant_skipped > 0 || stats.constant_failed > 0 {
+        eprintln!(
+            "Codegen stats: {} total constraints, {} constant-skipped, {} constant-failed",
+            stats.total_constraints, stats.constant_skipped, stats.constant_failed
+        );
+    }
+
+    // Panic if any constant assertions failed
+    if stats.constant_failed > 0 {
+        panic!(
+            "Static verification failed: {} constant assertions are non-zero: {:?}",
+            stats.constant_failed, stats.failed_names
+        );
+    }
+
+    code
+}
+
+/// Generate a complete Gnark circuit from an AstBundle, with statistics.
+///
+/// This version returns statistics about constant assertion handling,
+/// useful for debugging and testing.
+///
+/// **Per-Constraint CSE**: To avoid the node aliasing bug where structurally identical
+/// expressions from different constraints get merged, we use per-constraint CSE contexts.
+/// This means each constraint gets its own CSE namespace (cse_0_0, cse_0_1, ... for constraint 0,
+/// cse_1_0, cse_1_1, ... for constraint 1, etc.). This prevents CSE from merging expressions
+/// that are structurally identical but semantically different across constraints.
+pub fn generate_circuit_from_bundle_with_stats(
+    bundle: &zklean_extractor::mle_ast::AstBundle,
+    circuit_name: &str,
+) -> (String, ConstantAssertionStats) {
     use zklean_extractor::mle_ast::{Assertion, InputKind};
+
+    let mut stats = ConstantAssertionStats::default();
 
     // Build var_names mapping from bundle inputs
     let var_names: HashMap<u16, String> = bundle
@@ -343,28 +444,64 @@ pub fn generate_circuit_from_bundle(
         .map(|input| (input.index, input.name.clone()))
         .collect();
 
-    let mut codegen = MemoizedCodeGen::with_var_names(var_names);
+    // Per-constraint CSE: generate each constraint with its own CSE context
+    // This avoids the node aliasing bug where structurally identical expressions
+    // from different constraints get incorrectly merged.
+    let mut all_bindings_code = String::new();
+    // constraint_data: (name, expr, assertion, is_const, const_val, other_expr for EqualNode)
+    let mut constraint_data: Vec<(String, String, &Assertion, bool, Option<[u64; 4]>, Option<String>)> = Vec::new();
+    let mut all_vars: BTreeSet<u16> = BTreeSet::new();
 
-    // First pass: count references to all constraint roots
-    for constraint in &bundle.constraints {
-        codegen.count_refs(constraint.root);
-        // Also count refs for EqualNode targets
-        if let Assertion::EqualNode(other_id) = &constraint.assertion {
+    for (constraint_idx, c) in bundle.constraints.iter().enumerate() {
+        // Create a fresh codegen context for this constraint with per-constraint CSE naming
+        // This ensures CSE variables from different constraints don't collide
+        // e.g., constraint 0 uses cse_0_0, cse_0_1, constraint 1 uses cse_1_0, cse_1_1, etc.
+        let mut codegen = MemoizedCodeGen::with_var_names_and_constraint_idx(
+            var_names.clone(),
+            constraint_idx,
+        );
+
+        // Count references within this constraint only
+        codegen.count_refs(c.root);
+        if let Assertion::EqualNode(other_id) = &c.assertion {
             codegen.count_refs(*other_id);
         }
+
+        // Generate expression for this constraint
+        let expr = codegen.generate_expr(c.root);
+
+        // Generate other_expr for EqualNode assertions
+        let other_expr = if let Assertion::EqualNode(other_id) = &c.assertion {
+            Some(codegen.generate_expr(*other_id))
+        } else {
+            None
+        };
+
+        // Collect vars used in this constraint
+        all_vars.extend(codegen.vars().iter());
+
+        // Check if constant
+        let ast = MleAst::from_node_id(c.root);
+        let is_const = ast.is_constant();
+        let const_val = if is_const {
+            ast.try_evaluate_constant()
+        } else {
+            None
+        };
+
+        // Collect bindings for this constraint (already have prefixed names from codegen)
+        let constraint_bindings = codegen.bindings_code();
+        if !constraint_bindings.is_empty() {
+            all_bindings_code.push_str(&format!("\t// CSE bindings for constraint {}\n", constraint_idx));
+            all_bindings_code.push_str(&constraint_bindings);
+        }
+
+        constraint_data.push((c.name.clone(), expr, &c.assertion, is_const, const_val, other_expr));
     }
 
-    // Second pass: generate expressions for each constraint
-    let constraint_exprs: Vec<(String, String, &Assertion)> = bundle
-        .constraints
-        .iter()
-        .map(|c| {
-            let expr = codegen.generate_expr(c.root);
-            (c.name.clone(), expr, &c.assertion)
-        })
-        .collect();
+    stats.total_constraints = constraint_data.len();
 
-    let bindings_code = codegen.bindings_code();
+    let bindings_code = all_bindings_code;
 
     let mut output = String::new();
 
@@ -375,7 +512,7 @@ pub fn generate_circuit_from_bundle(
     output.push_str("\n");
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
     if bindings_code.contains("poseidon.Hash")
-        || constraint_exprs.iter().any(|(_, e, _)| e.contains("poseidon.Hash"))
+        || constraint_data.iter().any(|(_, e, _, _, _, _)| e.contains("poseidon.Hash"))
     {
         output.push_str("\t\"jolt_verifier/poseidon\"\n");
     }
@@ -437,7 +574,36 @@ pub fn generate_circuit_from_bundle(
     }
 
     // Generate constraints based on assertion type
-    for (name, expr, assertion) in &constraint_exprs {
+    // Skip constant assertions that are satisfied, track those that fail
+    for (name, expr, assertion, is_const, const_val, other_expr) in &constraint_data {
+        // Handle constant assertions specially
+        if *is_const {
+            match assertion {
+                Assertion::EqualZero => {
+                    let val = const_val.unwrap_or([0, 0, 0, 0]);
+                    if val == [0, 0, 0, 0] {
+                        // Constant equals zero - statically satisfied, skip
+                        output.push_str(&format!("\t// {} = 0 (statically verified, skipped)\n\n", name));
+                        stats.constant_skipped += 1;
+                        continue;
+                    } else {
+                        // Constant != 0 - static failure
+                        output.push_str(&format!(
+                            "\t// {} STATIC FAILURE: constant != 0\n",
+                            name
+                        ));
+                        stats.constant_failed += 1;
+                        stats.failed_names.push(name.clone());
+                        // Still emit the constraint so the error is visible
+                    }
+                }
+                _ => {
+                    // For other assertion types with constants, we can't easily
+                    // verify statically, so emit them as normal
+                }
+            }
+        }
+
         output.push_str(&format!("\t// {}\n", name));
         let var_name = sanitize_go_name(name);
         output.push_str(&format!("\t{} := {}\n", var_name, expr));
@@ -453,11 +619,12 @@ pub fn generate_circuit_from_bundle(
                     sanitize_go_name(pub_name)
                 ));
             }
-            Assertion::EqualNode(other_id) => {
-                let other_expr = codegen.generate_expr(*other_id);
+            Assertion::EqualNode(_) => {
+                // other_expr was generated during the constraint processing loop
+                let other = other_expr.as_ref().expect("EqualNode assertion must have other_expr");
                 output.push_str(&format!(
                     "\tapi.AssertIsEqual({}, {})\n\n",
-                    var_name, other_expr
+                    var_name, other
                 ));
             }
         }
@@ -466,7 +633,7 @@ pub fn generate_circuit_from_bundle(
     output.push_str("\treturn nil\n");
     output.push_str("}\n");
 
-    output
+    (output, stats)
 }
 
 /// Sanitize a name for use as a Go identifier.
@@ -733,564 +900,3 @@ pub fn generate_circuit(root_node_id: usize, circuit_name: &str) -> String {
 
     output
 }
-
-/// Generate a complete Gnark circuit for Stage 1 verification.
-///
-/// This generates a circuit that:
-/// 1. Declares all input variables
-/// 2. Enforces power_sum_check == 0
-/// 3. Enforces each sumcheck_consistency_check == 0
-/// 4. Outputs the final_claim
-pub fn generate_stage1_circuit(
-    result: &jolt_core::zkvm::stage1_only_verifier::Stage1TranscriptVerificationResult<
-        zklean_extractor::mle_ast::MleAst,
-    >,
-    circuit_name: &str,
-) -> String {
-    // Collect all variables from all constraints
-    let mut vars = BTreeSet::new();
-
-    let final_claim_expr = generate_gnark_expr_with_vars(result.final_claim.root(), &mut vars);
-    let power_sum_expr = generate_gnark_expr_with_vars(result.power_sum_check.root(), &mut vars);
-
-    let consistency_exprs: Vec<String> = result
-        .sumcheck_consistency_checks
-        .iter()
-        .map(|check| generate_gnark_expr_with_vars(check.root(), &mut vars))
-        .collect();
-
-    let mut output = String::new();
-
-    // Package and imports
-    output.push_str("package jolt_verifier\n\n");
-    output.push_str("import \"github.com/consensys/gnark/frontend\"\n\n");
-
-    // Circuit struct with all used variables
-    output.push_str(&format!("type {} struct {{\n", circuit_name));
-    for var_idx in &vars {
-        output.push_str(&format!(
-            "\tX_{} frontend.Variable `gnark:\",public\"`\n",
-            var_idx
-        ));
-    }
-    output.push_str("\tExpectedFinalClaim frontend.Variable `gnark:\",public\"`\n");
-    output.push_str("}\n\n");
-
-    // Define method
-    output.push_str(&format!(
-        "func (circuit *{}) Define(api frontend.API) error {{\n",
-        circuit_name
-    ));
-
-    // Constraint 1: Power sum check == 0
-    output.push_str("\t// Power sum check: sum over symmetric domain must equal 0\n");
-    output.push_str(&format!("\tpowerSumCheck := {}\n", power_sum_expr));
-    output.push_str("\tapi.AssertIsEqual(powerSumCheck, 0)\n\n");
-
-    // Constraint 2: Each sumcheck consistency check == 0
-    for (i, expr) in consistency_exprs.iter().enumerate() {
-        output.push_str(&format!(
-            "\t// Sumcheck round {}: poly(0) + poly(1) - claim == 0\n",
-            i
-        ));
-        output.push_str(&format!("\tconsistencyCheck{} := {}\n", i, expr));
-        output.push_str(&format!(
-            "\tapi.AssertIsEqual(consistencyCheck{}, 0)\n\n",
-            i
-        ));
-    }
-
-    // Final claim
-    output.push_str("\t// Final claim must match expected\n");
-    output.push_str(&format!("\tfinalClaim := {}\n", final_claim_expr));
-    output.push_str("\tapi.AssertIsEqual(finalClaim, circuit.ExpectedFinalClaim)\n\n");
-
-    output.push_str("\treturn nil\n");
-    output.push_str("}\n");
-
-    output
-}
-
-/// Convert an Atom to Gnark code with CSE offset for NamedVar indices
-fn atom_to_gnark_with_offset(atom: Atom, vars: &mut BTreeSet<u16>, cse_offset: usize) -> String {
-    match atom {
-        Atom::Scalar(value) => format_scalar_for_gnark(value),
-        Atom::Var(index) => {
-            vars.insert(index);
-            format!("circuit.X_{}", index)
-        }
-        Atom::NamedVar(index) => format!("cse_{}", cse_offset + index),
-    }
-}
-
-/// Convert an Edge to Gnark code with CSE offset
-fn edge_to_gnark_with_offset(edge: Edge, vars: &mut BTreeSet<u16>, cse_offset: usize) -> String {
-    match edge {
-        Edge::Atom(atom) => atom_to_gnark_with_offset(atom, vars, cse_offset),
-        Edge::NodeRef(node_id) => {
-            generate_gnark_expr_with_vars_and_offset(node_id, vars, cse_offset)
-        }
-    }
-}
-
-/// Generate Gnark expression with CSE offset for NamedVar references
-fn generate_gnark_expr_with_vars_and_offset(
-    node_id: usize,
-    vars: &mut BTreeSet<u16>,
-    cse_offset: usize,
-) -> String {
-    let node = get_node(node_id);
-
-    match node {
-        Node::Atom(atom) => atom_to_gnark_with_offset(atom, vars, cse_offset),
-
-        Node::Add(left, right) => {
-            format!(
-                "api.Add({}, {})",
-                edge_to_gnark_with_offset(left, vars, cse_offset),
-                edge_to_gnark_with_offset(right, vars, cse_offset)
-            )
-        }
-
-        Node::Mul(left, right) => {
-            format!(
-                "api.Mul({}, {})",
-                edge_to_gnark_with_offset(left, vars, cse_offset),
-                edge_to_gnark_with_offset(right, vars, cse_offset)
-            )
-        }
-
-        Node::Sub(left, right) => {
-            format!(
-                "api.Sub({}, {})",
-                edge_to_gnark_with_offset(left, vars, cse_offset),
-                edge_to_gnark_with_offset(right, vars, cse_offset)
-            )
-        }
-
-        Node::Neg(child) => {
-            format!(
-                "api.Neg({})",
-                edge_to_gnark_with_offset(child, vars, cse_offset)
-            )
-        }
-
-        Node::Inv(child) => {
-            format!(
-                "api.Inverse({})",
-                edge_to_gnark_with_offset(child, vars, cse_offset)
-            )
-        }
-
-        Node::Div(left, right) => {
-            format!(
-                "api.Div({}, {})",
-                edge_to_gnark_with_offset(left, vars, cse_offset),
-                edge_to_gnark_with_offset(right, vars, cse_offset)
-            )
-        }
-
-        Node::Poseidon(state, n_rounds, data) => {
-            format!(
-                "poseidon.Hash(api, {}, {}, {})",
-                edge_to_gnark_with_offset(state, vars, cse_offset),
-                edge_to_gnark_with_offset(n_rounds, vars, cse_offset),
-                edge_to_gnark_with_offset(data, vars, cse_offset)
-            )
-        }
-
-        Node::Keccak256(input) => {
-            format!(
-                "keccak.Keccak256(api, {})",
-                edge_to_gnark_with_offset(input, vars, cse_offset)
-            )
-        }
-
-        Node::ByteReverse(input) => {
-            format!(
-                "ByteReverse(api, {})",
-                edge_to_gnark_with_offset(input, vars, cse_offset)
-            )
-        }
-
-        Node::Truncate128Reverse(input) => {
-            format!(
-                "Truncate128Reverse(api, {})",
-                edge_to_gnark_with_offset(input, vars, cse_offset)
-            )
-        }
-
-        Node::Truncate128(input) => {
-            format!(
-                "Truncate128(api, {})",
-                edge_to_gnark_with_offset(input, vars, cse_offset)
-            )
-        }
-
-        Node::MulTwoPow192(input) => {
-            format!(
-                "AppendU64Transform(api, {})",
-                edge_to_gnark_with_offset(input, vars, cse_offset)
-            )
-        }
-    }
-}
-
-/// Generate Gnark expression for a node (used for CSE bindings) with offset.
-/// This is similar to generate_gnark_expr but takes a Node directly instead of a node_id.
-fn generate_gnark_expr_for_node_with_offset(
-    node: &Node,
-    vars: &mut BTreeSet<u16>,
-    cse_offset: usize,
-) -> String {
-    match node {
-        Node::Atom(atom) => atom_to_gnark_with_offset(*atom, vars, cse_offset),
-
-        Node::Add(left, right) => {
-            format!(
-                "api.Add({}, {})",
-                edge_to_gnark_with_offset(*left, vars, cse_offset),
-                edge_to_gnark_with_offset(*right, vars, cse_offset)
-            )
-        }
-
-        Node::Mul(left, right) => {
-            format!(
-                "api.Mul({}, {})",
-                edge_to_gnark_with_offset(*left, vars, cse_offset),
-                edge_to_gnark_with_offset(*right, vars, cse_offset)
-            )
-        }
-
-        Node::Sub(left, right) => {
-            format!(
-                "api.Sub({}, {})",
-                edge_to_gnark_with_offset(*left, vars, cse_offset),
-                edge_to_gnark_with_offset(*right, vars, cse_offset)
-            )
-        }
-
-        Node::Neg(child) => {
-            format!(
-                "api.Neg({})",
-                edge_to_gnark_with_offset(*child, vars, cse_offset)
-            )
-        }
-
-        Node::Inv(child) => {
-            format!(
-                "api.Inverse({})",
-                edge_to_gnark_with_offset(*child, vars, cse_offset)
-            )
-        }
-
-        Node::Div(left, right) => {
-            format!(
-                "api.Div({}, {})",
-                edge_to_gnark_with_offset(*left, vars, cse_offset),
-                edge_to_gnark_with_offset(*right, vars, cse_offset)
-            )
-        }
-
-        Node::Poseidon(state, n_rounds, data) => {
-            format!(
-                "poseidon.Hash(api, {}, {}, {})",
-                edge_to_gnark_with_offset(*state, vars, cse_offset),
-                edge_to_gnark_with_offset(*n_rounds, vars, cse_offset),
-                edge_to_gnark_with_offset(*data, vars, cse_offset)
-            )
-        }
-
-        Node::Keccak256(input) => {
-            format!(
-                "keccak.Keccak256(api, {})",
-                edge_to_gnark_with_offset(*input, vars, cse_offset)
-            )
-        }
-
-        Node::ByteReverse(input) => {
-            format!(
-                "ByteReverse(api, {})",
-                edge_to_gnark_with_offset(*input, vars, cse_offset)
-            )
-        }
-
-        Node::Truncate128Reverse(input) => {
-            format!(
-                "Truncate128Reverse(api, {})",
-                edge_to_gnark_with_offset(*input, vars, cse_offset)
-            )
-        }
-
-        Node::Truncate128(input) => {
-            format!(
-                "Truncate128(api, {})",
-                edge_to_gnark_with_offset(*input, vars, cse_offset)
-            )
-        }
-
-        Node::MulTwoPow192(input) => {
-            format!(
-                "AppendU64Transform(api, {})",
-                edge_to_gnark_with_offset(*input, vars, cse_offset)
-            )
-        }
-    }
-}
-
-/// Apply CSE to a node and generate Gnark code with hoisted bindings.
-///
-/// The `cse_offset` parameter allows generating unique CSE variable names across
-/// multiple calls (cse_0, cse_1, ... from first call, cse_N, cse_N+1, ... from second call).
-///
-/// Returns (bindings_code, final_expr, new_offset) where:
-/// - bindings_code: Go variable assignments for hoisted subexpressions
-/// - final_expr: The final expression using the hoisted variables
-/// - new_offset: The next available CSE index
-fn generate_gnark_expr_with_cse(
-    node_id: usize,
-    vars: &mut BTreeSet<u16>,
-    cse_offset: usize,
-) -> (String, String, usize) {
-    let root_node = get_node(node_id);
-    let (bindings, new_root) = common_subexpression_elimination(root_node);
-
-    let mut bindings_code = String::new();
-
-    // Generate code for each hoisted binding with offset indices
-    for (i, binding_node) in bindings.iter().enumerate() {
-        let binding_expr = generate_gnark_expr_for_node_with_offset(binding_node, vars, cse_offset);
-        bindings_code.push_str(&format!("\tcse_{} := {}\n", cse_offset + i, binding_expr));
-    }
-
-    // Generate the final expression using the new root
-    let new_root_id = insert_node(new_root);
-    let final_expr = generate_gnark_expr_with_vars_and_offset(new_root_id, vars, cse_offset);
-
-    let new_offset = cse_offset + bindings.len();
-    (bindings_code, final_expr, new_offset)
-}
-
-/// Generate a complete Gnark circuit for Stage 1 verification with CSE optimization.
-///
-/// This is like generate_stage1_circuit but applies Common Subexpression Elimination
-/// to reduce code size and potentially constraint count by hoisting repeated
-/// subexpressions (especially nested Poseidon calls) into named variables.
-pub fn generate_stage1_circuit_with_cse(
-    result: &jolt_core::zkvm::stage1_only_verifier::Stage1TranscriptVerificationResult<
-        zklean_extractor::mle_ast::MleAst,
-    >,
-    circuit_name: &str,
-) -> String {
-    let mut vars = BTreeSet::new();
-    let mut all_bindings = String::new();
-    let mut cse_offset = 0usize;
-
-    // Apply CSE to each constraint and collect all bindings with global offset
-    let (power_bindings, power_sum_expr, new_offset) =
-        generate_gnark_expr_with_cse(result.power_sum_check.root(), &mut vars, cse_offset);
-    all_bindings.push_str(&power_bindings);
-    cse_offset = new_offset;
-
-    let mut consistency_exprs = Vec::new();
-    for check in &result.sumcheck_consistency_checks {
-        let (bindings, expr, new_offset) =
-            generate_gnark_expr_with_cse(check.root(), &mut vars, cse_offset);
-        all_bindings.push_str(&bindings);
-        consistency_exprs.push(expr);
-        cse_offset = new_offset;
-    }
-
-    let (final_bindings, final_claim_expr, _) =
-        generate_gnark_expr_with_cse(result.final_claim.root(), &mut vars, cse_offset);
-    all_bindings.push_str(&final_bindings);
-
-    let mut output = String::new();
-
-    // Package and imports
-    output.push_str("package jolt_verifier\n\n");
-    output.push_str("import (\n");
-    output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
-    // Check if we use Poseidon
-    if all_bindings.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"jolt_verifier/poseidon\"\n");
-    }
-    output.push_str(")\n\n");
-
-    // Circuit struct with all used variables
-    output.push_str(&format!("type {} struct {{\n", circuit_name));
-    for var_idx in &vars {
-        output.push_str(&format!(
-            "\tX_{} frontend.Variable `gnark:\",public\"`\n",
-            var_idx
-        ));
-    }
-    output.push_str("\tExpectedFinalClaim frontend.Variable `gnark:\",public\"`\n");
-    output.push_str("}\n\n");
-
-    // Define method
-    output.push_str(&format!(
-        "func (circuit *{}) Define(api frontend.API) error {{\n",
-        circuit_name
-    ));
-
-    // First, emit all CSE bindings
-    if !all_bindings.is_empty() {
-        output.push_str("\t// Common subexpressions (CSE optimization)\n");
-        output.push_str(&all_bindings);
-        output.push_str("\n");
-    }
-
-    // Constraint 1: Power sum check == 0
-    output.push_str("\t// Power sum check: sum over symmetric domain must equal 0\n");
-    output.push_str(&format!("\tpowerSumCheck := {}\n", power_sum_expr));
-    output.push_str("\tapi.AssertIsEqual(powerSumCheck, 0)\n\n");
-
-    // Constraint 2: Each sumcheck consistency check == 0
-    for (i, expr) in consistency_exprs.iter().enumerate() {
-        output.push_str(&format!(
-            "\t// Sumcheck round {}: poly(0) + poly(1) - claim == 0\n",
-            i
-        ));
-        output.push_str(&format!("\tconsistencyCheck{} := {}\n", i, expr));
-        output.push_str(&format!(
-            "\tapi.AssertIsEqual(consistencyCheck{}, 0)\n\n",
-            i
-        ));
-    }
-
-    // Final claim
-    output.push_str("\t// Final claim must match expected\n");
-    output.push_str(&format!("\tfinalClaim := {}\n", final_claim_expr));
-    output.push_str("\tapi.AssertIsEqual(finalClaim, circuit.ExpectedFinalClaim)\n\n");
-
-    output.push_str("\treturn nil\n");
-    output.push_str("}\n");
-
-    output
-}
-
-/// Generate a complete Gnark circuit for Stage 1 verification with GLOBAL CSE optimization.
-///
-/// Unlike `generate_stage1_circuit_with_cse`, this function uses a SHARED bindings
-/// HashMap across ALL constraints. This means that if multiple constraints share
-/// the same subexpression (e.g., Poseidon hash chains), it will only be hoisted ONCE.
-///
-/// This is the proper CSE implementation that produces smaller output than no CSE.
-pub fn generate_stage1_circuit_with_global_cse(
-    result: &jolt_core::zkvm::stage1_only_verifier::Stage1TranscriptVerificationResult<
-        zklean_extractor::mle_ast::MleAst,
-    >,
-    circuit_name: &str,
-) -> String {
-    let mut vars = BTreeSet::new();
-
-    // GLOBAL shared state for CSE - this is the key difference!
-    let mut global_bindings: Bindings = HashMap::new();
-    let mut global_nodes: Vec<Node> = Vec::new();
-
-    // Apply CSE incrementally to each constraint, sharing bindings across all
-    let power_root = get_node(result.power_sum_check.root());
-    let power_new_root = common_subexpression_elimination_incremental(
-        power_root,
-        &mut global_bindings,
-        &mut global_nodes,
-    );
-    let power_new_root_id = insert_node(power_new_root);
-    let power_sum_expr = generate_gnark_expr_with_vars(power_new_root_id, &mut vars);
-
-    let mut consistency_exprs = Vec::new();
-    for check in &result.sumcheck_consistency_checks {
-        let check_root = get_node(check.root());
-        let check_new_root = common_subexpression_elimination_incremental(
-            check_root,
-            &mut global_bindings,
-            &mut global_nodes,
-        );
-        let check_new_root_id = insert_node(check_new_root);
-        let expr = generate_gnark_expr_with_vars(check_new_root_id, &mut vars);
-        consistency_exprs.push(expr);
-    }
-
-    let final_root = get_node(result.final_claim.root());
-    let final_new_root = common_subexpression_elimination_incremental(
-        final_root,
-        &mut global_bindings,
-        &mut global_nodes,
-    );
-    let final_new_root_id = insert_node(final_new_root);
-    let final_claim_expr = generate_gnark_expr_with_vars(final_new_root_id, &mut vars);
-
-    // Generate CSE bindings code from the global_nodes
-    let mut bindings_code = String::new();
-    for (i, binding_node) in global_nodes.iter().enumerate() {
-        let binding_expr = generate_gnark_expr_for_node_with_offset(binding_node, &mut vars, 0);
-        bindings_code.push_str(&format!("\tcse_{} := {}\n", i, binding_expr));
-    }
-
-    let mut output = String::new();
-
-    // Package and imports
-    output.push_str("package jolt_verifier\n\n");
-    output.push_str("import (\n");
-    output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
-    // Check if we use Poseidon
-    if bindings_code.contains("poseidon.Hash") || final_claim_expr.contains("poseidon.Hash") {
-        output.push_str("\t\"jolt_verifier/poseidon\"\n");
-    }
-    output.push_str(")\n\n");
-
-    // Circuit struct with all used variables
-    output.push_str(&format!("type {} struct {{\n", circuit_name));
-    for var_idx in &vars {
-        output.push_str(&format!(
-            "\tX_{} frontend.Variable `gnark:\",public\"`\n",
-            var_idx
-        ));
-    }
-    output.push_str("\tExpectedFinalClaim frontend.Variable `gnark:\",public\"`\n");
-    output.push_str("}\n\n");
-
-    // Define method
-    output.push_str(&format!(
-        "func (circuit *{}) Define(api frontend.API) error {{\n",
-        circuit_name
-    ));
-
-    // First, emit all CSE bindings (shared across all constraints!)
-    if !bindings_code.is_empty() {
-        output.push_str("\t// Common subexpressions (GLOBAL CSE optimization)\n");
-        output.push_str(&bindings_code);
-        output.push_str("\n");
-    }
-
-    // Constraint 1: Power sum check == 0
-    output.push_str("\t// Power sum check: sum over symmetric domain must equal 0\n");
-    output.push_str(&format!("\tpowerSumCheck := {}\n", power_sum_expr));
-    output.push_str("\tapi.AssertIsEqual(powerSumCheck, 0)\n\n");
-
-    // Constraint 2: Each sumcheck consistency check == 0
-    for (i, expr) in consistency_exprs.iter().enumerate() {
-        output.push_str(&format!(
-            "\t// Sumcheck round {}: poly(0) + poly(1) - claim == 0\n",
-            i
-        ));
-        output.push_str(&format!("\tconsistencyCheck{} := {}\n", i, expr));
-        output.push_str(&format!(
-            "\tapi.AssertIsEqual(consistencyCheck{}, 0)\n\n",
-            i
-        ));
-    }
-
-    // Final claim
-    output.push_str("\t// Final claim must match expected\n");
-    output.push_str(&format!("\tfinalClaim := {}\n", final_claim_expr));
-    output.push_str("\tapi.AssertIsEqual(finalClaim, circuit.ExpectedFinalClaim)\n\n");
-
-    output.push_str("\treturn nil\n");
-    output.push_str("}\n");
-
-    output
-}
-
-// Tests moved to tests/rust_to_gnark.rs
