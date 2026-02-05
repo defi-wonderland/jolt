@@ -7,7 +7,7 @@ use crate::{
         multilinear_polynomial::{BindingOrder, MultilinearPolynomial, PolynomialBinding},
         opening_proof::{
             OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
-            VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
+            BIG_ENDIAN, LITTLE_ENDIAN,
         },
         unipoly::UniPoly,
     },
@@ -59,12 +59,12 @@ impl<F: JoltField> ValFinalSumcheckParams<F> {
         }
     }
 
-    pub fn new_from_verifier(
+    pub fn new_from_verifier<A: OpeningAccumulator<F>>(
         ram_preprocessing: &super::RAMPreprocessing,
         program_io: &JoltDevice,
         trace_len: usize,
         ram_K: usize,
-        opening_accumulator: &VerifierOpeningAccumulator<F>,
+        opening_accumulator: &A,
         rw_config: &ReadWriteConfig,
     ) -> Self {
         let r_address = opening_accumulator
@@ -303,12 +303,12 @@ pub struct ValFinalSumcheckVerifier<F: JoltField> {
 }
 
 impl<F: JoltField> ValFinalSumcheckVerifier<F> {
-    pub fn new(
+    pub fn new<A: OpeningAccumulator<F>>(
         ram_preprocessing: &super::RAMPreprocessing,
         program_io: &JoltDevice,
         trace_len: usize,
         ram_K: usize,
-        opening_accumulator: &VerifierOpeningAccumulator<F>,
+        opening_accumulator: &A,
         rw_config: &ReadWriteConfig,
     ) -> Self {
         let params = ValFinalSumcheckParams::new_from_verifier(
@@ -323,14 +323,16 @@ impl<F: JoltField> ValFinalSumcheckVerifier<F> {
     }
 }
 
-impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for ValFinalSumcheckVerifier<F> {
+impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> SumcheckInstanceVerifier<F, T, A>
+    for ValFinalSumcheckVerifier<F>
+{
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         &self.params
     }
 
     fn expected_output_claim(
         &self,
-        accumulator: &VerifierOpeningAccumulator<F>,
+        accumulator: &A,
         _sumcheck_challenges: &[F::Challenge],
     ) -> F {
         let inc_claim = accumulator
@@ -350,7 +352,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T> for ValFinalSum
 
     fn cache_openings(
         &self,
-        accumulator: &mut VerifierOpeningAccumulator<F>,
+        accumulator: &mut A,
         transcript: &mut T,
         sumcheck_challenges: &[<F as JoltField>::Challenge],
     ) {

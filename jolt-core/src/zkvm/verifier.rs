@@ -326,7 +326,7 @@ impl<'a, F: JoltField, PCS: CommitmentScheme<Field = F>, ProofTranscript: Transc
     }
 
     fn verify_stage4(&mut self) -> Result<(), anyhow::Error> {
-        verifier_accumulate_advice::<F>(
+        verifier_accumulate_advice::<F, VerifierOpeningAccumulator<F>>(
             self.proof.ram_K,
             &self.program_io,
             self.proof.untrusted_advice_commitment.is_some(),
@@ -470,7 +470,7 @@ impl<'a, F: JoltField, PCS: CommitmentScheme<Field = F>, ProofTranscript: Transc
             ));
         }
 
-        let mut instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript>> = vec![
+        let mut instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, VerifierOpeningAccumulator<F>>> = vec![
             &bytecode_read_raf,
             &booleanity,
             &ram_hamming_booleanity,
@@ -506,7 +506,7 @@ impl<'a, F: JoltField, PCS: CommitmentScheme<Field = F>, ProofTranscript: Transc
             &mut self.transcript,
         );
 
-        let mut instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript>> =
+        let mut instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, VerifierOpeningAccumulator<F>>> =
             vec![&hw_verifier];
         if let Some(advice_reduction_verifier_trusted) =
             self.advice_reduction_verifier_trusted.as_mut()
