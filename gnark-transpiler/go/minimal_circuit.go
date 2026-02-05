@@ -1,4 +1,4 @@
-package tests
+package jolt_verifier
 
 import (
 	"github.com/consensys/gnark/frontend"
