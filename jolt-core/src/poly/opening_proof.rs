@@ -179,6 +179,18 @@ pub enum OpeningId {
     TrustedAdvice(SumcheckId),
 }
 
+impl OpeningId {
+    /// Create an OpeningId for a committed polynomial.
+    pub fn committed(poly: CommittedPolynomial, sumcheck: SumcheckId) -> Self {
+        OpeningId::Polynomial(PolynomialId::Committed(poly), sumcheck)
+    }
+
+    /// Create an OpeningId for a virtual polynomial.
+    pub fn virtual_poly(poly: VirtualPolynomial, sumcheck: SumcheckId) -> Self {
+        OpeningId::Polynomial(PolynomialId::Virtual(poly), sumcheck)
+    }
+}
+
 /// (point, claim)
 pub type Opening<F> = (OpeningPoint<BIG_ENDIAN, F>, F);
 pub type Openings<F> = BTreeMap<OpeningId, Opening<F>>;
