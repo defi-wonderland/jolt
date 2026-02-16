@@ -275,6 +275,8 @@ impl<
     }
 
     fn verify_stage1(&mut self) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "debug-expected-output")]
+        eprintln!("\n========== STAGE 1 ==========");
         let uni_skip_params = verify_stage1_uni_skip(
             &self.proof.stage1_uni_skip_first_round_proof,
             &self.spartan_key,
@@ -302,6 +304,8 @@ impl<
     }
 
     fn verify_stage2(&mut self) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "debug-expected-output")]
+        eprintln!("\n========== STAGE 2 ==========");
         let uni_skip_params = verify_stage2_uni_skip(
             &self.proof.stage2_uni_skip_first_round_proof,
             &mut self.opening_accumulator,
@@ -356,6 +360,8 @@ impl<
     }
 
     fn verify_stage3(&mut self) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "debug-expected-output")]
+        eprintln!("\n========== STAGE 3 ==========");
         let spartan_shift = ShiftSumcheckVerifier::new(
             self.proof.trace_length.log_2(),
             &self.opening_accumulator,
@@ -385,6 +391,8 @@ impl<
     }
 
     fn verify_stage4(&mut self) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "debug-expected-output")]
+        eprintln!("\n========== STAGE 4 ==========");
         verifier_accumulate_advice::<F, A>(
             self.proof.ram_K,
             &self.program_io,
@@ -435,6 +443,8 @@ impl<
     }
 
     fn verify_stage5(&mut self) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "debug-expected-output")]
+        eprintln!("\n========== STAGE 5 ==========");
         let n_cycle_vars = self.proof.trace_length.log_2();
 
         let lookups_read_raf = InstructionReadRafSumcheckVerifier::new(
@@ -468,6 +478,8 @@ impl<
     }
 
     fn verify_stage6(&mut self) -> Result<(), anyhow::Error> {
+        #[cfg(feature = "debug-expected-output")]
+        eprintln!("\n========== STAGE 6 ==========");
         let n_cycle_vars = self.proof.trace_length.log_2();
         let bytecode_read_raf = BytecodeReadRafSumcheckVerifier::gen(
             &self.preprocessing.shared.bytecode,

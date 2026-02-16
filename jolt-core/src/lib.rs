@@ -12,6 +12,8 @@
 #[cfg(feature = "host")]
 pub mod host;
 
+#[cfg(feature = "debug-expected-output")]
+pub mod assertion_debug;
 pub mod field;
 pub mod guest;
 pub mod msm;

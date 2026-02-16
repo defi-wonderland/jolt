@@ -1,12 +1,10 @@
 //! Run the real Jolt verifier (stages 1-6) with concrete types.
 //!
-//! When run with --features debug-expected-output, this will print the
-//! intermediate values of each sumcheck assertion (output_claim and expected_output_claim).
+//! With --features debug-expected-output, prints all 15 assertion values
+//! and exports them to go/rust_all_assertions.json for comparison with Go circuit.
 //!
 //! Usage:
-//!   cargo run -p gnark-transpiler --bin verify_real --features debug-expected-output 2> rust_assertions.txt
-//!
-//! With --export-json flag, also writes assertion values to /tmp/rust_assertion_values.json
+//!   cargo run -p gnark-transpiler --bin verify_real --features debug-expected-output
 
 use ark_bn254::Fr;
 use ark_serialize::CanonicalDeserialize;
@@ -19,7 +17,8 @@ use jolt_core::zkvm::RV64IMACProof;
 use common::jolt_device::JoltDevice;
 
 fn main() {
-    let export_json = std::env::args().any(|arg| arg == "--export-json");
+    #[cfg(feature = "debug-expected-output")]
+    jolt_core::assertion_debug::reset();
 
     eprintln!("=== Running Real Jolt Verifier (Stages 1-6) ===\n");
 
@@ -76,9 +75,10 @@ fn main() {
             eprintln!("=== END ASSERTION VALUES ===");
             eprintln!("\nVerification completed successfully!");
 
-            // Export to JSON if requested
-            if export_json {
-                export_assertion_json();
+            #[cfg(feature = "debug-expected-output")]
+            {
+                let json_path = concat!(env!("CARGO_MANIFEST_DIR"), "/go/rust_all_assertions.json");
+                jolt_core::assertion_debug::export_json(json_path);
             }
         }
         Err(e) => {
@@ -87,36 +87,4 @@ fn main() {
             std::process::exit(1);
         }
     }
-}
-
-/// Export assertion values to JSON by re-running with debug output and parsing
-fn export_assertion_json() {
-    eprintln!("\n=== Exporting assertion values to JSON ===");
-
-    // The assertion values are already captured above in the debug output.
-    // For a cleaner approach, we'll create a structured JSON with the known values.
-    // These values are extracted from the debug output of the verification above.
-
-    // Note: In production, you'd want to capture these values directly during verification.
-    // For now, we hardcode the expected format based on the debug output pattern.
-
-    let json_output = r#"{
-  "source": "rust_verify_real",
-  "stages": [
-    {
-      "stage": 1,
-      "name": "SpartanOuter",
-      "sumcheck": {
-        "output_claim": "extracted_from_debug",
-        "expected_output_claim": "extracted_from_debug",
-        "difference": "0"
-      }
-    }
-  ],
-  "note": "Run with --features debug-expected-output and parse stderr for actual values"
-}"#;
-
-    let output_path = "/tmp/rust_assertion_values.json";
-    std::fs::write(output_path, json_output).expect("Failed to write JSON");
-    eprintln!("Assertion values written to: {}", output_path);
 }

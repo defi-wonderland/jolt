@@ -1104,6 +1104,8 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
                 SumcheckId::InstructionInputVirtualization,
             );
 
+        #[cfg(feature = "debug-expected-output")]
+        crate::assertion_debug::log_assertion_eq(&spartan_shift_unexpanded_pc_claim, &instruction_input_unexpanded_pc_claim, "bytecode_unexpanded_pc_consistency");
         assert_eq!(
             spartan_shift_unexpanded_pc_claim,
             instruction_input_unexpanded_pc_claim

@@ -53,6 +53,8 @@ pub struct MemoizedCodeGen<'a> {
     var_names: HashMap<u16, String>,
     /// Optional constraint index for per-constraint CSE naming (None = global CSE)
     constraint_idx: Option<usize>,
+    /// When true, emit api.Println for debug output
+    debug_intermediates: bool,
 }
 
 impl<'a> MemoizedCodeGen<'a> {
@@ -66,6 +68,7 @@ impl<'a> MemoizedCodeGen<'a> {
             vars: BTreeSet::new(),
             var_names: HashMap::new(),
             constraint_idx: None,
+            debug_intermediates: false,
         }
     }
 
@@ -80,6 +83,7 @@ impl<'a> MemoizedCodeGen<'a> {
             vars: BTreeSet::new(),
             var_names,
             constraint_idx: None,
+            debug_intermediates: false,
         }
     }
 
@@ -95,6 +99,7 @@ impl<'a> MemoizedCodeGen<'a> {
             vars: BTreeSet::new(),
             var_names,
             constraint_idx: Some(constraint_idx),
+            debug_intermediates: false,
         }
     }
 
@@ -109,6 +114,11 @@ impl<'a> MemoizedCodeGen<'a> {
     /// Get collected input variables
     pub fn vars(&self) -> &BTreeSet<u16> {
         &self.vars
+    }
+
+    /// Enable debug intermediates mode (emits api.Println for each CSE binding)
+    pub fn set_debug_intermediates(&mut self, val: bool) {
+        self.debug_intermediates = val;
     }
 
     /// Get all CSE bindings as Go code
@@ -334,6 +344,9 @@ impl<'a> MemoizedCodeGen<'a> {
                 let var_name = self.make_cse_name();
                 self.cse_counter += 1;
                 self.bindings.push(format!("\t{} := {}\n", var_name, expr));
+                if self.debug_intermediates {
+                    self.bindings.push(format!("\tapi.Println(\"{}\", {})\n", var_name, var_name));
+                }
                 self.generated.insert(node_id, var_name);
             } else {
                 // Store the expression for single-use nodes too, so children can reference it
@@ -471,7 +484,7 @@ pub fn generate_circuit_from_bundle(
     bundle: &zklean_extractor::mle_ast::AstBundle,
     circuit_name: &str,
 ) -> String {
-    let (code, stats) = generate_circuit_from_bundle_with_stats(bundle, circuit_name);
+    let (code, stats) = generate_circuit_from_bundle_with_stats(bundle, circuit_name, false);
 
     // Log statistics
     if stats.constant_skipped > 0 || stats.constant_failed > 0 {
@@ -505,6 +518,7 @@ pub fn generate_circuit_from_bundle(
 pub fn generate_circuit_from_bundle_with_stats(
     bundle: &zklean_extractor::mle_ast::AstBundle,
     circuit_name: &str,
+    debug_intermediates: bool,
 ) -> (String, ConstantAssertionStats) {
     use zklean_extractor::mle_ast::{Assertion, InputKind};
 
@@ -534,6 +548,7 @@ pub fn generate_circuit_from_bundle_with_stats(
             var_names.clone(),
             constraint_idx,
         );
+        codegen.set_debug_intermediates(debug_intermediates);
 
         // Count references within this constraint only
         codegen.count_refs(c.root);
@@ -648,6 +663,10 @@ pub fn generate_circuit_from_bundle_with_stats(
 
     // Generate constraints based on assertion type
     // Skip constant assertions that are satisfied, track those that fail
+    // When debug_intermediates is true, we collect assert statements separately
+    // so ALL Println calls fire before any AssertIsEqual (which may panic).
+    let mut deferred_asserts: Vec<String> = Vec::new();
+
     for (name, expr, assertion, is_const, const_val, other_expr) in &constraint_data {
         // Handle constant assertions specially
         if *is_const {
@@ -683,23 +702,52 @@ pub fn generate_circuit_from_bundle_with_stats(
 
         match assertion {
             Assertion::EqualZero => {
-                output.push_str(&format!("\tapi.AssertIsEqual({}, 0)\n\n", var_name));
+                let assert_line = format!("\tapi.AssertIsEqual({}, 0)\n\n", var_name);
+                if debug_intermediates {
+                    deferred_asserts.push(assert_line);
+                } else {
+                    output.push_str(&assert_line);
+                }
             }
             Assertion::EqualPublicInput { name: pub_name } => {
-                output.push_str(&format!(
+                let assert_line = format!(
                     "\tapi.AssertIsEqual({}, circuit.{})\n\n",
                     var_name,
                     sanitize_go_name(pub_name)
-                ));
+                );
+                if debug_intermediates {
+                    deferred_asserts.push(assert_line);
+                } else {
+                    output.push_str(&assert_line);
+                }
             }
             Assertion::EqualNode(_) => {
                 // other_expr was generated during the constraint processing loop
                 let other = other_expr.as_ref().expect("EqualNode assertion must have other_expr");
-                output.push_str(&format!(
-                    "\tapi.AssertIsEqual({}, {})\n\n",
-                    var_name, other
-                ));
+                let rhs_var = format!("{}_rhs", var_name);
+                output.push_str(&format!("\t{} := {}\n", rhs_var, other));
+                if debug_intermediates {
+                    output.push_str(&format!("\tapi.Println(\"{}_lhs\", {})\n", name, var_name));
+                    output.push_str(&format!("\tapi.Println(\"{}_rhs\", {})\n", name, rhs_var));
+                    deferred_asserts.push(format!(
+                        "\tapi.AssertIsEqual({}, {})\n\n",
+                        var_name, rhs_var
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "\tapi.AssertIsEqual({}, {})\n\n",
+                        var_name, rhs_var
+                    ));
+                }
             }
+        }
+    }
+
+    // In debug mode, emit all deferred assertions AFTER all Println calls
+    if debug_intermediates && !deferred_asserts.is_empty() {
+        output.push_str("\n\t// === Deferred assertions (after all Println) ===\n");
+        for assert_line in &deferred_asserts {
+            output.push_str(assert_line);
         }
     }
 

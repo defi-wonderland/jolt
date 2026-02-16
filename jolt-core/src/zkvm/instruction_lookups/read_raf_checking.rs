@@ -152,6 +152,8 @@ impl<F: JoltField> SumcheckInstanceParams<F> for InstructionReadRafSumcheckParam
             SumcheckId::SpartanProductVirtualization,
         );
         // TODO: Make error and move to more appropriate place.
+        #[cfg(feature = "debug-expected-output")]
+        crate::assertion_debug::log_assertion_eq(&rv_claim, &rv_claim_branch, "instruction_lookup_consistency");
         assert_eq!(rv_claim, rv_claim_branch);
         let (_, left_operand_claim) = accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::LeftLookupOperand,

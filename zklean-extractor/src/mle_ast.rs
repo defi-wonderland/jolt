@@ -87,8 +87,8 @@ pub fn take_pending_commitment_chunks() -> Option<Vec<MleAst>> {
 
 thread_local! {
     /// Accumulated constraints during symbolic execution.
-    /// Each constraint is an MleAst that should equal zero.
-    static SYMBOLIC_CONSTRAINTS: RefCell<Vec<MleAst>> = RefCell::new(Vec::new());
+    /// Each constraint is a (lhs, rhs) pair where lhs should equal rhs.
+    static SYMBOLIC_CONSTRAINTS: RefCell<Vec<(MleAst, MleAst)>> = RefCell::new(Vec::new());
 
     /// Flag to enable constraint accumulation mode.
     /// When true, PartialEq comparisons register constraints instead of comparing NodeIds.
@@ -96,7 +96,7 @@ thread_local! {
 }
 
 /// Enable constraint accumulation mode.
-/// In this mode, `MleAst == MleAst` registers `(lhs - rhs) == 0` as a constraint
+/// In this mode, `MleAst == MleAst` registers `(lhs, rhs)` as a constraint pair
 /// and returns `true` to allow verification to continue.
 pub fn enable_constraint_mode() {
     CONSTRAINT_MODE.with(|cell| {
@@ -117,7 +117,8 @@ pub fn is_constraint_mode() -> bool {
 }
 
 /// Take all accumulated constraints, clearing the list.
-pub fn take_constraints() -> Vec<MleAst> {
+/// Each constraint is a (lhs, rhs) pair where the assertion is lhs == rhs.
+pub fn take_constraints() -> Vec<(MleAst, MleAst)> {
     SYMBOLIC_CONSTRAINTS.with(|cell| cell.borrow_mut().drain(..).collect())
 }
 
@@ -126,10 +127,10 @@ pub fn num_constraints() -> usize {
     SYMBOLIC_CONSTRAINTS.with(|cell| cell.borrow().len())
 }
 
-/// Add a constraint that should equal zero.
-fn add_constraint(constraint: MleAst) {
+/// Add a constraint pair (lhs, rhs) where lhs should equal rhs.
+fn add_constraint_pair(lhs: MleAst, rhs: MleAst) {
     SYMBOLIC_CONSTRAINTS.with(|cell| {
-        cell.borrow_mut().push(constraint);
+        cell.borrow_mut().push((lhs, rhs));
     });
 }
 
@@ -1108,11 +1109,10 @@ impl PartialEq for MleAst {
             return true;
         }
 
-        // In constraint mode, register constraint and return true
+        // In constraint mode, register constraint pair and return true
         if is_constraint_mode() {
-            // Constraint: (self - other) == 0
-            let diff = *self - *other;
-            add_constraint(diff);
+            // Constraint: self == other (preserves both sides for debug comparison)
+            add_constraint_pair(*self, *other);
             return true;
         }
 

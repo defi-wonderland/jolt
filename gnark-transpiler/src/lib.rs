@@ -46,8 +46,8 @@ pub mod witness;
 
 pub use ast_json::Stage1AstJson;
 pub use codegen::{
-    generate_circuit, generate_circuit_from_bundle, generate_gnark_expr,
-    MemoizedCodeGen, sanitize_go_name,
+    generate_circuit, generate_circuit_from_bundle, generate_circuit_from_bundle_with_stats,
+    generate_gnark_expr, ConstantAssertionStats, MemoizedCodeGen, sanitize_go_name,
 };
 pub use ast_commitment_scheme::AstCommitmentScheme;
 pub use keccak::KeccakMleTranscript;

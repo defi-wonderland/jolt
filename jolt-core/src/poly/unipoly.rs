@@ -333,6 +333,9 @@ impl<F: JoltField> UniPoly<F> {
         for (j, coeff) in self.coeffs.iter().enumerate() {
             sum += coeff.mul_i128(power_sums[j]);
         }
+        #[cfg(feature = "debug-expected-output")]
+        crate::assertion_debug::log_assertion_eq(&sum, &claim, "check_sum_evals");
+
         sum == claim
     }
 }

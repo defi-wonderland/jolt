@@ -123,6 +123,8 @@ impl<F: JoltField> SumcheckInstanceParams<F> for RegistersReadWriteCheckingParam
             SumcheckId::InstructionInputVirtualization,
         );
         // TODO: Make error and move to more appropriate place.
+        #[cfg(feature = "debug-expected-output")]
+        crate::assertion_debug::log_assertion_eq(&rs1_rv_claim, &rs1_rv_claim_instruction_input, "registers_rs1_consistency");
         assert_eq!(rs1_rv_claim, rs1_rv_claim_instruction_input);
         let (_, rs2_rv_claim) = accumulator.get_virtual_polynomial_opening(
             VirtualPolynomial::Rs2Value,
@@ -133,6 +135,8 @@ impl<F: JoltField> SumcheckInstanceParams<F> for RegistersReadWriteCheckingParam
             SumcheckId::InstructionInputVirtualization,
         );
         // TODO: Make error and move to more appropriate place.
+        #[cfg(feature = "debug-expected-output")]
+        crate::assertion_debug::log_assertion_eq(&rs2_rv_claim, &rs2_rv_claim_instruction_input, "registers_rs2_consistency");
         assert_eq!(rs2_rv_claim, rs2_rv_claim_instruction_input);
 
         rd_wv_claim + self.gamma * (rs1_rv_claim + self.gamma * rs2_rv_claim)

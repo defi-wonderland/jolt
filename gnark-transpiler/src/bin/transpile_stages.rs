@@ -4,18 +4,21 @@
 //! to generate a Gnark circuit for stages 1-6 of the Jolt verifier.
 
 use ark_serialize::CanonicalDeserialize;
+use common::jolt_device::JoltDevice;
 use gnark_transpiler::{
-    symbolize_proof, extract_witness_values, generate_circuit_from_bundle,
-    AstCommitmentScheme, MleOpeningAccumulator, PoseidonAstTranscript, sanitize_go_name,
+    extract_witness_values, generate_circuit_from_bundle, generate_circuit_from_bundle_with_stats,
+    sanitize_go_name, symbolize_proof, AstCommitmentScheme, MleOpeningAccumulator,
+    PoseidonAstTranscript,
 };
 use jolt_core::poly::commitment::dory::DoryCommitmentScheme;
 use jolt_core::transcripts::Transcript;
 use jolt_core::zkvm::transpilable_verifier::TranspilableVerifier;
 use jolt_core::zkvm::verifier::JoltVerifierPreprocessing;
 use jolt_core::zkvm::RV64IMACProof;
-use common::jolt_device::JoltDevice;
-use zklean_extractor::mle_ast::{enable_constraint_mode, take_constraints as take_assertions, AstBundle, InputKind, MleAst};
 use std::collections::HashMap;
+use zklean_extractor::mle_ast::{
+    enable_constraint_mode, take_constraints as take_assertions, AstBundle, InputKind, MleAst,
+};
 
 fn main() {
     println!("=== Transpiling Jolt Verifier Stages 1-6 to Gnark ===\n");
@@ -24,9 +27,8 @@ fn main() {
     let proof_path = "/tmp/fib_proof.bin";
     println!("Loading proof from: {}", proof_path);
     let proof_bytes = std::fs::read(proof_path).expect("Failed to read proof file");
-    let real_proof: RV64IMACProof =
-        CanonicalDeserialize::deserialize_compressed(&proof_bytes[..])
-            .expect("Failed to deserialize proof");
+    let real_proof: RV64IMACProof = CanonicalDeserialize::deserialize_compressed(&proof_bytes[..])
+        .expect("Failed to deserialize proof");
     println!("  trace_length: {}", real_proof.trace_length);
     println!("  commitments: {}", real_proof.commitments.len());
 
@@ -34,8 +36,14 @@ fn main() {
     if let Some(first_commitment) = real_proof.commitments.first() {
         use ark_serialize::CanonicalSerialize;
         let mut bytes = Vec::new();
-        first_commitment.serialize_uncompressed(&mut bytes).expect("serialize failed");
-        println!("  first commitment serialized size: {} bytes ({} chunks of 32)", bytes.len(), bytes.len() / 32);
+        first_commitment
+            .serialize_uncompressed(&mut bytes)
+            .expect("serialize failed");
+        println!(
+            "  first commitment serialized size: {} bytes ({} chunks of 32)",
+            bytes.len(),
+            bytes.len() / 32
+        );
     }
 
     // Load io_device
@@ -55,7 +63,10 @@ fn main() {
     let real_preprocessing: JoltVerifierPreprocessing<ark_bn254::Fr, DoryCommitmentScheme> =
         CanonicalDeserialize::deserialize_compressed(&preprocessing_bytes[..])
             .expect("Failed to deserialize preprocessing");
-    println!("  memory_layout: {:?}", real_preprocessing.shared.memory_layout);
+    println!(
+        "  memory_layout: {:?}",
+        real_preprocessing.shared.memory_layout
+    );
 
     // Convert preprocessing to AstCommitmentScheme version
     // (only generators change, shared stays the same)
@@ -118,9 +129,9 @@ fn main() {
     }
     println!("  Inputs: {}", bundle.inputs.len());
 
-    // All constraints from PartialEq::eq are EqualZero: (lhs - rhs) == 0
-    for (i, assertion) in assertions.iter().enumerate() {
-        bundle.add_constraint_eq_zero(format!("assertion_{}", i), assertion.root());
+    // All constraints from PartialEq::eq are EqualNode: lhs == rhs (both sides preserved)
+    for (i, (lhs, rhs)) in assertions.iter().enumerate() {
+        bundle.add_constraint_eq_node(format!("assertion_{}", i), lhs.root(), rhs.root());
     }
     println!("  Constraints: {}", bundle.constraints.len());
 
@@ -136,10 +147,32 @@ fn main() {
     println!("\n=== Generating Gnark Circuit ===");
     let circuit_code = generate_circuit_from_bundle(&bundle, "JoltStages16Circuit");
 
+    // Add build tag so this file is excluded when debug_intermediates tag is active
+    let circuit_code_with_tag = format!("//go:build !debug_intermediates\n\n{}", circuit_code);
     let output_path = format!("{}/go/stages16_circuit.go", manifest_dir);
-    std::fs::write(&output_path, &circuit_code).expect("Failed to write circuit file");
+    std::fs::write(&output_path, &circuit_code_with_tag).expect("Failed to write circuit file");
     println!("  Circuit written to: {}", output_path);
     println!("  Circuit size: {} bytes", circuit_code.len());
+
+    // Generate debug circuit only with --debug flag
+    if std::env::args().any(|a| a == "--debug") {
+        println!("\n=== Generating Debug Circuit ===");
+        let (debug_code, debug_stats) =
+            generate_circuit_from_bundle_with_stats(&bundle, "JoltStages16Circuit", true);
+        if debug_stats.constant_failed > 0 {
+            eprintln!(
+                "  Warning: {} constant assertions failed in debug circuit",
+                debug_stats.constant_failed
+            );
+        }
+        let debug_code_with_tag = format!("//go:build debug_intermediates\n\n{}", debug_code);
+        let debug_path = format!("{}/go/stages16_circuit_debug.go", manifest_dir);
+        std::fs::write(&debug_path, &debug_code_with_tag)
+            .expect("Failed to write debug circuit file");
+        println!("  Debug circuit written to: {}", debug_path);
+        println!("  Debug circuit size: {} bytes", debug_code.len());
+        println!("  Use: go test -tags debug_intermediates -v -run TestRustGoAssertionMatch");
+    }
 
     // === Generate witness data ===
     println!("\n=== Generating Witness Data ===");
@@ -154,7 +187,8 @@ fn main() {
         }
     }
 
-    let witness_json = serde_json::to_string_pretty(&witness_map).expect("Failed to serialize witness");
+    let witness_json =
+        serde_json::to_string_pretty(&witness_map).expect("Failed to serialize witness");
     let witness_path = format!("{}/go/stages16_witness.json", manifest_dir);
     std::fs::write(&witness_path, &witness_json).expect("Failed to write witness file");
     println!("  Witness written to: {}", witness_path);
@@ -163,4 +197,3 @@ fn main() {
     println!("\n=== SUCCESS ===");
     println!("TranspilableVerifier stages 1-6 transpiled to Gnark circuit.");
 }
-
