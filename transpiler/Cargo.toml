@@ -19,6 +19,7 @@ zklean-extractor = { path = "../zklean-extractor" }
 common = { path = "../common" }
 light-poseidon = "0.4.0"
 num-bigint = "0.4"
+blake2.workspace = true
 
 [features]
 default = []

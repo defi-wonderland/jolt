@@ -31,9 +31,11 @@
 //! ```
 
 pub mod ast_commitment_scheme;
+pub mod blake2b;
 pub mod opening_accumulator;
 pub mod poseidon;
 
 pub use ast_commitment_scheme::AstCommitmentScheme;
+pub use blake2b::Blake2bAstTranscript;
 pub use opening_accumulator::AstOpeningAccumulator;
 pub use poseidon::PoseidonAstTranscript;
