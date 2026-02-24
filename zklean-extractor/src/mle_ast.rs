@@ -1567,5 +1567,6 @@ impl Valid for Node {
 // =============================================================================
 
 pub use crate::ast_bundle::{
-    Assertion, AstBundle, AstCommitment, Constraint, InputKind, InputVar, TargetField,
+    Assertion, AstBundle, AstCommitment, Constraint, ConstraintCse, InputKind, InputVar,
+    TargetField,
 };
