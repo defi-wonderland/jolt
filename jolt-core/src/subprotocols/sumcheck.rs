@@ -199,6 +199,10 @@ impl BatchedSumcheck {
         }
         let batching_coeffs: Vec<F> = transcript.challenge_vector(sumcheck_instances.len());
 
+        // Debug: Print batching coefficients for transpilation verification.
+        // These coefficients are used to combine multiple sumcheck instances into a single
+        // batched claim. Values printed here should match those computed in the transpiled
+        // gnark circuit to verify Fiat-Shamir transcript continuity.
         #[cfg(feature = "debug-expected-output")]
         {
             use ark_serialize::CanonicalSerialize;
@@ -254,7 +258,10 @@ impl BatchedSumcheck {
             })
             .sum();
 
-        // Debug output for concrete Fr types
+        // Debug: Compare sumcheck verification claims.
+        // The output_claim (from the sumcheck proof) should equal the expected_output_claim
+        // (computed from batched evaluations). The difference should be zero; any non-zero
+        // value indicates a verification failure. Printed for debugging transpiled circuits.
         #[cfg(feature = "debug-expected-output")]
         {
             use ark_serialize::CanonicalSerialize;
@@ -351,6 +358,10 @@ impl<F: JoltField, ProofTranscript: Transcript> SumcheckInstanceProof<F, ProofTr
             e = self.compressed_polys[i].eval_from_hint(&e, &r_i);
         }
 
+        // Debug: Print all sumcheck round challenges for transcript verification.
+        // These challenges (r_0, r_1, ..., r_{n-1}) are generated via Fiat-Shamir from
+        // the transcript state. Values printed here should match those computed in the
+        // transpiled gnark circuit to verify correct challenge derivation.
         #[cfg(feature = "debug-expected-output")]
         {
             use ark_serialize::CanonicalSerialize;
