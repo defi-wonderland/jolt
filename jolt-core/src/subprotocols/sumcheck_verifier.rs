@@ -1,9 +1,11 @@
 use crate::poly::opening_proof::{OpeningAccumulator, OpeningPoint, BIG_ENDIAN};
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{InputClaimConstraint, OutputClaimConstraint};
 use crate::transcripts::Transcript;
 
 use crate::field::JoltField;
 
-pub trait SumcheckInstanceVerifier<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> {
+pub trait SumcheckInstanceVerifier<F: JoltField, T: Transcript, A: OpeningAccumulator<F> + 'static> {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         unimplemented!(
             "If get_params is unimplemented, degree, num_rounds, and \
@@ -46,7 +48,6 @@ pub trait SumcheckInstanceVerifier<F: JoltField, T: Transcript, A: OpeningAccumu
     fn cache_openings(
         &self,
         accumulator: &mut A,
-        transcript: &mut T,
         sumcheck_challenges: &[F::Challenge],
     );
 }
@@ -54,14 +55,23 @@ pub trait SumcheckInstanceVerifier<F: JoltField, T: Transcript, A: OpeningAccumu
 /// Params shared between prover and verifier.
 /// Note: input_claim uses dyn OpeningAccumulator to work with both Prover and Verifier accumulators.
 pub trait SumcheckInstanceParams<F: JoltField> {
-    /// Returns the maximum degree of the sumcheck polynomial.
     fn degree(&self) -> usize;
 
-    /// Returns the number of rounds/variables in this sumcheck instance.
     fn num_rounds(&self) -> usize;
 
-    /// Returns the initial claim of this sumcheck instance.
     fn input_claim(&self, accumulator: &dyn OpeningAccumulator<F>) -> F;
 
     fn normalize_opening_point(&self, challenges: &[F::Challenge]) -> OpeningPoint<BIG_ENDIAN, F>;
+
+    #[cfg(feature = "zk")]
+    fn input_claim_constraint(&self) -> InputClaimConstraint;
+
+    #[cfg(feature = "zk")]
+    fn input_constraint_challenge_values(&self, accumulator: &dyn OpeningAccumulator<F>) -> Vec<F>;
+
+    #[cfg(feature = "zk")]
+    fn output_claim_constraint(&self) -> Option<OutputClaimConstraint>;
+
+    #[cfg(feature = "zk")]
+    fn output_constraint_challenge_values(&self, _sumcheck_challenges: &[F::Challenge]) -> Vec<F>;
 }

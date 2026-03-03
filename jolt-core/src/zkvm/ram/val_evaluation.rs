@@ -340,7 +340,7 @@ impl<F: JoltField> ValEvaluationSumcheckVerifier<F> {
     }
 }
 
-impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> SumcheckInstanceVerifier<F, T, A>
+impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F> + 'static> SumcheckInstanceVerifier<F, T, A>
     for ValEvaluationSumcheckVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {

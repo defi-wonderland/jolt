@@ -34,10 +34,11 @@ use crate::symbolic_traits::ast_commitment_scheme::{AstCommitmentScheme, AstProo
 use crate::symbolic_traits::opening_accumulator::AstOpeningAccumulator;
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
+use jolt_core::curve::Bn254Curve;
 use jolt_core::poly::opening_proof::OpeningPoint;
 use jolt_core::poly::unipoly::CompressedUniPoly;
-use jolt_core::subprotocols::sumcheck::SumcheckInstanceProof;
-use jolt_core::subprotocols::univariate_skip::UniSkipFirstRoundProof;
+use jolt_core::subprotocols::sumcheck::{ClearSumcheckProof, SumcheckInstanceProof};
+use jolt_core::subprotocols::univariate_skip::{UniSkipFirstRoundProof, UniSkipFirstRoundProofVariant};
 use jolt_core::transcripts::Transcript;
 use jolt_core::zkvm::proof_serialization::{Claims, JoltProof};
 use jolt_core::zkvm::RV64IMACProof;
@@ -279,7 +280,7 @@ fn commitment_to_field_chunks<T: CanonicalSerialize>(commitment: &T) -> Vec<ark_
 pub fn symbolize_proof<OutputTranscript: Transcript>(
     real_proof: &RV64IMACProof,
 ) -> (
-    JoltProof<MleAst, AstCommitmentScheme, OutputTranscript>,
+    JoltProof<MleAst, Bn254Curve, AstCommitmentScheme, OutputTranscript>,
     AstOpeningAccumulator,
     VarAllocator,
 ) {
@@ -304,63 +305,63 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
     }
 
     // === Symbolize stage 1 uni-skip proof ===
-    let stage1_uni_skip = symbolize_uni_skip_proof::<_, OutputTranscript>(
+    let stage1_uni_skip = symbolize_uni_skip_variant::<_, OutputTranscript>(
         &real_proof.stage1_uni_skip_first_round_proof,
         &mut alloc,
         "stage1_uni_skip",
     );
 
     // === Symbolize stage 1 sumcheck proof ===
-    let stage1_sumcheck = symbolize_sumcheck_proof::<_, OutputTranscript>(
+    let stage1_sumcheck = symbolize_sumcheck_variant::<_, OutputTranscript>(
         &real_proof.stage1_sumcheck_proof,
         &mut alloc,
         "stage1_sumcheck",
     );
 
     // === Symbolize stage 2 uni-skip proof ===
-    let stage2_uni_skip = symbolize_uni_skip_proof::<_, OutputTranscript>(
+    let stage2_uni_skip = symbolize_uni_skip_variant::<_, OutputTranscript>(
         &real_proof.stage2_uni_skip_first_round_proof,
         &mut alloc,
         "stage2_uni_skip",
     );
 
     // === Symbolize stage 2 sumcheck proof ===
-    let stage2_sumcheck = symbolize_sumcheck_proof::<_, OutputTranscript>(
+    let stage2_sumcheck = symbolize_sumcheck_variant::<_, OutputTranscript>(
         &real_proof.stage2_sumcheck_proof,
         &mut alloc,
         "stage2_sumcheck",
     );
 
     // === Symbolize stage 3 sumcheck proof ===
-    let stage3_sumcheck = symbolize_sumcheck_proof::<_, OutputTranscript>(
+    let stage3_sumcheck = symbolize_sumcheck_variant::<_, OutputTranscript>(
         &real_proof.stage3_sumcheck_proof,
         &mut alloc,
         "stage3_sumcheck",
     );
 
     // === Symbolize stage 4 sumcheck proof ===
-    let stage4_sumcheck = symbolize_sumcheck_proof::<_, OutputTranscript>(
+    let stage4_sumcheck = symbolize_sumcheck_variant::<_, OutputTranscript>(
         &real_proof.stage4_sumcheck_proof,
         &mut alloc,
         "stage4_sumcheck",
     );
 
     // === Symbolize stage 5 sumcheck proof ===
-    let stage5_sumcheck = symbolize_sumcheck_proof::<_, OutputTranscript>(
+    let stage5_sumcheck = symbolize_sumcheck_variant::<_, OutputTranscript>(
         &real_proof.stage5_sumcheck_proof,
         &mut alloc,
         "stage5_sumcheck",
     );
 
     // === Symbolize stage 6 sumcheck proof ===
-    let stage6_sumcheck = symbolize_sumcheck_proof::<_, OutputTranscript>(
+    let stage6_sumcheck = symbolize_sumcheck_variant::<_, OutputTranscript>(
         &real_proof.stage6_sumcheck_proof,
         &mut alloc,
         "stage6_sumcheck",
     );
 
     // === Symbolize stage 7 sumcheck proof ===
-    let stage7_sumcheck = symbolize_sumcheck_proof::<_, OutputTranscript>(
+    let stage7_sumcheck = symbolize_sumcheck_variant::<_, OutputTranscript>(
         &real_proof.stage7_sumcheck_proof,
         &mut alloc,
         "stage7_sumcheck",
@@ -393,7 +394,6 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
         untrusted_advice_commitment,
         trace_length: real_proof.trace_length,
         ram_K: real_proof.ram_K,
-        bytecode_K: real_proof.bytecode_K,
         rw_config: real_proof.rw_config.clone(),
         one_hot_config: real_proof.one_hot_config.clone(),
         dory_layout: real_proof.dory_layout,
@@ -417,36 +417,55 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
 // These functions convert concrete proof components (Fr values) to symbolic form
 // (MleAst variables) while simultaneously recording witness values in VarAllocator.
 
-fn symbolize_uni_skip_proof<T: Transcript, OutT: Transcript>(
-    real: &UniSkipFirstRoundProof<ark_bn254::Fr, T>,
+/// Symbolize a UniSkipFirstRoundProofVariant by extracting the Standard variant.
+/// Transpilation only supports Standard (non-ZK) uni-skip proofs.
+fn symbolize_uni_skip_variant<T: Transcript, OutT: Transcript>(
+    real: &UniSkipFirstRoundProofVariant<ark_bn254::Fr, Bn254Curve, T>,
     alloc: &mut VarAllocator,
     prefix: &str,
-) -> UniSkipFirstRoundProof<MleAst, OutT> {
-    let coeffs = alloc.alloc_n_with_values(&real.uni_poly.coeffs, &format!("{prefix}_coeff"));
-    UniSkipFirstRoundProof::new(jolt_core::poly::unipoly::UniPoly::from_coeff(coeffs))
+) -> UniSkipFirstRoundProofVariant<MleAst, Bn254Curve, OutT> {
+    match real {
+        UniSkipFirstRoundProofVariant::Standard(proof) => {
+            let coeffs = alloc.alloc_n_with_values(&proof.uni_poly.coeffs, &format!("{prefix}_coeff"));
+            UniSkipFirstRoundProofVariant::Standard(
+                UniSkipFirstRoundProof::new(jolt_core::poly::unipoly::UniPoly::from_coeff(coeffs))
+            )
+        }
+        UniSkipFirstRoundProofVariant::Zk(_) => {
+            panic!("Transpilation only supports Standard (non-ZK) uni-skip proofs")
+        }
+    }
 }
 
-fn symbolize_sumcheck_proof<T: Transcript, OutT: Transcript>(
-    real: &SumcheckInstanceProof<ark_bn254::Fr, T>,
+/// Symbolize a SumcheckInstanceProof by extracting the Clear variant.
+/// Transpilation only supports Clear (non-ZK) sumcheck proofs.
+fn symbolize_sumcheck_variant<T: Transcript, OutT: Transcript>(
+    real: &SumcheckInstanceProof<ark_bn254::Fr, Bn254Curve, T>,
     alloc: &mut VarAllocator,
     prefix: &str,
-) -> SumcheckInstanceProof<MleAst, OutT> {
-    let compressed_polys: Vec<CompressedUniPoly<MleAst>> = real
-        .compressed_polys
-        .iter()
-        .enumerate()
-        .map(|(round, poly)| {
-            let coeffs = alloc.alloc_n_with_values(
-                &poly.coeffs_except_linear_term,
-                &format!("{prefix}_r{round}"),
-            );
-            CompressedUniPoly {
-                coeffs_except_linear_term: coeffs,
-            }
-        })
-        .collect();
-
-    SumcheckInstanceProof::new(compressed_polys)
+) -> SumcheckInstanceProof<MleAst, Bn254Curve, OutT> {
+    match real {
+        SumcheckInstanceProof::Clear(proof) => {
+            let compressed_polys: Vec<CompressedUniPoly<MleAst>> = proof
+                .compressed_polys
+                .iter()
+                .enumerate()
+                .map(|(round, poly)| {
+                    let coeffs = alloc.alloc_n_with_values(
+                        &poly.coeffs_except_linear_term,
+                        &format!("{prefix}_r{round}"),
+                    );
+                    CompressedUniPoly {
+                        coeffs_except_linear_term: coeffs,
+                    }
+                })
+                .collect();
+            SumcheckInstanceProof::Clear(ClearSumcheckProof::new(compressed_polys))
+        }
+        SumcheckInstanceProof::Zk(_) => {
+            panic!("Transpilation only supports Clear (non-ZK) sumcheck proofs")
+        }
+    }
 }
 
 // =============================================================================

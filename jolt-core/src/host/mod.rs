@@ -6,15 +6,12 @@ use std::path::PathBuf;
 pub mod analyze;
 #[cfg(feature = "host")]
 pub mod program;
-#[cfg(all(feature = "host", not(target_arch = "wasm32")))]
-pub mod toolchain;
-
-pub const TOOLCHAIN_VERSION: &str = "1.89.0";
 
 #[derive(Clone)]
 pub struct Program {
     guest: String,
     func: Option<String>,
+    profile: Option<String>,
     heap_size: u64,
     stack_size: u64,
     max_input_size: u64,
@@ -22,7 +19,9 @@ pub struct Program {
     max_trusted_advice_size: u64,
     max_output_size: u64,
     std: bool,
+    backtrace: Option<String>,
     pub elf: Option<PathBuf>,
+    pub elf_compute_advice: Option<PathBuf>,
 }
 
 pub const DEFAULT_TARGET_DIR: &str = "/tmp/jolt-guest-targets";

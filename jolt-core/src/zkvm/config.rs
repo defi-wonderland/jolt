@@ -44,12 +44,11 @@ impl ReadWriteConfig {
     /// This is the default configuration for the prover; other configurations are possible
     /// (as long as they satisfy the validation constraints).
     pub fn new(log_T: usize, ram_log_K: usize) -> Self {
-        let log_register_count = REGISTER_COUNT.ilog2() as usize;
         let config = Self {
             ram_rw_phase1_num_rounds: log_T as u8,
             ram_rw_phase2_num_rounds: ram_log_K as u8,
             registers_rw_phase1_num_rounds: log_T as u8,
-            registers_rw_phase2_num_rounds: log_register_count as u8,
+            registers_rw_phase2_num_rounds: REGISTER_COUNT.ilog2() as u8,
         };
 
         // Validate the configuration
@@ -95,8 +94,8 @@ impl ReadWriteConfig {
 
     /// Returns true if all cycle variables are bound in phase 1.
     ///
-    /// When this returns true, the advice opening points for `RamValEvaluation` and
-    /// `RamValFinalEvaluation` are identical, so we only need one advice opening.
+    /// When this returns true, the advice opening points for `RamValCheck` and
+    /// `RamValCheck` are identical, so we only need one advice opening.
     #[inline]
     pub fn needs_single_advice_opening(&self, log_T: usize) -> bool {
         self.ram_rw_phase1_num_rounds as usize == log_T
@@ -201,7 +200,7 @@ impl OneHotConfig {
 /// Full one-hot parameters with cached derived values.
 ///
 /// This struct is NOT serialized in the proof. It is constructed by the prover
-/// and verifier from `OneHotConfig` plus the proof parameters (bytecode_K, ram_K).
+/// and verifier from `OneHotConfig`, `bytecode_K` (from preprocessing), and `ram_K` (from proof).
 #[derive(Allocative, Clone, Debug, Default)]
 pub struct OneHotParams {
     pub log_k_chunk: usize,

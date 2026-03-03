@@ -224,27 +224,6 @@ impl Transcript for PoseidonTranscript {
         self.raw_append_bytes(&buf);
     }
 
-    fn raw_append_point<G: CurveGroup>(&mut self, point: &G) {
-        // Point at infinity: hash 64 zero bytes
-        if point.is_zero() {
-            self.raw_append_bytes(&[0_u8; 2 * BYTES_PER_CHUNK]);
-            return;
-        }
-
-        // Extract affine coordinates and serialize as LE bytes (no reversal for Groth16)
-        let aff = point.into_affine();
-        let mut combined = [0u8; 2 * BYTES_PER_CHUNK];
-        aff.x()
-            .unwrap()
-            .serialize_compressed(&mut combined[..BYTES_PER_CHUNK])
-            .unwrap();
-        aff.y()
-            .unwrap()
-            .serialize_compressed(&mut combined[BYTES_PER_CHUNK..])
-            .unwrap();
-        self.raw_append_bytes(&combined);
-    }
-
     // === Public API (overrides) ===
 
     /// Override: skip buf.reverse() from the trait default (EVM compat not needed for Groth16)

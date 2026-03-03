@@ -64,6 +64,10 @@ pub struct AstOpeningAccumulator {
     /// Log of trace length (matches VerifierOpeningAccumulator for parity).
     /// Currently unused but stored for potential Stage 8 batch opening logic.
     pub log_T: usize,
+    /// Pending claims to be flushed to transcript.
+    /// The new upstream pattern: append_* methods accumulate claims here,
+    /// then flush_to_transcript drains them all at once.
+    pending_claims: Vec<MleAst>,
 }
 
 // =============================================================================
@@ -76,6 +80,7 @@ impl AstOpeningAccumulator {
         Self {
             openings: BTreeMap::new(),
             log_T,
+            pending_claims: Vec::new(),
         }
     }
 
@@ -96,7 +101,11 @@ impl AstOpeningAccumulator {
             // Point is initially empty, will be set via append_* methods
             openings.insert(key, (vec![], claim));
         }
-        Self { openings, log_T }
+        Self {
+            openings,
+            log_T,
+            pending_claims: Vec::new(),
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -112,17 +121,12 @@ impl AstOpeningAccumulator {
         (OpeningPoint::new(point.clone()), *claim)
     }
 
-    /// Append an opening: add claim to transcript and store the point.
-    fn append_opening<T: Transcript>(
-        &mut self,
-        transcript: &mut T,
-        key: &OpeningId,
-        point: Vec<MleAst>,
-    ) {
+    /// Append an opening: add claim to pending_claims and store the point.
+    fn append_opening(&mut self, key: &OpeningId, point: Vec<MleAst>) {
         if let Some((stored_point, claim)) = self.openings.get_mut(key) {
-            // CRITICAL: Must append the claim to transcript, matching VerifierOpeningAccumulator.
-            // Without this, the transcript state diverges and challenges are incorrect.
-            transcript.append_scalar(b"opening_claim", claim);
+            // CRITICAL: Must record the claim for later flushing to transcript,
+            // matching VerifierOpeningAccumulator behavior.
+            self.pending_claims.push(*claim);
             *stored_point = point;
         } else {
             panic!("No opening found for {key:?}");
@@ -148,7 +152,7 @@ impl OpeningAccumulator<MleAst> for AstOpeningAccumulator {
         polynomial: VirtualPolynomial,
         sumcheck: SumcheckId,
     ) -> (OpeningPoint<BIG_ENDIAN, MleAst>, MleAst) {
-        self.get_opening(&OpeningId::virtual_poly(polynomial, sumcheck))
+        self.get_opening(&OpeningId::virt(polynomial, sumcheck))
     }
 
     fn get_committed_polynomial_opening(
@@ -172,74 +176,74 @@ impl OpeningAccumulator<MleAst> for AstOpeningAccumulator {
         Some((OpeningPoint::new(point.clone()), *claim))
     }
 
-    fn append_virtual<T: Transcript>(
+    fn append_virtual(
         &mut self,
-        transcript: &mut T,
         polynomial: VirtualPolynomial,
         sumcheck: SumcheckId,
         opening_point: OpeningPoint<BIG_ENDIAN, MleAst>,
     ) {
         self.append_opening(
-            transcript,
-            &OpeningId::virtual_poly(polynomial, sumcheck),
+            &OpeningId::virt(polynomial, sumcheck),
             opening_point.r,
         );
     }
 
-    fn append_untrusted_advice<T: Transcript>(
+    fn append_untrusted_advice(
         &mut self,
-        transcript: &mut T,
         sumcheck_id: SumcheckId,
         opening_point: OpeningPoint<BIG_ENDIAN, MleAst>,
     ) {
         self.append_opening(
-            transcript,
             &OpeningId::UntrustedAdvice(sumcheck_id),
             opening_point.r,
         );
     }
 
-    fn append_trusted_advice<T: Transcript>(
+    fn append_trusted_advice(
         &mut self,
-        transcript: &mut T,
         sumcheck_id: SumcheckId,
         opening_point: OpeningPoint<BIG_ENDIAN, MleAst>,
     ) {
         self.append_opening(
-            transcript,
             &OpeningId::TrustedAdvice(sumcheck_id),
             opening_point.r,
         );
     }
 
-    fn append_dense<T: Transcript>(
+    fn append_dense(
         &mut self,
-        transcript: &mut T,
         polynomial: CommittedPolynomial,
         sumcheck: SumcheckId,
         opening_point: Vec<MleAst>,
     ) {
         self.append_opening(
-            transcript,
             &OpeningId::committed(polynomial, sumcheck),
             opening_point,
         );
     }
 
-    fn append_sparse<T: Transcript>(
+    fn append_sparse(
         &mut self,
-        transcript: &mut T,
         polynomials: Vec<CommittedPolynomial>,
         sumcheck: SumcheckId,
         opening_point: Vec<MleAst>,
     ) {
         for polynomial in polynomials {
             self.append_opening(
-                transcript,
                 &OpeningId::committed(polynomial, sumcheck),
                 opening_point.clone(),
             );
         }
+    }
+
+    fn flush_to_transcript<T: Transcript>(&mut self, transcript: &mut T) {
+        for claim in self.pending_claims.drain(..) {
+            transcript.append_scalar(b"opening_claim", &claim);
+        }
+    }
+
+    fn take_pending_claims(&mut self) -> Vec<MleAst> {
+        std::mem::take(&mut self.pending_claims)
     }
 }
 
@@ -258,7 +262,7 @@ mod tests {
         // CRITICAL: new_with_claims must correctly store all claims
         let claims = vec![
             (
-                OpeningId::virtual_poly(VirtualPolynomial::PC, SumcheckId::SpartanOuter),
+                OpeningId::virt(VirtualPolynomial::PC, SumcheckId::SpartanOuter),
                 MleAst::from_u64(100),
             ),
             (
@@ -291,30 +295,36 @@ mod tests {
         use jolt_core::transcripts::Transcript;
 
         let claims = vec![(
-            OpeningId::virtual_poly(VirtualPolynomial::PC, SumcheckId::SpartanOuter),
+            OpeningId::virt(VirtualPolynomial::PC, SumcheckId::SpartanOuter),
             MleAst::from_u64(100),
         )];
 
         let mut accumulator = AstOpeningAccumulator::new_with_claims(claims, 10);
-        let mut transcript = PoseidonAstTranscript::new(b"test");
 
         // Append opening with a point
         let point_values = vec![MleAst::from_u64(1), MleAst::from_u64(2)];
         let opening_point = OpeningPoint::new(point_values.clone());
 
         accumulator.append_virtual(
-            &mut transcript,
             VirtualPolynomial::PC,
             SumcheckId::SpartanOuter,
             opening_point,
         );
 
         // Verify point was stored
-        let key = OpeningId::virtual_poly(VirtualPolynomial::PC, SumcheckId::SpartanOuter);
+        let key = OpeningId::virt(VirtualPolynomial::PC, SumcheckId::SpartanOuter);
         let (stored_point, _) = accumulator.openings.get(&key).unwrap();
         assert_eq!(stored_point.len(), 2);
         assert_eq!(stored_point[0].root(), point_values[0].root());
         assert_eq!(stored_point[1].root(), point_values[1].root());
+
+        // Verify pending claim was recorded
+        assert_eq!(accumulator.pending_claims.len(), 1);
+
+        // Flush to transcript
+        let mut transcript = PoseidonAstTranscript::new(b"test");
+        accumulator.flush_to_transcript(&mut transcript);
+        assert_eq!(accumulator.pending_claims.len(), 0);
     }
 
     #[test]
@@ -340,9 +350,6 @@ mod tests {
 
     #[test]
     fn test_append_sparse_multiple_polynomials() {
-        use crate::symbolic_traits::poseidon::PoseidonAstTranscript;
-        use jolt_core::transcripts::Transcript;
-
         let claims = vec![
             (
                 OpeningId::committed(CommittedPolynomial::RdInc, SumcheckId::SpartanOuter),
@@ -359,7 +366,6 @@ mod tests {
         ];
 
         let mut accumulator = AstOpeningAccumulator::new_with_claims(claims, 10);
-        let mut transcript = PoseidonAstTranscript::new(b"test");
 
         let point_values = vec![MleAst::from_u64(1), MleAst::from_u64(2)];
         let polynomials = vec![
@@ -369,7 +375,6 @@ mod tests {
         ];
 
         accumulator.append_sparse(
-            &mut transcript,
             polynomials.clone(),
             SumcheckId::SpartanOuter,
             point_values.clone(),
@@ -383,5 +388,8 @@ mod tests {
             assert_eq!(stored_point[0].root(), point_values[0].root());
             assert_eq!(stored_point[1].root(), point_values[1].root());
         }
+
+        // Verify 3 pending claims were recorded
+        assert_eq!(accumulator.pending_claims.len(), 3);
     }
 }

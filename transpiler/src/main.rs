@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use common::jolt_device::JoltDevice;
+use jolt_core::curve::Bn254Curve;
 use jolt_core::poly::commitment::dory::DoryCommitmentScheme;
 use jolt_core::transcripts::Transcript;
 use jolt_core::zkvm::ram::{set_pending_initial_ram, PendingInitialRamValues};
@@ -216,6 +217,7 @@ fn main() {
     println!("\n=== Creating TranspilableVerifier ===");
     let verifier = TranspilableVerifier::<
         MleAst,
+        Bn254Curve,
         AstCommitmentScheme,
         SelectedAstTranscript,
         AstOpeningAccumulator,

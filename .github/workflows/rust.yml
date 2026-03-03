@@ -18,7 +18,7 @@ jobs:
   fmt:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: rustfmt
@@ -28,18 +28,21 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy
       - name: cargo clippy --features allocative,host
         run: cargo clippy --all --all-targets --features allocative,host
+      - name: cargo clippy --features allocative,host,zk
+        run: cargo clippy --all --all-targets --features allocative,host,zk
       - name: cargo clippy --no-default-features
         run: cargo clippy --all --all-targets --no-default-features
 
   machete:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v6
       - uses: bnjbvr/cargo-machete@main
       - name: cargo machete
         run: cargo machete --with-metadata
@@ -48,7 +51,7 @@ jobs:
     name: Build Wasm
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
@@ -60,8 +63,10 @@ jobs:
     runs-on: ubuntu-latest
     name: Test jolt-core
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-directories: ~/.cache/dory
       - name: Build and install jolt CLI
         run: cargo install --path . --locked
       - name: Install nextest
@@ -69,11 +74,26 @@ jobs:
       - name: Run jolt-core tests
         run: cargo nextest run --release -p jolt-core
 
+  test-core-zk:
+    runs-on: ubuntu-latest
+    name: Test jolt-core (zk)
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-directories: ~/.cache/dory
+      - name: Build and install jolt CLI
+        run: cargo install --path . --locked
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: Run jolt-core tests with zk feature
+        run: cargo nextest run --release -p jolt-core --features zk
+
   typos:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: crate-ci/typos@v1.30.0
+      - uses: actions/checkout@v6
+      - uses: crate-ci/typos@v1.43.5
         with:
           files: .
 
@@ -81,8 +101,10 @@ jobs:
     name: jolt binary check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-directories: ~/.cache/dory
       - name: Build and install jolt CLI
         run: cargo install --path . --locked
 
@@ -105,7 +127,7 @@ jobs:
     name: Test inlines
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Install nextest
         uses: taiki-e/install-action@nextest
@@ -132,8 +154,10 @@ jobs:
     name: Jolt SDK Verifier Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-directories: ~/.cache/dory
       - name: Build and install jolt CLI
         run: cargo install --path . --locked
       - name: Install nextest
@@ -147,7 +171,7 @@ jobs:
     runs-on: ubuntu-latest
     name: Test tracer
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - name: Build and install jolt CLI
         run: cargo install --path . --locked
@@ -160,7 +184,7 @@ jobs:
     name: ZkLean extractor tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Run extractor tests
         working-directory: ./zklean-extractor
         run: cargo test
@@ -169,14 +193,14 @@ jobs:
     name: Compile extracted Lean
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
       - name: Extract Jolt ZkLean package
         working-directory: ./zklean-extractor
         run: cargo run --release -- -o -p jolt-zklean
 
-      # - name: Run lake build on the extracted model
-      #   uses: leanprover/lean-action@v1
-      #   with:
-      #     lake-package-directory: ./zklean-extractor/jolt-zklean
-      #     build: true
-      #     test: true
+  #    - name: Run lake build on the extracted model
+  #      uses: leanprover/lean-action@v1
+  #      with:
+  #        lake-package-directory: ./zklean-extractor/jolt-zklean
+  #        build: true
+  #        test: true

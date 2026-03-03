@@ -7,6 +7,7 @@ pub use jolt_core::zkvm::{prover::JoltProverPreprocessing, RV64IMACProver};
 
 pub use common::jolt_device::{JoltDevice, MemoryConfig, MemoryLayout};
 pub use jolt_core::ark_bn254::Fr as F;
+pub use jolt_core::curve::{Bn254Curve, JoltCurve};
 pub use jolt_core::field::JoltField;
 pub use jolt_core::guest;
 pub use jolt_core::poly::commitment::dory::DoryCommitmentScheme as PCS;
@@ -14,6 +15,7 @@ pub use jolt_core::zkvm::{
     proof_serialization::JoltProof, verifier::JoltSharedPreprocessing,
     verifier::JoltVerifierPreprocessing, RV64IMACProof, RV64IMACVerifier, Serializable,
 };
+pub use jolt_core::AdviceTape;
 
 // Re-exports needed by the provable macro
 pub use jolt_core::poly::commitment::commitment_scheme::CommitmentScheme;

@@ -23,6 +23,7 @@ impl Program {
         Self {
             guest: guest.to_string(),
             func: None,
+            profile: None,
             heap_size: DEFAULT_HEAP_SIZE,
             stack_size: DEFAULT_STACK_SIZE,
             max_input_size: DEFAULT_MAX_INPUT_SIZE,
@@ -30,7 +31,9 @@ impl Program {
             max_trusted_advice_size: DEFAULT_MAX_TRUSTED_ADVICE_SIZE,
             max_output_size: DEFAULT_MAX_OUTPUT_SIZE,
             std: false,
+            backtrace: Some("disable".to_string()), // Default to disable for minimal size
             elf: None,
+            elf_compute_advice: None,
         }
     }
 
@@ -40,6 +43,22 @@ impl Program {
 
     pub fn set_func(&mut self, func: &str) {
         self.func = Some(func.to_string())
+    }
+
+    /// Set the cargo profile used to compile the guest.
+    ///
+    /// If unset, guest builds default to `--release`.
+    /// If set, guest builds use `--profile <name>`.
+    pub fn set_profile(&mut self, profile: &str) {
+        self.profile = Some(profile.to_string());
+    }
+
+    /// Set backtrace mode for the guest build.
+    ///
+    /// This adds --backtrace <mode> to the cargo-jolt CLI.
+    /// Valid modes: "off", "dwarf", "frame-pointers".
+    pub fn set_backtrace(&mut self, mode: &str) {
+        self.backtrace = Some(mode.to_string());
     }
 
     pub fn set_memory_config(&mut self, memory_config: MemoryConfig) {
@@ -76,24 +95,31 @@ impl Program {
     }
 
     pub fn build(&mut self, target_dir: &str) {
-        self.build_with_channel(target_dir, "stable");
+        self.build_with_features(target_dir, &[]);
     }
 
-    #[tracing::instrument(skip_all, name = "Program::build")]
-    pub fn build_with_channel(&mut self, target_dir: &str, _channel: &str) {
+    #[tracing::instrument(skip_all, name = "Program::build_with_features")]
+    pub fn build_with_features(&mut self, target_dir: &str, extra_features: &[&str]) {
         if self.elf.is_none() {
             // Use jolt CLI to build the guest program
-            // JOLT_PATH can be set to override (for development/testing)
-            let jolt_path = std::env::var("JOLT_PATH").unwrap_or_else(|_| "jolt".to_string());
+            // JOLT_PATH can be set to override the jolt binary path
+            let jolt_cmd = std::env::var("JOLT_PATH").unwrap_or_else(|_| "jolt".to_string());
+            let mut args = vec!["build".to_string()];
 
-            // Build base arguments for jolt build
-            // jolt is invoked as: jolt build -p <package> [--mode std] -- --release --target-dir <dir> --features guest
-            let mut args = vec!["build".to_string(), "-p".to_string(), self.guest.clone()];
+            // Add package argument
+            args.push("-p".to_string());
+            args.push(self.guest.clone());
 
             // Add --mode std flag if std mode is enabled
             if self.std {
                 args.push("--mode".to_string());
                 args.push("std".to_string());
+            }
+
+            // Add --backtrace <mode> flag if backtrace is configured
+            if let Some(mode) = &self.backtrace {
+                args.push("--backtrace".to_string());
+                args.push(mode.to_string());
             }
 
             // Pass memory layout parameters to cargo-jolt
@@ -102,19 +128,35 @@ impl Program {
             args.push("--heap-size".to_string());
             args.push(self.heap_size.to_string());
 
-            // Create per-guest target directory (isolates builds)
-            let guest_target_dir = format!(
-                "{}/{}-{}",
-                target_dir,
-                self.guest,
-                self.func.as_ref().unwrap_or(&"".to_string())
-            );
+            // Add suffix to target dir if building with compute_advice feature
+            let guest_target_dir = if extra_features.contains(&"compute_advice") {
+                format!(
+                    "{}/{}-{}-compute-advice",
+                    target_dir,
+                    self.guest,
+                    self.func.as_ref().unwrap_or(&"".to_string())
+                )
+            } else {
+                format!(
+                    "{}/{}-{}",
+                    target_dir,
+                    self.guest,
+                    self.func.as_ref().unwrap_or(&"".to_string())
+                )
+            };
 
             // Add separator for cargo passthrough args
             args.push("--".to_string());
 
-            // --release goes after -- as a cargo argument
-            args.push("--release".to_string());
+            // Cargo profile selection. Default to `--release` for backwards compatibility.
+            // If a profile is set, pass `--profile <name>` instead.
+            if let Some(profile) = &self.profile {
+                args.push("--profile".to_string());
+                args.push(profile.clone());
+            } else {
+                // --release goes after -- as a cargo argument
+                args.push("--release".to_string());
+            }
 
             // Pass --target-dir to cargo (not cargo-jolt)
             args.push("--target-dir".to_string());
@@ -123,16 +165,18 @@ impl Program {
             // Always pass --features guest to enable the guest feature on the example package
             // (this is separate from the jolt-sdk features specified in the example's Cargo.toml)
             args.push("--features".to_string());
-            args.push("guest".to_string());
+            let mut features = vec!["guest".to_string()];
+            features.extend(extra_features.iter().map(|s| s.to_string()));
+            args.push(features.join(","));
 
             let cmd_line = compose_command_line(
-                &jolt_path,
+                &jolt_cmd,
                 &[],
                 &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
             );
             info!("\n{cmd_line}");
 
-            let mut cmd = Command::new(&jolt_path);
+            let mut cmd = Command::new(&jolt_cmd);
             cmd.args(&args);
 
             // Pass JOLT_FUNC_NAME if a specific function is set (for guest packages with multiple provable functions)
@@ -145,10 +189,16 @@ impl Program {
                 .expect("failed to run jolt - make sure it's installed (cargo install --path .)");
 
             if !output.status.success() {
-                io::stderr().write_all(&output.stderr).unwrap();
-                let output_msg = format!("::build command: \n{cmd_line}\n");
-                io::stderr().write_all(output_msg.as_bytes()).unwrap();
-                panic!("failed to compile guest with jolt");
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("does not contain this feature: compute_advice") {
+                    info!("guest does not support compute_advice feature");
+                    return;
+                } else {
+                    io::stderr().write_all(&output.stderr).unwrap();
+                    let output_msg = format!("::build command: \n{cmd_line}\n");
+                    io::stderr().write_all(output_msg.as_bytes()).unwrap();
+                    panic!("failed to compile guest with jolt");
+                }
             }
 
             // Determine the ELF path based on std mode
@@ -158,10 +208,12 @@ impl Program {
                 "riscv64imac-unknown-none-elf"
             };
 
-            // ELF is built to guest_target_dir with standard cargo layout
+            // ELF is built to guest_target_dir with standard cargo layout.
+            // Note: output directory includes the selected cargo profile (default: "release").
+            let out_profile = self.profile.as_deref().unwrap_or("release");
             let elf_path = PathBuf::from(&guest_target_dir)
                 .join(target_triple)
-                .join("release")
+                .join(out_profile)
                 .join(&self.guest);
 
             // Verify the ELF exists
@@ -172,15 +224,32 @@ impl Program {
                 );
             }
 
-            // Store the main ELF path
-            self.elf = Some(elf_path.clone());
-
-            info!("Built guest binary with jolt: {}", elf_path.display());
+            // If extra_features contains "compute_advice", store in elf_compute_advice
+            // Otherwise store in elf
+            if extra_features.contains(&"compute_advice") {
+                self.elf_compute_advice = Some(elf_path.clone());
+                info!("Built compute_advice guest binary: {}", elf_path.display());
+            } else {
+                self.elf = Some(elf_path.clone());
+                info!("Built guest binary with jolt: {}", elf_path.display());
+            }
         }
     }
 
     pub fn get_elf_contents(&self) -> Option<Vec<u8>> {
         if let Some(elf) = &self.elf {
+            let mut elf_file =
+                File::open(elf).unwrap_or_else(|_| panic!("could not open elf file: {elf:?}"));
+            let mut elf_contents = Vec::new();
+            elf_file.read_to_end(&mut elf_contents).unwrap();
+            Some(elf_contents)
+        } else {
+            None
+        }
+    }
+
+    pub fn get_elf_compute_advice_contents(&self) -> Option<Vec<u8>> {
+        if let Some(elf) = &self.elf_compute_advice {
             let mut elf_file =
                 File::open(elf).unwrap_or_else(|_| panic!("could not open elf file: {elf:?}"));
             let mut elf_contents = Vec::new();
@@ -228,14 +297,16 @@ impl Program {
             program_size: Some(program_size),
         };
 
-        guest::program::trace(
+        let (lazy_trace, trace, memory, jolt_device, _advice_tape) = guest::program::trace(
             &elf_contents,
             self.elf.as_ref(),
             inputs,
             untrusted_advice,
             trusted_advice,
             &memory_config,
-        )
+            None,
+        );
+        (lazy_trace, trace, memory, jolt_device)
     }
 
     #[tracing::instrument(skip_all, name = "Program::trace_to_file")]

@@ -12,8 +12,6 @@ pprof/
 # pprof files
 *.pb
 
-benchmark-runs/
-
 # flamegraphs
 **/*.svg
 
@@ -58,6 +56,7 @@ bin/act
 benchmark-runs/
 /perfetto_traces/
 *.pb
+*benchmark_results.json
 
 # verifier test fixtures
 jolt-sdk/tests/fixtures
@@ -67,4 +66,3 @@ jolt-sdk/tests/jolt_verifier_preprocessing_bytes.rs
 
 # transpiler test output
 transpiler/go/groth16_results.json
-
