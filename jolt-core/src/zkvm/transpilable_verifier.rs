@@ -34,13 +34,16 @@
 //!
 //! ## Advice Verifiers
 //!
-//! Note: `AdviceClaimReduction` verifiers are NOT included in stage 7. They require
-//! state management across stages 6-7 (phase transitions).
+//! `AdviceClaimReduction` verifiers are included when advice commitments are present.
+//! They span stages 6 and 7 with a phase transition between them:
+//! - Stage 6: CycleVariables phase (bind cycle-derived coordinates)
+//! - Stage 7: AddressVariables phase (bind address-derived coordinates)
 
 use crate::poly::commitment::commitment_scheme::CommitmentScheme;
 use crate::subprotocols::sumcheck::BatchedSumcheck;
 use crate::zkvm::claim_reductions::{
-    HammingWeightClaimReductionVerifier, RegistersClaimReductionSumcheckVerifier,
+    AdviceClaimReductionVerifier, AdviceKind, HammingWeightClaimReductionVerifier,
+    ReductionPhase, RegistersClaimReductionSumcheckVerifier,
 };
 use crate::zkvm::config::OneHotParams;
 use crate::zkvm::ram::val_final::ValFinalSumcheckVerifier;
@@ -111,6 +114,12 @@ pub struct TranspilableVerifier<
     pub opening_accumulator: A,
     pub spartan_key: UniformSpartanKey<F>,
     pub one_hot_params: OneHotParams,
+    /// The advice claim reduction sumcheck effectively spans two stages (6 and 7).
+    /// Cache the verifier state here between stages.
+    advice_reduction_verifier_trusted: Option<AdviceClaimReductionVerifier<F>>,
+    /// The advice claim reduction sumcheck effectively spans two stages (6 and 7).
+    /// Cache the verifier state here between stages.
+    advice_reduction_verifier_untrusted: Option<AdviceClaimReductionVerifier<F>>,
 }
 
 impl<
@@ -202,6 +211,8 @@ impl<
             opening_accumulator,
             spartan_key,
             one_hot_params,
+            advice_reduction_verifier_trusted: None,
+            advice_reduction_verifier_untrusted: None,
         })
     }
 
@@ -230,6 +241,8 @@ impl<
             opening_accumulator,
             spartan_key,
             one_hot_params,
+            advice_reduction_verifier_trusted: None,
+            advice_reduction_verifier_untrusted: None,
         }
     }
 
@@ -507,11 +520,33 @@ impl<
             &mut self.transcript,
         );
 
-        // Note: AdviceClaimReduction verifiers are not included here because they
-        // require VerifierOpeningAccumulator-specific state management across stages.
-        // For transpilation, advice handling would need a different approach.
+        // Advice claim reduction (Phase 1 in Stage 6): trusted and untrusted are separate instances.
+        if self.trusted_advice_commitment.is_some() {
+            self.advice_reduction_verifier_trusted = Some(AdviceClaimReductionVerifier::new(
+                AdviceKind::Trusted,
+                &self.program_io.memory_layout,
+                self.proof.trace_length,
+                &self.opening_accumulator,
+                &mut self.transcript,
+                self.proof
+                    .rw_config
+                    .needs_single_advice_opening(self.proof.trace_length.log_2()),
+            ));
+        }
+        if self.proof.untrusted_advice_commitment.is_some() {
+            self.advice_reduction_verifier_untrusted = Some(AdviceClaimReductionVerifier::new(
+                AdviceKind::Untrusted,
+                &self.program_io.memory_layout,
+                self.proof.trace_length,
+                &self.opening_accumulator,
+                &mut self.transcript,
+                self.proof
+                    .rw_config
+                    .needs_single_advice_opening(self.proof.trace_length.log_2()),
+            ));
+        }
 
-        let instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, A>> = vec![
+        let mut instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, A>> = vec![
             &bytecode_read_raf,
             &booleanity,
             &ram_hamming_booleanity,
@@ -519,6 +554,12 @@ impl<
             &lookups_ra_virtual,
             &inc_reduction,
         ];
+        if let Some(ref advice) = self.advice_reduction_verifier_trusted {
+            instances.push(advice);
+        }
+        if let Some(ref advice) = self.advice_reduction_verifier_untrusted {
+            instances.push(advice);
+        }
 
         let _r_stage6 = BatchedSumcheck::verify(
             &self.proof.stage6_sumcheck_proof,
@@ -541,12 +582,30 @@ impl<
             &mut self.transcript,
         );
 
-        // Note: AdviceClaimReduction verifiers are not included here.
-        // They require state management across stages 6-7 (phase transitions).
-        // For proofs with advice, this would need to be extended.
-        // See .claude/tasks/006-add-advice-verifiers-stage7.md for planned implementation.
-        let instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, A>> =
+        let mut instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, A>> =
             vec![&hw_verifier];
+
+        // Phase transition: CycleVariables -> AddressVariables for advice verifiers.
+        // The advice verifiers were created in stage 6 with phase = CycleVariables.
+        // Now transition to AddressVariables phase for the address-binding rounds.
+        if let Some(advice_reduction_verifier_trusted) =
+            self.advice_reduction_verifier_trusted.as_mut()
+        {
+            let mut params = advice_reduction_verifier_trusted.params.borrow_mut();
+            if params.num_address_phase_rounds() > 0 {
+                params.phase = ReductionPhase::AddressVariables;
+                instances.push(advice_reduction_verifier_trusted);
+            }
+        }
+        if let Some(advice_reduction_verifier_untrusted) =
+            self.advice_reduction_verifier_untrusted.as_mut()
+        {
+            let mut params = advice_reduction_verifier_untrusted.params.borrow_mut();
+            if params.num_address_phase_rounds() > 0 {
+                params.phase = ReductionPhase::AddressVariables;
+                instances.push(advice_reduction_verifier_untrusted);
+            }
+        }
 
         let _r_stage7 = BatchedSumcheck::verify(
             &self.proof.stage7_sumcheck_proof,
