@@ -36,9 +36,17 @@ func runCommand(t *testing.T, name string, dir string, bin string, args ...strin
 
 // TestEndToEndPipeline runs the complete pipeline and reports all timings.
 //
-// Usage: go test -run TestEndToEndPipeline -v -timeout 30m
+// Usage:
+//
+//	go test -run TestEndToEndPipeline -v -timeout 30m
+//	FIB_N=100 go test -run TestEndToEndPipeline -v -timeout 30m
 func TestEndToEndPipeline(t *testing.T) {
-	t.Log("=== End-to-End Pipeline ===")
+	fibN := os.Getenv("FIB_N")
+	if fibN == "" {
+		fibN = "50"
+	}
+
+	t.Logf("=== End-to-End Pipeline (fib(%s)) ===", fibN)
 	root := getWorkspaceRoot()
 	_, thisFile, _, _ := runtime.Caller(0)
 	goDir := filepath.Dir(thisFile)
@@ -57,10 +65,10 @@ func TestEndToEndPipeline(t *testing.T) {
 	totalStart := time.Now()
 
 	// Step 1: Fibonacci proof (binary only, no compilation)
-	t.Log("--- Step 1: Fibonacci Proof ---")
+	t.Logf("--- Step 1: Fibonacci Proof (n=%s) ---", fibN)
 	fibBin := filepath.Join(root, "target", "release", "fibonacci")
 	fibTime := runCommand(t, "fibonacci", root,
-		fibBin, "--save", "50",
+		fibBin, "--save", fibN,
 	)
 
 	// Step 2: Transpile (binary only, no compilation)

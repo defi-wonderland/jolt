@@ -17,6 +17,7 @@ clap = { version = "4.0", features = ["derive"] }
 jolt-core = { path = "../jolt-core" }
 zklean-extractor = { path = "../zklean-extractor" }
 common = { path = "../common" }
+tracer = { workspace = true, default-features = false, features = ["std"] }
 light-poseidon = "0.4.0"
 num-bigint = "0.4"
 

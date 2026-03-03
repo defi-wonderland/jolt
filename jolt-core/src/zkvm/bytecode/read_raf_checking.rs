@@ -1,4 +1,4 @@
-use std::{array, iter::once, sync::Arc};
+use std::{any::Any, array, cell::RefCell, iter::once, sync::Arc};
 
 use num_traits::Zero;
 
@@ -24,13 +24,13 @@ use crate::{
         sumcheck_verifier::{SumcheckInstanceParams, SumcheckInstanceVerifier},
     },
     transcripts::Transcript,
-    utils::{math::Math, small_scalar::SmallScalar, thread::unsafe_allocate_zero_vec},
+    utils::{math::Math, thread::unsafe_allocate_zero_vec},
     zkvm::{
         bytecode::BytecodePreprocessing,
         config::OneHotParams,
         instruction::{
             CircuitFlags, Flags, InstructionFlags, InstructionLookup, InterleavedBitsMarker,
-            NUM_CIRCUIT_FLAGS,
+            NUM_CIRCUIT_FLAGS, NUM_INSTRUCTION_FLAGS,
         },
         lookup_table::{LookupTables, NUM_LOOKUP_TABLES},
         witness::{CommittedPolynomial, VirtualPolynomial},
@@ -44,6 +44,95 @@ use itertools::{zip_eq, Itertools};
 use rayon::prelude::*;
 use strum::{EnumCount, IntoEnumIterator};
 use tracer::instruction::{Cycle, Instruction};
+
+// =============================================================================
+// Symbolic bytecode support (universal circuit transpilation)
+// =============================================================================
+
+thread_local! {
+    static PENDING_BYTECODE_INSTRUCTIONS: RefCell<Option<Box<dyn Any>>> = RefCell::new(None);
+    /// Captured eq_r_register tables and gammas from compute_val_polys execution.
+    /// Used by the transpiler to fix up witness values after symbolic verification.
+    static CAPTURED_BYTECODE_CHALLENGES: RefCell<Option<Box<dyn Any>>> = RefCell::new(None);
+}
+
+/// Pre-allocated symbolic variables for a single bytecode instruction.
+///
+/// For universal circuit transpilation, concrete instruction data (address, imm, flags,
+/// register eq lookups, lookup table contribution) are replaced with witness variables.
+/// Branches like `if flag { lc += gamma }` become `flag_var * gamma`.
+///
+/// Fields that depend on challenge-derived values (`eq_r_register_4`, `eq_r_register_5_rd`,
+/// `stage5_lookup_contribution`) are allocated with placeholder witness values that must be
+/// fixed up after symbolic verification completes.
+#[derive(Clone)]
+pub struct SymbolicInstruction<F> {
+    pub address: F,
+    pub imm: F,
+    pub circuit_flags: [F; NUM_CIRCUIT_FLAGS],
+    pub instruction_flags: [F; NUM_INSTRUCTION_FLAGS],
+    /// eq(rd, r_register_4) * gamma4[0] + eq(rs1, r_register_4) * gamma4[1] + eq(rs2, r_register_4) * gamma4[2]
+    /// Provided as 3 separate witness values for stage 4.
+    pub eq_r_register_4: [F; 3], // [rd_eq4, rs1_eq4, rs2_eq4]
+    /// eq(rd, r_register_5) for stage 5.
+    pub eq_r_register_5_rd: F,
+    /// 1 - is_interleaved_operands for stage 5.
+    pub stage5_not_interleaved: F,
+    /// gamma[2 + table_idx] for the instruction's lookup table, or 0 if no table.
+    pub stage5_lookup_contribution: F,
+}
+
+/// Pending symbolic instructions for compute_val_polys.
+#[derive(Clone)]
+pub struct PendingBytecodeInstructions<F> {
+    pub instructions: Vec<SymbolicInstruction<F>>,
+    /// Concrete register numbers for each instruction (for witness fixup).
+    /// Each entry: (rd: Option<u8>, rs1: Option<u8>, rs2: Option<u8>)
+    pub register_indices: Vec<(Option<u8>, Option<u8>, Option<u8>)>,
+    /// Concrete lookup table index for each instruction (for witness fixup).
+    /// None if the instruction has no lookup table.
+    pub lookup_table_indices: Vec<Option<usize>>,
+}
+
+/// Captured concrete eq_r_register tables and gammas from compute_val_polys.
+/// Used to fix up placeholder witness values after symbolic verification.
+#[derive(Clone)]
+pub struct CapturedBytecodeData<F> {
+    pub eq_r_register_4: Vec<F>,
+    pub eq_r_register_5: Vec<F>,
+    pub stage5_gammas: Vec<F>,
+}
+
+pub fn set_pending_bytecode_instructions<F: Clone + 'static>(
+    vals: PendingBytecodeInstructions<F>,
+) {
+    PENDING_BYTECODE_INSTRUCTIONS.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(vals));
+    });
+}
+
+fn get_pending_bytecode_instructions<F: Clone + 'static>(
+) -> Option<PendingBytecodeInstructions<F>> {
+    PENDING_BYTECODE_INSTRUCTIONS.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|b| b.downcast_ref::<PendingBytecodeInstructions<F>>().unwrap().clone())
+    })
+}
+
+pub fn set_captured_bytecode_data<F: Clone + 'static>(data: CapturedBytecodeData<F>) {
+    CAPTURED_BYTECODE_CHALLENGES.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(data));
+    });
+}
+
+pub fn take_captured_bytecode_data<F: Clone + 'static>() -> Option<CapturedBytecodeData<F>> {
+    CAPTURED_BYTECODE_CHALLENGES.with(|cell| {
+        cell.borrow_mut()
+            .take()
+            .map(|b| *b.downcast::<CapturedBytecodeData<F>>().unwrap())
+    })
+}
 
 /// Number of batched read-checking sumchecks bespokely
 const N_STAGES: usize = 5;
@@ -771,11 +860,33 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
         let eq_r_register_5 =
             EqPolynomial::<F>::evals(&r_register_5[..(REGISTER_COUNT as usize).log_2()]);
 
-        // Fused pass: compute all val polynomials in a single parallel iteration
+        // Build SymbolicInstruction<F> array: either from thread-local override (symbolic)
+        // or by converting concrete Instruction data. Single generic compute_val_polys path.
+        let sym_instructions: Vec<SymbolicInstruction<F>> =
+            if let Some(pending) = get_pending_bytecode_instructions::<F>() {
+                // Capture the concrete eq_r_register tables and gammas for witness fixup.
+                set_captured_bytecode_data(CapturedBytecodeData {
+                    eq_r_register_4: eq_r_register_4.clone(),
+                    eq_r_register_5: eq_r_register_5.clone(),
+                    stage5_gammas: stage5_gammas.clone(),
+                });
+                pending.instructions
+            } else {
+                bytecode
+                    .iter()
+                    .map(|instr| {
+                        Self::instruction_to_symbolic(
+                            instr,
+                            &eq_r_register_4,
+                            &eq_r_register_5,
+                            &stage5_gammas,
+                        )
+                    })
+                    .collect()
+            };
+
         let val_polys = Self::compute_val_polys(
-            bytecode,
-            &eq_r_register_4,
-            &eq_r_register_5,
+            &sym_instructions,
             &stage1_gammas,
             &stage2_gammas,
             &stage3_gammas,
@@ -850,168 +961,138 @@ impl<F: JoltField> BytecodeReadRafSumcheckParams<F> {
         }
     }
 
-    /// Fused computation of all Val polynomials in a single parallel pass over bytecode.
+    /// Convert a concrete `Instruction` into a `SymbolicInstruction<F>`.
     ///
-    /// This computes all 5 stage-specific Val(k) polynomials simultaneously, avoiding
-    /// 5 separate passes through the bytecode. Each stage has its own gamma powers
-    /// and formula for Val(k).
-    #[allow(clippy::too_many_arguments)]
-    fn compute_val_polys(
-        bytecode: &[Instruction],
+    /// This is used when there is no symbolic override: concrete instruction data is
+    /// converted to field elements so that `compute_val_polys` can use a single generic path.
+    /// For `F = Fr`, `flag_var * gamma` is equivalent to `if flag { += gamma }` because
+    /// flags are 0 or 1.
+    fn instruction_to_symbolic(
+        instruction: &Instruction,
         eq_r_register_4: &[F],
         eq_r_register_5: &[F],
+        stage5_gammas: &[F],
+    ) -> SymbolicInstruction<F> {
+        let instr = instruction.normalize();
+        let circuit_flags = instruction.circuit_flags();
+        let instr_flags = instruction.instruction_flags();
+
+        SymbolicInstruction {
+            address: F::from_u64(instr.address as u64),
+            imm: F::from_i128(instr.operands.imm),
+            circuit_flags: array::from_fn(|i| {
+                if circuit_flags[i] { F::one() } else { F::zero() }
+            }),
+            instruction_flags: array::from_fn(|i| {
+                if instr_flags[i] { F::one() } else { F::zero() }
+            }),
+            eq_r_register_4: [
+                instr.operands.rd.map_or(F::zero(), |r| eq_r_register_4[r as usize]),
+                instr.operands.rs1.map_or(F::zero(), |r| eq_r_register_4[r as usize]),
+                instr.operands.rs2.map_or(F::zero(), |r| eq_r_register_4[r as usize]),
+            ],
+            eq_r_register_5_rd: instr
+                .operands
+                .rd
+                .map_or(F::zero(), |r| eq_r_register_5[r as usize]),
+            stage5_not_interleaved: if circuit_flags.is_interleaved_operands() {
+                F::zero()
+            } else {
+                F::one()
+            },
+            stage5_lookup_contribution: instruction
+                .lookup_table()
+                .map_or(F::zero(), |table| stage5_gammas[2 + LookupTables::enum_index(&table)]),
+        }
+    }
+
+    /// Compute all 5 stage-specific Val(k) polynomials from `SymbolicInstruction<F>`.
+    ///
+    /// Single generic path: branches like `if flag { lc += gamma }` are replaced by
+    /// `flag_var * gamma`. For concrete `F` (flags are 0/1), this is arithmetically
+    /// equivalent. For symbolic `F` (MleAst), it produces Mul nodes that yield a
+    /// universal circuit structure regardless of program bytecode.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_val_polys(
+        instructions: &[SymbolicInstruction<F>],
         stage1_gammas: &[F],
         stage2_gammas: &[F],
         stage3_gammas: &[F],
         stage4_gammas: &[F],
         stage5_gammas: &[F],
     ) -> [MultilinearPolynomial<F>; N_STAGES] {
-        let K = bytecode.len();
+        let k = instructions.len();
 
-        // Pre-allocate output vectors for each stage
-        let mut vals: [Vec<F>; N_STAGES] = array::from_fn(|_| unsafe_allocate_zero_vec(K));
+        let mut vals: [Vec<F>; N_STAGES] = array::from_fn(|_| unsafe_allocate_zero_vec(k));
         let [v0, v1, v2, v3, v4] = &mut vals;
 
-        // Fused parallel iteration: compute all 5 val entries for each instruction
-        bytecode
-            .par_iter()
-            .zip(v0.par_iter_mut())
-            .zip(v1.par_iter_mut())
-            .zip(v2.par_iter_mut())
-            .zip(v3.par_iter_mut())
-            .zip(v4.par_iter_mut())
-            .for_each(|(((((instruction, o0), o1), o2), o3), o4)| {
-                let instr = instruction.normalize();
-                let circuit_flags = instruction.circuit_flags();
-                let instr_flags = instruction.instruction_flags();
-
-                // Stage 1 (Spartan outer sumcheck)
-                // Val(k) = unexpanded_pc(k) + γ·imm(k)
-                //          + γ²·circuit_flags[0](k) + γ³·circuit_flags[1](k) + ...
-                // This virtualizes claims output by Spartan's "outer" sumcheck.
-                {
-                    let mut lc = F::from_u64(instr.address as u64);
-                    lc += instr.operands.imm.field_mul(stage1_gammas[1]);
-                    // sanity check
-                    debug_assert!(
-                        !circuit_flags[CircuitFlags::IsCompressed]
-                            || !circuit_flags[CircuitFlags::DoNotUpdateUnexpandedPC]
-                    );
-                    for (flag, gamma_power) in circuit_flags.iter().zip(stage1_gammas[2..].iter()) {
-                        if *flag {
-                            lc += *gamma_power;
-                        }
-                    }
-                    *o0 = lc;
+        // Sequential iteration (safe for both Fr and MleAst; K is small enough).
+        for (idx, si) in instructions.iter().enumerate() {
+            // Stage 1 (Spartan outer sumcheck)
+            // Val(k) = address + imm * γ₁ + Σᵢ circuit_flags[i] * γ₂₊ᵢ
+            {
+                let mut lc = si.address;
+                lc = lc + si.imm * stage1_gammas[1];
+                for (i, gamma_power) in stage1_gammas[2..].iter().enumerate() {
+                    lc = lc + si.circuit_flags[i] * *gamma_power;
                 }
+                v0[idx] = lc;
+            }
 
-                // Stage 2 (product virtualization, de-duplicated factors)
-                // Val(k) = jump_flag(k) + γ·branch_flag(k)
-                //          + γ²·is_rd_not_zero_flag(k) + γ³·write_lookup_output_to_rd_flag(k)
-                // where jump_flag(k) = 1 if instruction k is a jump, 0 otherwise;
-                //       branch_flag(k) = 1 if instruction k is a branch, 0 otherwise;
-                //       is_rd_not_zero_flag(k) = 1 if instruction k has rd != 0;
-                //       write_lookup_output_to_rd_flag(k) = 1 if instruction k writes lookup output to rd.
-                //       virtual_instruction(k) = 1 if instruction k is a virtual instruction.
-                // This Val matches the fused product sumcheck.
-                {
-                    let mut lc = F::zero();
-                    if circuit_flags[CircuitFlags::Jump] {
-                        lc += stage2_gammas[0];
-                    }
-                    if instr_flags[InstructionFlags::Branch] {
-                        lc += stage2_gammas[1];
-                    }
-                    if instr_flags[InstructionFlags::IsRdNotZero] {
-                        lc += stage2_gammas[2];
-                    }
-                    if circuit_flags[CircuitFlags::WriteLookupOutputToRD] {
-                        lc += stage2_gammas[3];
-                    }
-                    if circuit_flags[CircuitFlags::VirtualInstruction] {
-                        lc += stage2_gammas[4];
-                    }
-                    *o1 = lc;
-                }
+            // Stage 2 (product virtualization)
+            // Val(k) = cf[Jump]*γ₀ + if[Branch]*γ₁ + if[IsRdNotZero]*γ₂
+            //          + cf[WriteLookupOutputToRD]*γ₃ + cf[VirtualInstruction]*γ₄
+            {
+                let lc = si.circuit_flags[CircuitFlags::Jump as usize] * stage2_gammas[0]
+                    + si.instruction_flags[InstructionFlags::Branch as usize] * stage2_gammas[1]
+                    + si.instruction_flags[InstructionFlags::IsRdNotZero as usize]
+                        * stage2_gammas[2]
+                    + si.circuit_flags[CircuitFlags::WriteLookupOutputToRD as usize]
+                        * stage2_gammas[3]
+                    + si.circuit_flags[CircuitFlags::VirtualInstruction as usize]
+                        * stage2_gammas[4];
+                v1[idx] = lc;
+            }
 
-                // Stage 3 (Shift sumcheck)
-                // Val(k) = imm(k) + γ·unexpanded_pc(k)
-                //          + γ²·left_operand_is_rs1_value(k) + γ³·left_operand_is_pc(k)
-                //          + γ⁴·right_operand_is_rs2_value(k) + γ⁵·right_operand_is_imm(k)
-                //          + γ⁶·is_noop(k) + γ⁷·virtual_instruction(k) + γ⁸·is_first_in_sequence(k)
-                // This virtualizes claims output by the ShiftSumcheck.
-                {
-                    let mut lc = F::from_i128(instr.operands.imm);
-                    lc += stage3_gammas[1].mul_u64(instr.address as u64);
-                    if instr_flags[InstructionFlags::LeftOperandIsRs1Value] {
-                        lc += stage3_gammas[2];
-                    }
-                    if instr_flags[InstructionFlags::LeftOperandIsPC] {
-                        lc += stage3_gammas[3];
-                    }
-                    if instr_flags[InstructionFlags::RightOperandIsRs2Value] {
-                        lc += stage3_gammas[4];
-                    }
-                    if instr_flags[InstructionFlags::RightOperandIsImm] {
-                        lc += stage3_gammas[5];
-                    }
-                    if instr_flags[InstructionFlags::IsNoop] {
-                        lc += stage3_gammas[6];
-                    }
-                    if circuit_flags[CircuitFlags::VirtualInstruction] {
-                        lc += stage3_gammas[7];
-                    }
-                    if circuit_flags[CircuitFlags::IsFirstInSequence] {
-                        lc += stage3_gammas[8];
-                    }
-                    *o2 = lc;
-                }
+            // Stage 3 (Shift sumcheck)
+            // Val(k) = imm + address*γ₁ + if[LeftOperandIsRs1Value]*γ₂ + if[LeftOperandIsPC]*γ₃
+            //          + if[RightOperandIsRs2Value]*γ₄ + if[RightOperandIsImm]*γ₅
+            //          + if[IsNoop]*γ₆ + cf[VirtualInstruction]*γ₇ + cf[IsFirstInSequence]*γ₈
+            {
+                let lc = si.imm
+                    + si.address * stage3_gammas[1]
+                    + si.instruction_flags[InstructionFlags::LeftOperandIsRs1Value as usize]
+                        * stage3_gammas[2]
+                    + si.instruction_flags[InstructionFlags::LeftOperandIsPC as usize]
+                        * stage3_gammas[3]
+                    + si.instruction_flags[InstructionFlags::RightOperandIsRs2Value as usize]
+                        * stage3_gammas[4]
+                    + si.instruction_flags[InstructionFlags::RightOperandIsImm as usize]
+                        * stage3_gammas[5]
+                    + si.instruction_flags[InstructionFlags::IsNoop as usize] * stage3_gammas[6]
+                    + si.circuit_flags[CircuitFlags::VirtualInstruction as usize]
+                        * stage3_gammas[7]
+                    + si.circuit_flags[CircuitFlags::IsFirstInSequence as usize]
+                        * stage3_gammas[8];
+                v2[idx] = lc;
+            }
 
-                // Stage 4 (registers read/write checking sumcheck)
-                // Val(k) = eq(rd(k), r_register) + γ·eq(rs1(k), r_register) + γ²·eq(rs2(k), r_register)
-                // where rd(k, r) = 1 if the k'th instruction in the bytecode has rd = r,
-                // and analogously for rs1(k, r) and rs2(k, r).
-                // This virtualizes claims output by the registers read/write checking sumcheck.
-                {
-                    let rd_eq = instr
-                        .operands
-                        .rd
-                        .map_or(F::zero(), |r| eq_r_register_4[r as usize]);
-                    let rs1_eq = instr
-                        .operands
-                        .rs1
-                        .map_or(F::zero(), |r| eq_r_register_4[r as usize]);
-                    let rs2_eq = instr
-                        .operands
-                        .rs2
-                        .map_or(F::zero(), |r| eq_r_register_4[r as usize]);
-                    *o3 = rd_eq * stage4_gammas[0]
-                        + rs1_eq * stage4_gammas[1]
-                        + rs2_eq * stage4_gammas[2];
-                }
+            // Stage 4 (registers read/write checking)
+            // Val(k) = rd_eq4 * γ₀ + rs1_eq4 * γ₁ + rs2_eq4 * γ₂
+            {
+                v3[idx] = si.eq_r_register_4[0] * stage4_gammas[0]
+                    + si.eq_r_register_4[1] * stage4_gammas[1]
+                    + si.eq_r_register_4[2] * stage4_gammas[2];
+            }
 
-                // Stage 5 (registers val-evaluation + instruction lookups sumcheck)
-                // Val(k) = eq(rd(k), r_register) + γ·raf_flag(k)
-                //          + γ²·lookup_table_flag[0](k) + γ³·lookup_table_flag[1](k) + ...
-                // where rd(k, r) = 1 if the k'th instruction in the bytecode has rd = r,
-                // and raf_flag(k) = 1 if instruction k is NOT interleaved operands.
-                // This virtualizes the claim output by the registers val-evaluation sumcheck
-                // and the instruction lookups sumcheck.
-                {
-                    let mut lc = instr
-                        .operands
-                        .rd
-                        .map_or(F::zero(), |r| eq_r_register_5[r as usize]);
-                    if !circuit_flags.is_interleaved_operands() {
-                        lc += stage5_gammas[1];
-                    }
-                    if let Some(table) = instruction.lookup_table() {
-                        let table_index = LookupTables::enum_index(&table);
-                        lc += stage5_gammas[2 + table_index];
-                    }
-                    *o4 = lc;
-                }
-            });
+            // Stage 5 (registers val-evaluation + instruction lookups)
+            // Val(k) = rd_eq5 + not_interleaved * γ₁ + lookup_contribution
+            {
+                v4[idx] = si.eq_r_register_5_rd
+                    + si.stage5_not_interleaved * stage5_gammas[1]
+                    + si.stage5_lookup_contribution;
+            }
+        }
 
         vals.map(MultilinearPolynomial::from)
     }

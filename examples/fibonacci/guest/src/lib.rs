@@ -10,7 +10,7 @@ fn fib(n: u32) -> u128 {
     start_cycle_tracking("fib_loop"); // Use `start_cycle_tracking("{name}")` to start a cycle span
 
     for _ in 1..n {
-        sum = a + b;
+        sum = a.wrapping_add(b);
         a = b;
         b = sum;
     }

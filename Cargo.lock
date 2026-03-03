@@ -6241,6 +6241,7 @@ dependencies = [
  "num-bigint",
  "serde",
  "serde_json",
+ "tracer",
  "zklean-extractor",
 ]
 

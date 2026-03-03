@@ -85,6 +85,7 @@
 //! let circuit_code = gnark_codegen::generate_circuit_from_bundle(&bundle, "MyCircuit");
 //! ```
 
+pub mod evaluate_concrete;
 pub mod gnark_codegen;
 pub mod symbolic_proof;
 pub mod symbolic_traits;
