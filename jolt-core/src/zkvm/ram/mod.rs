@@ -47,7 +47,7 @@
 
 use crate::zkvm::config::OneHotParams;
 use crate::{
-    field::{self, BarrettReduce, FMAdd, JoltField},
+    field::{self, JoltField},
     poly::{
         eq_poly::EqPolynomial,
         multilinear_polynomial::{MultilinearPolynomial, PolynomialEvaluation},
@@ -56,7 +56,7 @@ use crate::{
         },
     },
     transcripts::Transcript,
-    utils::{accumulation::Acc6U, math::Math},
+    utils::math::Math,
     zkvm::witness::VirtualPolynomial,
 };
 use std::vec;
@@ -69,6 +69,67 @@ use common::{
 use rayon::prelude::*;
 use tracer::emulator::memory::Memory;
 use tracer::JoltDevice;
+
+use std::any::Any;
+use std::cell::RefCell;
+
+// =============================================================================
+// Thread-local overrides for symbolic IO / RAM evaluation
+// =============================================================================
+
+thread_local! {
+    static PENDING_IO_MLE: RefCell<Option<Box<dyn Any>>> = RefCell::new(None);
+    static PENDING_INITIAL_RAM: RefCell<Option<Box<dyn Any>>> = RefCell::new(None);
+}
+
+/// Symbolic values for `eval_io_mle` (universal circuit transpilation).
+///
+/// When set, `eval_io_mle` uses these field-element values instead of packing
+/// concrete `u64` words from `JoltDevice`.
+#[derive(Clone)]
+pub struct PendingIoMleValues<F> {
+    pub input_words: Vec<F>,
+    pub output_words: Vec<F>,
+    pub panic_val: F,
+}
+
+/// Symbolic values for `eval_initial_ram_mle` (universal circuit transpilation).
+///
+/// When set, `eval_initial_ram_mle` uses these field-element values instead of
+/// the concrete `bytecode_words` and `input_words`.
+#[derive(Clone)]
+pub struct PendingInitialRamValues<F> {
+    pub bytecode_words: Vec<F>,
+    pub input_words: Vec<F>,
+}
+
+pub fn set_pending_io_mle<F: 'static>(vals: PendingIoMleValues<F>) {
+    PENDING_IO_MLE.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(vals));
+    });
+}
+
+fn get_pending_io_mle<F: Clone + 'static>() -> Option<PendingIoMleValues<F>> {
+    PENDING_IO_MLE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|b| b.downcast_ref::<PendingIoMleValues<F>>().unwrap().clone())
+    })
+}
+
+pub fn set_pending_initial_ram<F: 'static>(vals: PendingInitialRamValues<F>) {
+    PENDING_INITIAL_RAM.with(|cell| {
+        *cell.borrow_mut() = Some(Box::new(vals));
+    });
+}
+
+fn get_pending_initial_ram<F: Clone + 'static>() -> Option<PendingInitialRamValues<F>> {
+    PENDING_INITIAL_RAM.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|b| b.downcast_ref::<PendingInitialRamValues<F>>().unwrap().clone())
+    })
+}
 
 pub mod hamming_booleanity;
 pub mod output_check;
@@ -436,19 +497,18 @@ fn calculate_advice_memory_evaluation<F: JoltField>(
     }
 }
 
-/// Evaluate a shifted slice of `u64` coefficients as a multilinear polynomial at `r`.
+/// Evaluate a shifted slice of field-element coefficients as a multilinear polynomial at `r`.
 ///
 /// Conceptually computes:
 /// \[
-///   \sum_{j=0}^{len-1} values[j] \cdot eq(r, start_index + j)
+///   \sum_{j=0}^{len-1} values[j] \cdot eq(r, start\_index + j)
 /// \]
-/// without materializing a full length-\(K\) vector or a full `eq(r, ·)` table.
+/// without materializing a full length-K vector or a full eq(r, ·) table.
 ///
-/// Uses aligned power-of-two block decomposition with `EqPolynomial::evals_for_max_aligned_block`,
-/// and accumulates using unreduced limb arithmetic via `Acc6U`.
-fn sparse_eval_u64_block<F: JoltField>(
+/// Uses aligned power-of-two block decomposition with `EqPolynomial::evals_for_max_aligned_block`.
+pub fn sparse_eval_field_block<F: JoltField>(
     start_index: usize,
-    values: &[u64],
+    values: &[F],
     r: &[F::Challenge],
 ) -> F {
     if values.is_empty() {
@@ -464,13 +524,9 @@ fn sparse_eval_u64_block<F: JoltField>(
             EqPolynomial::<F>::evals_for_max_aligned_block(r, idx, remaining);
         debug_assert_eq!(block_evals.len(), block_size);
 
-        // Accumulate this block in unreduced form, then reduce once.
-        let mut block_acc: Acc6U<F> = Acc6U::default();
         for j in 0..block_size {
-            // FMAdd implementation skips zeros internally.
-            block_acc.fmadd(&block_evals[j], &values[off + j]);
+            acc += block_evals[j] * values[off + j];
         }
-        acc += block_acc.barrett_reduce();
 
         idx += block_size;
         off += block_size;
@@ -488,28 +544,21 @@ fn sparse_eval_u64_block<F: JoltField>(
 /// This function computes:
 ///   \sum_k Val_init_public[k] * eq(r_address, k)
 /// but only over the (contiguous) regions that can be non-zero.
-pub fn eval_initial_ram_mle<F: JoltField>(
+pub fn eval_initial_ram_mle<F: JoltField + 'static>(
     ram_preprocessing: &RAMPreprocessing,
     program_io: &JoltDevice,
     r_address: &[F::Challenge],
 ) -> F {
-    // Bytecode region
-    let bytecode_start = remap_address(
-        ram_preprocessing.min_bytecode_address,
-        &program_io.memory_layout,
-    )
-    .unwrap() as usize;
-    let mut acc =
-        sparse_eval_u64_block::<F>(bytecode_start, &ram_preprocessing.bytecode_words, r_address);
-
-    // Inputs region (packed into u64 words in little-endian)
-    if !program_io.inputs.is_empty() {
-        let input_start = remap_address(
-            program_io.memory_layout.input_start,
-            &program_io.memory_layout,
-        )
-        .unwrap() as usize;
-        let input_words: Vec<u64> = program_io
+    // Source values: pending symbolic override OR convert concrete u64→F
+    let (bytecode_vals, input_vals) = if let Some(pending) = get_pending_initial_ram::<F>() {
+        (pending.bytecode_words, pending.input_words)
+    } else {
+        let bw: Vec<F> = ram_preprocessing
+            .bytecode_words
+            .iter()
+            .map(|&w| F::from_u64(w))
+            .collect();
+        let iw: Vec<F> = program_io
             .inputs
             .chunks(8)
             .map(|chunk| {
@@ -517,10 +566,28 @@ pub fn eval_initial_ram_mle<F: JoltField>(
                 for (i, byte) in chunk.iter().enumerate() {
                     word[i] = *byte;
                 }
-                u64::from_le_bytes(word)
+                F::from_u64(u64::from_le_bytes(word))
             })
             .collect();
-        acc += sparse_eval_u64_block::<F>(input_start, &input_words, r_address);
+        (bw, iw)
+    };
+
+    // Bytecode region
+    let bytecode_start = remap_address(
+        ram_preprocessing.min_bytecode_address,
+        &program_io.memory_layout,
+    )
+    .unwrap() as usize;
+    let mut acc = sparse_eval_field_block::<F>(bytecode_start, &bytecode_vals, r_address);
+
+    // Inputs region
+    if !input_vals.is_empty() {
+        let input_start = remap_address(
+            program_io.memory_layout.input_start,
+            &program_io.memory_layout,
+        )
+        .unwrap() as usize;
+        acc += sparse_eval_field_block::<F>(input_start, &input_vals, r_address);
     }
 
     acc
@@ -541,7 +608,40 @@ pub fn eval_initial_ram_mle<F: JoltField>(
 /// When `r_address` has more variables than the IO polynomial, we embed it into the larger
 /// domain by fixing the extra high-order variables to 0, which corresponds to multiplying
 /// by `∏(1 - r_hi[i])`.
-pub fn eval_io_mle<F: JoltField>(program_io: &JoltDevice, r_address: &[F::Challenge]) -> F {
+pub fn eval_io_mle<F: JoltField + 'static>(
+    program_io: &JoltDevice,
+    r_address: &[F::Challenge],
+) -> F {
+    // Source values: pending symbolic override OR convert concrete u64→F
+    let (input_vals, output_vals, panic_val) = if let Some(pending) = get_pending_io_mle::<F>() {
+        (pending.input_words, pending.output_words, pending.panic_val)
+    } else {
+        let iw: Vec<F> = program_io
+            .inputs
+            .chunks(8)
+            .map(|chunk| {
+                let mut word = [0u8; 8];
+                for (i, byte) in chunk.iter().enumerate() {
+                    word[i] = *byte;
+                }
+                F::from_u64(u64::from_le_bytes(word))
+            })
+            .collect();
+        let ow: Vec<F> = program_io
+            .outputs
+            .chunks(8)
+            .map(|chunk| {
+                let mut word = [0u8; 8];
+                for (i, byte) in chunk.iter().enumerate() {
+                    word[i] = *byte;
+                }
+                F::from_u64(u64::from_le_bytes(word))
+            })
+            .collect();
+        let pv = F::from_u64(program_io.panic as u64);
+        (iw, ow, pv)
+    };
+
     // IO region size in words (power of two).
     let range_end_words =
         remap_address(RAM_START_ADDRESS, &program_io.memory_layout).unwrap() as usize;
@@ -552,7 +652,7 @@ pub fn eval_io_mle<F: JoltField>(program_io: &JoltDevice, r_address: &[F::Challe
     let (r_hi, r_lo) = r_address.split_at(r_address.len() - num_io_vars);
     debug_assert_eq!(r_lo.len(), num_io_vars);
 
-    // Embed the IO polynomial into the full RAM domain (if any extra high vars exist).
+    // Embed the IO polynomial into the full RAM domain.
     let mut hi_scale = F::one();
     for r_i in r_hi.iter() {
         hi_scale *= F::one() - *r_i;
@@ -561,63 +661,40 @@ pub fn eval_io_mle<F: JoltField>(program_io: &JoltDevice, r_address: &[F::Challe
     let mut acc = F::zero();
 
     // Inputs region
-    if !program_io.inputs.is_empty() {
+    if !input_vals.is_empty() {
         let input_start = remap_address(
             program_io.memory_layout.input_start,
             &program_io.memory_layout,
         )
         .unwrap() as usize;
-        let input_words: Vec<u64> = program_io
-            .inputs
-            .chunks(8)
-            .map(|chunk| {
-                let mut word = [0u8; 8];
-                for (i, byte) in chunk.iter().enumerate() {
-                    word[i] = *byte;
-                }
-                u64::from_le_bytes(word)
-            })
-            .collect();
-        acc += sparse_eval_u64_block::<F>(input_start, &input_words, r_lo);
+        acc += sparse_eval_field_block::<F>(input_start, &input_vals, r_lo);
     }
 
     // Outputs region
-    if !program_io.outputs.is_empty() {
+    if !output_vals.is_empty() {
         let output_start = remap_address(
             program_io.memory_layout.output_start,
             &program_io.memory_layout,
         )
         .unwrap() as usize;
-        let output_words: Vec<u64> = program_io
-            .outputs
-            .chunks(8)
-            .map(|chunk| {
-                let mut word = [0u8; 8];
-                for (i, byte) in chunk.iter().enumerate() {
-                    word[i] = *byte;
-                }
-                u64::from_le_bytes(word)
-            })
-            .collect();
-        acc += sparse_eval_u64_block::<F>(output_start, &output_words, r_lo);
+        acc += sparse_eval_field_block::<F>(output_start, &output_vals, r_lo);
     }
 
-    // Panic bit (one word)
+    // Panic
     let panic_index =
         remap_address(program_io.memory_layout.panic, &program_io.memory_layout).unwrap() as usize;
-    let panic_word = [program_io.panic as u64];
-    acc += sparse_eval_u64_block::<F>(panic_index, &panic_word, r_lo);
+    acc += sparse_eval_field_block::<F>(panic_index, &[panic_val], r_lo);
 
-    // Termination bit (one word), only set when not panicking.
-    if !program_io.panic {
-        let termination_index = remap_address(
-            program_io.memory_layout.termination,
-            &program_io.memory_layout,
-        )
-        .unwrap() as usize;
-        let term_word = [1u64];
-        acc += sparse_eval_u64_block::<F>(termination_index, &term_word, r_lo);
-    }
+    // Termination: arithmetic select — (1 - panic_val) * eq(term, r)
+    //   panic_val=0 → eq(term, r)  (same as original when !panic)
+    //   panic_val=1 → 0            (same as original when panic)
+    let termination_index = remap_address(
+        program_io.memory_layout.termination,
+        &program_io.memory_layout,
+    )
+    .unwrap() as usize;
+    let term_eq = sparse_eval_field_block::<F>(termination_index, &[F::one()], r_lo);
+    acc += (F::one() - panic_val) * term_eq;
 
     hi_scale * acc
 }

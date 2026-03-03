@@ -63,11 +63,13 @@ use zklean_extractor::AstCommitment;
 /// - Concrete witness values as decimal strings (for JSON serialization to Go)
 /// - Field kind per variable (Fr for native, Fq for emulated arithmetic)
 pub struct VarAllocator {
-    next_idx: u16,
+    next_idx: u32,
     /// (index, name, target_field) tuples for each allocated variable.
-    descriptions: Vec<(u16, String, TargetField)>,
+    descriptions: Vec<(u32, String, TargetField)>,
     /// Witness values indexed by variable index, stored as decimal strings.
     witness_values: Vec<String>,
+    /// Concrete Fr values for evaluate_concrete (indexed by variable index).
+    concrete_fr: Vec<ark_bn254::Fr>,
 }
 
 impl VarAllocator {
@@ -76,6 +78,7 @@ impl VarAllocator {
             next_idx: 0,
             descriptions: Vec::new(),
             witness_values: Vec::new(),
+            concrete_fr: Vec::new(),
         }
     }
 
@@ -107,6 +110,7 @@ impl VarAllocator {
         self.descriptions
             .push((idx, description.to_string(), target_field));
         self.witness_values.push(format!("{}", value.into_bigint()));
+        self.concrete_fr.push(*value);
         self.next_idx += 1;
         MleAst::from_var(idx)
     }
@@ -135,20 +139,35 @@ impl VarAllocator {
             .collect()
     }
 
-    pub fn next_idx(&self) -> u16 {
+    pub fn next_idx(&self) -> u32 {
         self.next_idx
     }
 
     /// Get descriptions with target fields for AstBundle population.
-    pub fn descriptions_with_fields(&self) -> &[(u16, String, TargetField)] {
+    pub fn descriptions_with_fields(&self) -> &[(u32, String, TargetField)] {
         &self.descriptions
     }
 
     /// Get descriptions without field kinds (backward compatible iterator).
-    pub fn descriptions(&self) -> impl Iterator<Item = (u16, &str)> + '_ {
+    pub fn descriptions(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
         self.descriptions
             .iter()
             .map(|(idx, name, _)| (*idx, name.as_str()))
+    }
+
+    /// Get concrete Fr values for evaluate_concrete.
+    pub fn concrete_values(&self) -> &[ark_bn254::Fr] {
+        &self.concrete_fr
+    }
+
+    /// Update the witness value for a previously allocated variable.
+    ///
+    /// Used to fix up placeholder values after symbolic verification completes
+    /// (e.g., challenge-dependent fields in bytecode symbolization).
+    pub fn update_witness(&mut self, idx: u32, value: &ark_bn254::Fr) {
+        use ark_ff::PrimeField;
+        self.witness_values[idx as usize] = format!("{}", value.into_bigint());
+        self.concrete_fr[idx as usize] = *value;
     }
 
     /// Get witness values as a HashMap for JSON serialization.

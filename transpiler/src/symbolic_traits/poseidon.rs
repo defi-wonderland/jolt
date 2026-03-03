@@ -145,7 +145,28 @@ impl Transcript for PoseidonAstTranscript {
         self.hash_and_update(field);
     }
 
+    /// Override the default trait impl to avoid going through `raw_append_bytes`.
+    ///
+    /// The default impl calls `self.raw_append_bytes(&packed)` which would
+    /// incorrectly consume a `PENDING_BYTES_OVERRIDES` entry meant for actual data.
+    /// Instead, we directly hash the packed label+len constant.
+    fn raw_append_label_with_len(&mut self, label: &'static [u8], len: u64) {
+        let mut packed = [0u8; 32];
+        packed[..label.len()].copy_from_slice(label);
+        packed[24..32].copy_from_slice(&len.to_be_bytes());
+        let field = MleAst::from(bytes_to_scalar(&packed));
+        self.hash_and_update(field);
+    }
+
     fn raw_append_bytes(&mut self, bytes: &[u8]) {
+        // Check for symbolic override (universal circuit IO symbolization).
+        // When present, use the pre-allocated MleAst::Var elements instead of
+        // creating MleAst::Const from the concrete bytes.
+        if let Some(symbolic_elements) = super::io_replay::pop_bytes_override() {
+            self.append_field_elements(&symbolic_elements);
+            return;
+        }
+        // Concrete path: pack bytes into 32-byte chunks → BN254 scalars → constants.
         let elements: Vec<MleAst> = bytes
             .chunks(32)
             .map(|chunk| {
@@ -303,7 +324,7 @@ impl Default for PoseidonAstTranscript {
 }
 
 /// Convert 32 little-endian bytes to `[u64; 4]` limbs (no mod reduction).
-fn bytes_to_scalar(bytes: &[u8; 32]) -> [u64; 4] {
+pub fn bytes_to_scalar(bytes: &[u8; 32]) -> [u64; 4] {
     let mut limbs = [0u64; 4];
     for (i, chunk) in bytes.chunks(8).enumerate() {
         limbs[i] = u64::from_le_bytes(chunk.try_into().unwrap());

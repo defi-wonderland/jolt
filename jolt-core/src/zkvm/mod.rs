@@ -150,9 +150,22 @@ pub fn fiat_shamir_preamble(
     transcript.append_u64(b"max_input_size", program_io.memory_layout.max_input_size);
     transcript.append_u64(b"max_output_size", program_io.memory_layout.max_output_size);
     transcript.append_u64(b"heap_size", program_io.memory_layout.heap_size);
-    transcript.append_bytes(b"inputs", &program_io.inputs);
-    transcript.append_bytes(b"outputs", &program_io.outputs);
-    transcript.append_u64(b"panic", program_io.panic as u64);
+
+    // Pad inputs and outputs to max sizes for universal circuit compatibility.
+    // Zero-padding is sound: unused memory is zero-initialized in Jolt.
+    // Both prover and verifier must see the same padded bytes for Fiat-Shamir.
+    let mut padded_inputs = program_io.inputs.clone();
+    padded_inputs.resize(program_io.memory_layout.max_input_size as usize, 0);
+    let mut padded_outputs = program_io.outputs.clone();
+    padded_outputs.resize(program_io.memory_layout.max_output_size as usize, 0);
+
+    transcript.append_bytes(b"inputs", &padded_inputs);
+    transcript.append_bytes(b"outputs", &padded_outputs);
+    // Route panic through append_bytes (not append_u64) so that the symbolic
+    // transcript's raw_append_bytes can intercept it via PENDING_BYTES_OVERRIDES.
+    // Equivalence: raw_append_u64(x) hashes from_u64(x) = from_le_bytes([x_LE, 0..0])
+    // which equals bytes_to_scalar([x_LE, 0..0]) that raw_append_bytes produces.
+    transcript.append_bytes(b"panic", &(program_io.panic as u64).to_le_bytes());
     transcript.append_u64(b"ram_K", ram_K as u64);
     transcript.append_u64(b"trace_length", trace_length as u64);
 }

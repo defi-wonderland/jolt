@@ -74,7 +74,7 @@ const CSE_DEPTH_THRESHOLD: usize = 4;
 /// to decimal strings for Lean output.
 pub type Scalar = [u64; 4];
 
-type Index = u16;
+type Index = u32;
 
 pub type NodeId = usize;
 
@@ -464,7 +464,7 @@ impl MleAst {
     }
 
     /// Create a variable from an index (for symbolic execution).
-    pub fn from_var(index: u16) -> Self {
+    pub fn from_var(index: u32) -> Self {
         Self::new_var('v', index)
     }
 

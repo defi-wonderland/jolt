@@ -179,7 +179,7 @@ pub(crate) struct GnarkCodeGen<'a> {
     /// Next CSE variable index
     cse_counter: usize,
     /// Maps variable index to input name (e.g., 0 -> "UniSkipCoeff0")
-    var_names: &'a HashMap<u16, String>,
+    var_names: &'a HashMap<u32, String>,
     /// Constraint index for per-constraint CSE naming (e.g., constraint 3 uses cse_3_*)
     constraint_idx: usize,
     /// Whether poseidon was used in this constraint
@@ -198,7 +198,7 @@ impl<'a> GnarkCodeGen<'a> {
     /// They become `cse_{constraint_idx}_{i}` for element `i`.
     pub(crate) fn new(
         nodes: &'a [Node],
-        var_names: &'a HashMap<u16, String>,
+        var_names: &'a HashMap<u32, String>,
         constraint_idx: usize,
         cse_bindings: &[usize],
     ) -> Self {
@@ -532,7 +532,7 @@ pub fn generate_circuit_from_bundle_with_stats(
     let circuit_name = sanitize_go_name(circuit_name);
 
     // Build var_names mapping from bundle inputs
-    let var_names: HashMap<u16, String> = bundle
+    let var_names: HashMap<u32, String> = bundle
         .inputs
         .iter()
         .map(|input| (input.index, input.name.clone()))

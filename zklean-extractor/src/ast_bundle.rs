@@ -90,7 +90,7 @@ impl TargetField {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputVar {
     /// The index into the vars register (matches `Atom::Var(index)`).
-    pub index: u16,
+    pub index: u32,
     /// Human-readable name for debugging and codegen (e.g., "r_sumcheck_0", "claimed_output").
     pub name: String,
     /// Whether this is a public statement or proof data.
@@ -184,7 +184,7 @@ impl AstBundle {
     }
 
     /// Add an input variable description with default target field (Fr).
-    pub fn add_input(&mut self, index: u16, name: impl Into<String>, witness_type: WitnessType) {
+    pub fn add_input(&mut self, index: u32, name: impl Into<String>, witness_type: WitnessType) {
         self.add_input_with_field(index, name, witness_type, TargetField::default())
     }
 
@@ -199,7 +199,7 @@ impl AstBundle {
     /// * `target_field`: Which field this variable belongs to
     pub fn add_input_with_field(
         &mut self,
-        index: u16,
+        index: u32,
         name: impl Into<String>,
         witness_type: WitnessType,
         target_field: TargetField,
