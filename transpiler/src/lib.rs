@@ -87,6 +87,7 @@
 
 pub mod evaluate_concrete;
 pub mod gnark_codegen;
+pub mod symbolize;
 pub mod symbolic_proof;
 pub mod symbolic_traits;
 
