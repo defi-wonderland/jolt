@@ -205,6 +205,7 @@ impl Transcript for Blake2bTranscript {
         }
         q_powers
     }
+
 }
 
 #[cfg(test)]

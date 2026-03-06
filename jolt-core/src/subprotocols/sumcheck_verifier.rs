@@ -3,9 +3,9 @@ use crate::poly::opening_proof::{OpeningAccumulator, OpeningPoint, BIG_ENDIAN};
 use crate::subprotocols::blindfold::{InputClaimConstraint, OutputClaimConstraint};
 use crate::transcripts::Transcript;
 
-use crate::{field::JoltField, poly::opening_proof::VerifierOpeningAccumulator};
+use crate::field::JoltField;
 
-pub trait SumcheckInstanceVerifier<F: JoltField, T: Transcript> {
+pub trait SumcheckInstanceVerifier<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F>;
     /// Returns the maximum degree of the sumcheck polynomial.
     fn degree(&self) -> usize {
@@ -26,26 +26,20 @@ pub trait SumcheckInstanceVerifier<F: JoltField, T: Transcript> {
     }
 
     /// Returns the initial claim of this sumcheck instance.
-    fn input_claim(&self, accumulator: &VerifierOpeningAccumulator<F>) -> F {
+    fn input_claim(&self, accumulator: &A) -> F {
         self.get_params().input_claim(accumulator)
     }
 
     /// Expected final claim after binding to the provided instance-local r slice.
-    fn expected_output_claim(
-        &self,
-        accumulator: &VerifierOpeningAccumulator<F>,
-        sumcheck_challenges: &[F::Challenge],
-    ) -> F;
+    fn expected_output_claim(&self, accumulator: &A, sumcheck_challenges: &[F::Challenge]) -> F;
 
     /// Enqueue any openings needed after sumcheck completes.
     /// r is the instance-local slice; instance normalizes internally.
-    fn cache_openings(
-        &self,
-        accumulator: &mut VerifierOpeningAccumulator<F>,
-        sumcheck_challenges: &[F::Challenge],
-    );
+    fn cache_openings(&self, accumulator: &mut A, sumcheck_challenges: &[F::Challenge]);
 }
 
+/// Params shared between prover and verifier.
+/// Note: input_claim uses dyn OpeningAccumulator to work with both Prover and Verifier accumulators.
 pub trait SumcheckInstanceParams<F: JoltField> {
     fn degree(&self) -> usize;
 

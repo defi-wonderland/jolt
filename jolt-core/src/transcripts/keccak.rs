@@ -203,6 +203,7 @@ impl Transcript for KeccakTranscript {
         }
         q_powers
     }
+
 }
 
 #[cfg(test)]

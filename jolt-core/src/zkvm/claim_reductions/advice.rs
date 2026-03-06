@@ -40,8 +40,8 @@ use crate::poly::multilinear_polynomial::{BindingOrder, MultilinearPolynomial, P
 #[cfg(feature = "zk")]
 use crate::poly::opening_proof::OpeningId;
 use crate::poly::opening_proof::{
-    OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId,
-    VerifierOpeningAccumulator, BIG_ENDIAN, LITTLE_ENDIAN,
+    OpeningAccumulator, OpeningPoint, ProverOpeningAccumulator, SumcheckId, BIG_ENDIAN,
+    LITTLE_ENDIAN,
 };
 use crate::poly::unipoly::UniPoly;
 #[cfg(feature = "zk")]
@@ -581,7 +581,7 @@ impl<F: JoltField> AdviceClaimReductionVerifier<F> {
         kind: AdviceKind,
         memory_layout: &MemoryLayout,
         trace_len: usize,
-        accumulator: &VerifierOpeningAccumulator<F>,
+        accumulator: &dyn OpeningAccumulator<F>,
     ) -> Self {
         let params = AdviceClaimReductionParams::new(kind, memory_layout, trace_len, accumulator);
 
@@ -591,18 +591,14 @@ impl<F: JoltField> AdviceClaimReductionVerifier<F> {
     }
 }
 
-impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
+impl<F: JoltField, T: Transcript, A: OpeningAccumulator<F>> SumcheckInstanceVerifier<F, T, A>
     for AdviceClaimReductionVerifier<F>
 {
     fn get_params(&self) -> &dyn SumcheckInstanceParams<F> {
         unsafe { &*self.params.as_ptr() }
     }
 
-    fn expected_output_claim(
-        &self,
-        accumulator: &VerifierOpeningAccumulator<F>,
-        sumcheck_challenges: &[F::Challenge],
-    ) -> F {
+    fn expected_output_claim(&self, accumulator: &A, sumcheck_challenges: &[F::Challenge]) -> F {
         let params = self.params.borrow();
         match params.phase {
             ReductionPhase::CycleVariables => {
@@ -636,11 +632,7 @@ impl<F: JoltField, T: Transcript> SumcheckInstanceVerifier<F, T>
         }
     }
 
-    fn cache_openings(
-        &self,
-        accumulator: &mut VerifierOpeningAccumulator<F>,
-        sumcheck_challenges: &[F::Challenge],
-    ) {
+    fn cache_openings(&self, accumulator: &mut A, sumcheck_challenges: &[F::Challenge]) {
         let mut params = self.params.borrow_mut();
         if params.phase == ReductionPhase::CycleVariables {
             let opening_point = params.normalize_opening_point(sumcheck_challenges);
