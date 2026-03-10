@@ -47,8 +47,8 @@ use transpiler::{
     SelectedAstTranscript,
 };
 use zklean_extractor::mle_ast::{
-    enable_constraint_mode, take_constraints as take_assertions, AstBundle, MleAst, TargetField,
-    WitnessType,
+    enable_constraint_mode, take_constraints as take_assertions, take_g1_constraints, take_g1_ops,
+    AstBundle, MleAst, TargetField, WitnessType,
 };
 use zklean_extractor::AstCommitment;
 
@@ -158,6 +158,13 @@ fn main() {
         JoltVerifierPreprocessing {
             generators: transpiler::symbolic_traits::ast_commitment_scheme::AstVerifierSetup,
             shared: real_preprocessing.shared.clone(),
+            // Pass real Bn254G1 generators for BlindFold symbolic execution.
+            // pedersen_generators::<AstCurve>() converts each Bn254G1 → AstGroupElement
+            // via From<Bn254G1>, which also captures Grumpkin affine coordinates for witnesses.
+            #[cfg(feature = "zk")]
+            zk_generator_g1s: real_preprocessing.zk_generator_g1s.clone(),
+            #[cfg(feature = "zk")]
+            zk_generator_h1: real_preprocessing.zk_generator_h1,
         };
 
     // =========================================================================
@@ -292,6 +299,18 @@ fn main() {
     }
     println!("  Constraints: {}", bundle.constraints.len());
 
+    // Snapshot G1 operations and constraints (BlindFold curve arithmetic).
+    // Only populated in ZK mode when verify_blindfold() records curve ops.
+    bundle.g1_ops = take_g1_ops();
+    bundle.g1_constraints = take_g1_constraints();
+    if !bundle.g1_ops.is_empty() {
+        println!(
+            "  G1 operations: {}, G1 constraints: {}",
+            bundle.g1_ops.len(),
+            bundle.g1_constraints.len()
+        );
+    }
+
     // Run CSE (Common Subexpression Elimination) at the AST level.
     // This pre-computes which nodes should be hoisted to named variables,
     // making codegen simpler (just reads pre-computed decisions).
@@ -355,6 +374,72 @@ fn main() {
                 if let Some(value) = witness_values.get(&(*idx as usize)) {
                     witness_map.insert(sanitized, value.clone());
                 }
+            }
+
+            // G1 witness values: affine (X, Y) coordinates for Grumpkin points.
+            // Grumpkin base field = BN254 scalar field (Fr), so coordinates are native.
+            // Source 1: G1 points from proof symbolization (alloc_g1_var)
+            for (name, x_dec, y_dec) in var_alloc.g1_witness_coords() {
+                let go_name = gnark_codegen::sanitize_go_name(name);
+                witness_map.insert(format!("{go_name}_X"), x_dec.clone());
+                witness_map.insert(format!("{go_name}_Y"), y_dec.clone());
+            }
+            // Source 2: G1 points from runtime conversions (Pedersen generators)
+            // These are created by From<Bn254G1> during verify_blindfold's preprocessing access.
+            let runtime_g1_witnesses =
+                transpiler::symbolic_traits::ast_curve::take_g1_from_witnesses();
+            for (name, x_dec, y_dec) in &runtime_g1_witnesses {
+                let go_name = gnark_codegen::sanitize_go_name(name);
+                witness_map.insert(format!("{go_name}_X"), x_dec.clone());
+                witness_map.insert(format!("{go_name}_Y"), y_dec.clone());
+            }
+
+            // Source 3: Eval commitment generators from Dory setup.
+            // These are created by AstCommitmentScheme::eval_commitment_gens_verifier()
+            // as G1Op::Var("EvalCommitGen_G1_0") and G1Op::Var("EvalCommitGen_H1").
+            // Their concrete values come from the real Dory verifier setup.
+            #[cfg(feature = "zk")]
+            {
+                use ark_ff::PrimeField;
+                use ark_serialize::CanonicalSerialize;
+                use jolt_core::poly::commitment::commitment_scheme::ZkEvalCommitment;
+                use jolt_core::poly::commitment::dory::DoryCommitmentScheme;
+                use jolt_core::zkvm::PedersenCurve;
+
+                if let Some((g1_0, h1)) =
+                    <DoryCommitmentScheme as ZkEvalCommitment<PedersenCurve>>::eval_commitment_gens_verifier(
+                        &real_preprocessing.generators,
+                    )
+                {
+                    // Extract Grumpkin affine coordinates (BN254 Fr elements)
+                    let mut extract = |point: &<PedersenCurve as jolt_core::curve::JoltCurve>::G1, name: &str| {
+                        let mut bytes = Vec::new();
+                        point.serialize_uncompressed(&mut bytes).expect("serialize failed");
+                        let x = ark_bn254::Fr::from_le_bytes_mod_order(&bytes[..32]);
+                        let y = ark_bn254::Fr::from_le_bytes_mod_order(&bytes[32..64]);
+                        let go_name = gnark_codegen::sanitize_go_name(name);
+                        witness_map.insert(
+                            format!("{go_name}_X"),
+                            format!("{}", x.into_bigint()),
+                        );
+                        witness_map.insert(
+                            format!("{go_name}_Y"),
+                            format!("{}", y.into_bigint()),
+                        );
+                    };
+                    extract(&g1_0, "EvalCommitGen_G1_0");
+                    extract(&h1, "EvalCommitGen_H1");
+                }
+            }
+
+            let total_g1_points =
+                var_alloc.g1_witness_coords().len() + runtime_g1_witnesses.len();
+            if total_g1_points > 0 {
+                println!(
+                    "  G1 witness points: {} ({} coordinate values)",
+                    total_g1_points,
+                    total_g1_points * 2
+                );
             }
 
             let witness_json =

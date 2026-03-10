@@ -47,13 +47,17 @@ use ark_serialize::{
     CanonicalDeserialize, CanonicalSerialize, Read, SerializationError, Valid, Write,
 };
 use jolt_core::field::JoltField;
-use jolt_core::poly::commitment::commitment_scheme::CommitmentScheme;
+use jolt_core::poly::commitment::commitment_scheme::{CommitmentScheme, ZkEvalCommitment};
 use jolt_core::poly::multilinear_polynomial::MultilinearPolynomial;
 use jolt_core::transcripts::Transcript;
 use jolt_core::utils::errors::ProofVerifyError;
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use zklean_extractor::mle_ast::MleAst;
+use zklean_extractor::{alloc_g1_op, G1Op, G1OpId};
 use zklean_extractor::AstCommitment;
+
+use super::ast_curve::{AstCurve, AstGroupElement};
 
 // =============================================================================
 // Type Definitions
@@ -158,6 +162,49 @@ impl CommitmentScheme for AstCommitmentScheme {
 
     fn protocol_name() -> &'static [u8] {
         b"AstCommitmentScheme"
+    }
+}
+
+// =============================================================================
+// ZkEvalCommitment Implementation (ZK-only)
+// =============================================================================
+//
+// Used by verify_blindfold() to extract the evaluation commitment from the proof
+// and to get the Pedersen generators for eval commitments.
+
+thread_local! {
+    /// Stores the G1OpId of the eval commitment point (y_com) from the symbolic proof.
+    /// Set during proof symbolization, read during verify_blindfold().
+    static EVAL_COMMITMENT_OP_ID: RefCell<Option<G1OpId>> = RefCell::new(None);
+}
+
+/// Set the eval commitment G1 op ID (called during proof symbolization).
+pub fn set_eval_commitment_op_id(op_id: G1OpId) {
+    EVAL_COMMITMENT_OP_ID.with(|cell| *cell.borrow_mut() = Some(op_id));
+}
+
+impl ZkEvalCommitment<AstCurve> for AstCommitmentScheme {
+    fn eval_commitment(_proof: &Self::Proof) -> Option<AstGroupElement> {
+        EVAL_COMMITMENT_OP_ID.with(|cell| {
+            cell.borrow().map(AstGroupElement::from_g1_op)
+        })
+    }
+
+    fn eval_commitment_gens(_setup: &Self::ProverSetup) -> Option<(AstGroupElement, AstGroupElement)> {
+        panic!("eval_commitment_gens (prover) should not be called during symbolic verification")
+    }
+
+    fn eval_commitment_gens_verifier(
+        _setup: &Self::VerifierSetup,
+    ) -> Option<(AstGroupElement, AstGroupElement)> {
+        // Allocate symbolic G1 variables for the eval commitment generators.
+        // In the gnark circuit, these will be populated with the actual generator coordinates.
+        let g1_0_id = alloc_g1_op(G1Op::Var("EvalCommitGen_G1_0".to_string()));
+        let h1_id = alloc_g1_op(G1Op::Var("EvalCommitGen_H1".to_string()));
+        Some((
+            AstGroupElement::from_g1_op(g1_0_id),
+            AstGroupElement::from_g1_op(h1_id),
+        ))
     }
 }
 

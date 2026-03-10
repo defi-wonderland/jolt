@@ -2,8 +2,11 @@ use std::fs::File;
 
 use crate::zkvm::config::OneHotParams;
 use crate::zkvm::witness::CommittedPolynomial;
+#[cfg(feature = "zk")]
+use crate::curve::GrumpkinCurve;
+#[cfg(not(feature = "zk"))]
+use crate::curve::Bn254Curve;
 use crate::{
-    curve::Bn254Curve,
     field::JoltField,
     poly::opening_proof::ProverOpeningAccumulator,
     poly::opening_proof::{OpeningId, SumcheckId},
@@ -206,23 +209,31 @@ pub fn fiat_shamir_preamble(
     transcript.append_u64(b"trace_length", trace_length as u64);
 }
 
+/// Curve used for ZK Pedersen commitments.
+/// In ZK mode: GrumpkinCurve (native in BN254 Groth16 circuit via sw_grumpkin).
+/// In non-ZK mode: Bn254Curve (unused placeholder — no Pedersen fields in proof).
+#[cfg(feature = "zk")]
+pub type PedersenCurve = GrumpkinCurve;
+#[cfg(not(feature = "zk"))]
+pub type PedersenCurve = Bn254Curve;
+
 #[cfg(all(feature = "prover", feature = "transcript-poseidon"))]
 pub type RV64IMACProver<'a> =
-    JoltCpuProver<'a, Fr, Bn254Curve, DoryCommitmentScheme, PoseidonTranscript>;
+    JoltCpuProver<'a, Fr, PedersenCurve, DoryCommitmentScheme, PoseidonTranscript>;
 #[cfg(feature = "transcript-poseidon")]
 pub type RV64IMACVerifier<'a> =
-    JoltVerifier<'a, Fr, Bn254Curve, DoryCommitmentScheme, PoseidonTranscript>;
+    JoltVerifier<'a, Fr, PedersenCurve, DoryCommitmentScheme, PoseidonTranscript>;
 #[cfg(feature = "transcript-poseidon")]
-pub type RV64IMACProof = JoltProof<Fr, Bn254Curve, DoryCommitmentScheme, PoseidonTranscript>;
+pub type RV64IMACProof = JoltProof<Fr, PedersenCurve, DoryCommitmentScheme, PoseidonTranscript>;
 
 #[cfg(all(feature = "prover", feature = "transcript-keccak"))]
 pub type RV64IMACProver<'a> =
-    JoltCpuProver<'a, Fr, Bn254Curve, DoryCommitmentScheme, KeccakTranscript>;
+    JoltCpuProver<'a, Fr, PedersenCurve, DoryCommitmentScheme, KeccakTranscript>;
 #[cfg(feature = "transcript-keccak")]
 pub type RV64IMACVerifier<'a> =
-    JoltVerifier<'a, Fr, Bn254Curve, DoryCommitmentScheme, KeccakTranscript>;
+    JoltVerifier<'a, Fr, PedersenCurve, DoryCommitmentScheme, KeccakTranscript>;
 #[cfg(feature = "transcript-keccak")]
-pub type RV64IMACProof = JoltProof<Fr, Bn254Curve, DoryCommitmentScheme, KeccakTranscript>;
+pub type RV64IMACProof = JoltProof<Fr, PedersenCurve, DoryCommitmentScheme, KeccakTranscript>;
 
 #[cfg(all(
     feature = "prover",
@@ -233,29 +244,29 @@ pub type RV64IMACProof = JoltProof<Fr, Bn254Curve, DoryCommitmentScheme, KeccakT
     ))
 ))]
 pub type RV64IMACProver<'a> =
-    JoltCpuProver<'a, Fr, Bn254Curve, DoryCommitmentScheme, Blake2bTranscript>;
+    JoltCpuProver<'a, Fr, PedersenCurve, DoryCommitmentScheme, Blake2bTranscript>;
 #[cfg(not(any(
     feature = "transcript-poseidon",
     feature = "transcript-keccak",
     feature = "transcript-blake2b"
 )))]
 pub type RV64IMACVerifier<'a> =
-    JoltVerifier<'a, Fr, Bn254Curve, DoryCommitmentScheme, Blake2bTranscript>;
+    JoltVerifier<'a, Fr, PedersenCurve, DoryCommitmentScheme, Blake2bTranscript>;
 #[cfg(not(any(
     feature = "transcript-poseidon",
     feature = "transcript-keccak",
     feature = "transcript-blake2b"
 )))]
-pub type RV64IMACProof = JoltProof<Fr, Bn254Curve, DoryCommitmentScheme, Blake2bTranscript>;
+pub type RV64IMACProof = JoltProof<Fr, PedersenCurve, DoryCommitmentScheme, Blake2bTranscript>;
 
 #[cfg(all(feature = "prover", feature = "transcript-blake2b"))]
 pub type RV64IMACProver<'a> =
-    JoltCpuProver<'a, Fr, Bn254Curve, DoryCommitmentScheme, Blake2bTranscript>;
+    JoltCpuProver<'a, Fr, PedersenCurve, DoryCommitmentScheme, Blake2bTranscript>;
 #[cfg(feature = "transcript-blake2b")]
 pub type RV64IMACVerifier<'a> =
-    JoltVerifier<'a, Fr, Bn254Curve, DoryCommitmentScheme, Blake2bTranscript>;
+    JoltVerifier<'a, Fr, PedersenCurve, DoryCommitmentScheme, Blake2bTranscript>;
 #[cfg(feature = "transcript-blake2b")]
-pub type RV64IMACProof = JoltProof<Fr, Bn254Curve, DoryCommitmentScheme, Blake2bTranscript>;
+pub type RV64IMACProof = JoltProof<Fr, PedersenCurve, DoryCommitmentScheme, Blake2bTranscript>;
 
 pub trait Serializable: CanonicalSerialize + CanonicalDeserialize + Sized {
     /// Gets the byte size of the serialized data

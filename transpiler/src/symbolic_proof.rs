@@ -33,23 +33,30 @@
 //! This must match exactly how the Poseidon transcript hashes commitments.
 
 use crate::symbolic_traits::ast_commitment_scheme::{AstCommitmentScheme, AstProof};
-use crate::symbolic_traits::ast_curve::AstCurve;
+use crate::symbolic_traits::ast_curve::{AstCurve, AstGroupElement};
 use crate::symbolic_traits::opening_accumulator::AstOpeningAccumulator;
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
-use jolt_core::curve::{Bn254Curve, JoltCurve};
+use jolt_core::curve::JoltCurve;
+use jolt_core::zkvm::PedersenCurve;
+#[cfg(not(feature = "zk"))]
 use jolt_core::poly::opening_proof::OpeningPoint;
 use jolt_core::poly::unipoly::CompressedUniPoly;
-use jolt_core::subprotocols::sumcheck::SumcheckInstanceProof;
+#[cfg(feature = "zk")]
+use jolt_core::subprotocols::blindfold::{BlindFoldProof, RelaxedR1CSInstance};
+use jolt_core::subprotocols::sumcheck::{SumcheckInstanceProof, ZkSumcheckProof};
 use jolt_core::subprotocols::univariate_skip::{
-    UniSkipFirstRoundProof, UniSkipFirstRoundProofVariant,
+    UniSkipFirstRoundProof, UniSkipFirstRoundProofVariant, ZkUniSkipFirstRoundProof,
 };
 use jolt_core::transcripts::Transcript;
-use jolt_core::zkvm::proof_serialization::{Claims, JoltProof};
+#[cfg(not(feature = "zk"))]
+use jolt_core::zkvm::proof_serialization::Claims;
+use jolt_core::zkvm::proof_serialization::JoltProof;
 use jolt_core::zkvm::RV64IMACProof;
+#[cfg(not(feature = "zk"))]
 use std::collections::BTreeMap;
 use zklean_extractor::mle_ast::{MleAst, TargetField};
-use zklean_extractor::AstCommitment;
+use zklean_extractor::{store_g1_chunks, AstCommitment};
 
 /// Tracks variable index allocation and witness values during symbolization.
 ///
@@ -74,6 +81,9 @@ pub struct VarAllocator {
     descriptions: Vec<(u16, String, TargetField)>,
     /// Witness values indexed by variable index, stored as decimal strings.
     witness_values: Vec<String>,
+    /// G1 affine coordinate witness values: (go_name, x_decimal, y_decimal).
+    /// For Grumpkin points, X and Y are BN254 Fr elements (native in the circuit).
+    g1_witness_coords: Vec<(String, String, String)>,
 }
 
 impl VarAllocator {
@@ -82,6 +92,7 @@ impl VarAllocator {
             next_idx: 0,
             descriptions: Vec::new(),
             witness_values: Vec::new(),
+            g1_witness_coords: Vec::new(),
         }
     }
 
@@ -171,6 +182,14 @@ impl VarAllocator {
         self.descriptions.iter().any(|(_, _, tf)| *tf == field)
     }
 
+    /// Get G1 affine coordinate witness values for the witness JSON.
+    ///
+    /// Returns (go_name, x_decimal, y_decimal) for each G1 variable.
+    /// These correspond to `{Name}_X` and `{Name}_Y` struct fields in the gnark circuit.
+    pub fn g1_witness_coords(&self) -> &[(String, String, String)] {
+        &self.g1_witness_coords
+    }
+
     /// Allocate variables for a commitment's 12 chunks and record witness values (Fr field).
     ///
     /// Commitments are serialized as uncompressed LE bytes,
@@ -182,6 +201,77 @@ impl VarAllocator {
     ) -> Vec<MleAst> {
         let chunks = commitment_to_field_chunks(commitment);
         self.alloc_n_with_values(&chunks, prefix)
+    }
+
+    /// Allocate variables for a compressed G1 point and return an AstGroupElement.
+    ///
+    /// The point is serialized compressed (33 bytes for BN254 G1), split into
+    /// 32-byte chunks, converted to field elements, and stored in G1_CHUNK_STORE.
+    /// The returned AstGroupElement carries the store index so that
+    /// `serialize_compressed` → `set_pending_g1_chunks` tunnels the symbolic
+    /// chunks to `PoseidonAstTranscript::append_commitment`.
+    pub fn alloc_g1_compressed(
+        &mut self,
+        point: &impl CanonicalSerialize,
+        prefix: &str,
+    ) -> AstGroupElement {
+        let chunks = g1_compressed_to_field_chunks(point);
+        let symbolic_chunks = self.alloc_n_with_values(&chunks, prefix);
+        let idx = store_g1_chunks(symbolic_chunks);
+        AstGroupElement::new(idx)
+    }
+
+    /// Allocate a G1 point variable with both Fiat-Shamir chunks and G1 operation recording.
+    ///
+    /// This is the Phase 3 variant of `alloc_g1_compressed`. It creates:
+    /// 1. Symbolic MleAst chunks in G1_CHUNK_STORE (for Fiat-Shamir transcript tunneling)
+    /// 2. A G1Op::Var entry in G1_OP_ARENA (for curve operation recording)
+    /// 3. Affine (X, Y) coordinate witness values for the gnark circuit
+    ///
+    /// Use this for BlindFold proof G1 points that participate in both
+    /// transcript operations AND curve arithmetic.
+    pub fn alloc_g1_var(
+        &mut self,
+        point: &impl CanonicalSerialize,
+        prefix: &str,
+    ) -> AstGroupElement {
+        // Phase 2: Fiat-Shamir chunk allocation
+        let chunks = g1_compressed_to_field_chunks(point);
+        let symbolic_chunks = self.alloc_n_with_values(&chunks, prefix);
+        let chunk_store_idx = store_g1_chunks(symbolic_chunks);
+
+        // Phase 3: G1 operation variable allocation
+        let g1_op_id = zklean_extractor::alloc_g1_op(zklean_extractor::G1Op::Var(
+            prefix.to_string(),
+        ));
+
+        // Extract affine (X, Y) coordinates for G1 witness
+        let (x, y) = extract_g1_affine_coords(point);
+        self.g1_witness_coords
+            .push((prefix.to_string(), x, y));
+
+        AstGroupElement::new_full(chunk_store_idx, g1_op_id)
+    }
+
+    /// Allocate a G1 point variable with G1 operation recording only (no Fiat-Shamir chunks).
+    ///
+    /// Use this for BlindFold proof G1 points that participate in curve arithmetic
+    /// but are NOT appended to the transcript (e.g., intermediate commitments).
+    pub fn alloc_g1_var_no_transcript(
+        &mut self,
+        point: &impl CanonicalSerialize,
+        prefix: &str,
+    ) -> AstGroupElement {
+        let g1_op_id = zklean_extractor::alloc_g1_op(zklean_extractor::G1Op::Var(
+            prefix.to_string(),
+        ));
+
+        // Extract affine (X, Y) coordinates for G1 witness
+        let (x, y) = extract_g1_affine_coords(point);
+        self.g1_witness_coords
+            .push((prefix.to_string(), x, y));
+
+        AstGroupElement::from_g1_op(g1_op_id)
     }
 }
 
@@ -215,6 +305,53 @@ fn commitment_to_bytes<T: CanonicalSerialize>(commitment: &T) -> Vec<u8> {
 /// other PCS types produce different chunk counts based on their commitment size.
 fn commitment_to_field_chunks<T: CanonicalSerialize>(commitment: &T) -> Vec<ark_bn254::Fr> {
     let bytes = commitment_to_bytes(commitment);
+    let num_chunks = bytes.len().div_ceil(BYTES_PER_CHUNK);
+
+    (0..num_chunks)
+        .map(|i| {
+            let start = i * BYTES_PER_CHUNK;
+            let end = std::cmp::min(start + BYTES_PER_CHUNK, bytes.len());
+            ark_bn254::Fr::from_le_bytes_mod_order(&bytes[start..end])
+        })
+        .collect()
+}
+
+/// Extract affine (X, Y) coordinates from a serializable G1 point.
+///
+/// Uses `serialize_uncompressed` which gives: X (32 bytes LE) + Y (32 bytes LE) + flags.
+/// For Grumpkin points, both coordinates are BN254 Fr elements (the 2-cycle property),
+/// so they can be used directly as native circuit variables in gnark.
+///
+/// Returns (x_decimal, y_decimal) as decimal string representations.
+fn extract_g1_affine_coords(point: &impl CanonicalSerialize) -> (String, String) {
+    let mut bytes = Vec::new();
+    point
+        .serialize_uncompressed(&mut bytes)
+        .expect("G1 uncompressed serialization failed");
+
+    // arkworks uncompressed format: X (field_size bytes LE) + Y (field_size bytes LE) + flags
+    // For 256-bit fields: 32 + 32 + 1 = 65 bytes
+    assert!(
+        bytes.len() >= 64,
+        "G1 uncompressed serialization too short: {} bytes",
+        bytes.len()
+    );
+
+    let x = ark_bn254::Fr::from_le_bytes_mod_order(&bytes[..32]);
+    let y = ark_bn254::Fr::from_le_bytes_mod_order(&bytes[32..64]);
+
+    (format!("{}", x.into_bigint()), format!("{}", y.into_bigint()))
+}
+
+/// Serialize a G1 point compressed and convert to field element chunks.
+///
+/// BN254 G1 compressed = 33 bytes → 2 chunks (32 + 1 padded to 32).
+/// Uses `serialize_compressed` to match `append_commitment` in the transcript.
+fn g1_compressed_to_field_chunks(point: &impl CanonicalSerialize) -> Vec<ark_bn254::Fr> {
+    let mut bytes = Vec::new();
+    point
+        .serialize_compressed(&mut bytes)
+        .expect("G1 compressed serialization failed");
     let num_chunks = bytes.len().div_ceil(BYTES_PER_CHUNK);
 
     (0..num_chunks)
@@ -273,71 +410,76 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
         })
         .collect();
 
-    // === Symbolize opening claims (with witness values) ===
-    let mut symbolic_claims = BTreeMap::new();
-    for (key, (_point, claim)) in &real_proof.opening_claims.0 {
-        let symbolic_claim = alloc.alloc_with_value(&format!("claim_{key:?}"), claim);
-        symbolic_claims.insert(*key, (OpeningPoint::default(), symbolic_claim));
-    }
+    // === Symbolize opening claims (non-ZK only) ===
+    // In ZK mode, opening claims are verified by BlindFold, not pre-populated.
+    #[cfg(not(feature = "zk"))]
+    let symbolic_claims = {
+        let mut claims = BTreeMap::new();
+        for (key, (_point, claim)) in &real_proof.opening_claims.0 {
+            let symbolic_claim = alloc.alloc_with_value(&format!("claim_{key:?}"), claim);
+            claims.insert(*key, (OpeningPoint::default(), symbolic_claim));
+        }
+        claims
+    };
 
     // === Symbolize stage 1 uni-skip proof ===
-    let stage1_uni_skip = symbolize_uni_skip_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage1_uni_skip = symbolize_uni_skip_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage1_uni_skip_first_round_proof,
         &mut alloc,
         "stage1_uni_skip",
     );
 
     // === Symbolize stage 1 sumcheck proof ===
-    let stage1_sumcheck = symbolize_sumcheck_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage1_sumcheck = symbolize_sumcheck_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage1_sumcheck_proof,
         &mut alloc,
         "stage1_sumcheck",
     );
 
     // === Symbolize stage 2 uni-skip proof ===
-    let stage2_uni_skip = symbolize_uni_skip_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage2_uni_skip = symbolize_uni_skip_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage2_uni_skip_first_round_proof,
         &mut alloc,
         "stage2_uni_skip",
     );
 
     // === Symbolize stage 2 sumcheck proof ===
-    let stage2_sumcheck = symbolize_sumcheck_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage2_sumcheck = symbolize_sumcheck_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage2_sumcheck_proof,
         &mut alloc,
         "stage2_sumcheck",
     );
 
     // === Symbolize stage 3 sumcheck proof ===
-    let stage3_sumcheck = symbolize_sumcheck_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage3_sumcheck = symbolize_sumcheck_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage3_sumcheck_proof,
         &mut alloc,
         "stage3_sumcheck",
     );
 
     // === Symbolize stage 4 sumcheck proof ===
-    let stage4_sumcheck = symbolize_sumcheck_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage4_sumcheck = symbolize_sumcheck_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage4_sumcheck_proof,
         &mut alloc,
         "stage4_sumcheck",
     );
 
     // === Symbolize stage 5 sumcheck proof ===
-    let stage5_sumcheck = symbolize_sumcheck_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage5_sumcheck = symbolize_sumcheck_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage5_sumcheck_proof,
         &mut alloc,
         "stage5_sumcheck",
     );
 
     // === Symbolize stage 6 sumcheck proof ===
-    let stage6_sumcheck = symbolize_sumcheck_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage6_sumcheck = symbolize_sumcheck_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage6_sumcheck_proof,
         &mut alloc,
         "stage6_sumcheck",
     );
 
     // === Symbolize stage 7 sumcheck proof ===
-    let stage7_sumcheck = symbolize_sumcheck_variant::<Bn254Curve, _, OutputTranscript>(
+    let stage7_sumcheck = symbolize_sumcheck_variant::<PedersenCurve, _, OutputTranscript>(
         &real_proof.stage7_sumcheck_proof,
         &mut alloc,
         "stage7_sumcheck",
@@ -355,7 +497,10 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
 
     // Build the symbolic proof
     let symbolic_proof = JoltProof {
+        #[cfg(not(feature = "zk"))]
         opening_claims: Claims(symbolic_claims),
+        #[cfg(feature = "zk")]
+        blindfold_proof: symbolize_blindfold_proof(&real_proof.blindfold_proof, &mut alloc),
         commitments,
         stage1_uni_skip_first_round_proof: stage1_uni_skip,
         stage1_sumcheck_proof: stage1_sumcheck,
@@ -375,12 +520,38 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
         dory_layout: real_proof.dory_layout,
     };
 
-    // Build the opening accumulator with the symbolic claims we created
-    #[allow(non_snake_case)] // Match VerifierOpeningAccumulator naming
+    // In ZK mode, extract the eval commitment (y_com) from the real proof
+    // and register it as a symbolic G1 variable for BlindFold verification.
+    #[cfg(feature = "zk")]
+    {
+        use jolt_core::poly::commitment::commitment_scheme::ZkEvalCommitment;
+        use jolt_core::poly::commitment::dory::DoryCommitmentScheme;
+        if let Some(y_com) =
+            <DoryCommitmentScheme as ZkEvalCommitment<PedersenCurve>>::eval_commitment(
+                &real_proof.joint_opening_proof,
+            )
+        {
+            let ast_y_com = alloc.alloc_g1_var(&y_com, "eval_commitment");
+            crate::symbolic_traits::ast_commitment_scheme::set_eval_commitment_op_id(
+                ast_y_com.g1_op_id(),
+            );
+        }
+    }
+
+    // Build the opening accumulator
+    #[allow(non_snake_case)]
     let log_T = (real_proof.trace_length as f64).log2().ceil() as usize;
     let mut accumulator = AstOpeningAccumulator::new(log_T);
+
+    // In non-ZK mode, pre-populate with symbolic opening claims.
+    // In ZK mode, claims are verified by BlindFold — accumulator runs in zk_mode.
+    #[cfg(not(feature = "zk"))]
     for (key, (_, claim)) in &symbolic_proof.opening_claims.0 {
         accumulator.openings.insert(*key, (vec![], *claim));
+    }
+    #[cfg(feature = "zk")]
+    {
+        accumulator.zk_mode = true;
     }
 
     (symbolic_proof, accumulator, alloc)
@@ -408,8 +579,18 @@ fn symbolize_uni_skip_variant<C: JoltCurve, T: Transcript, OutT: Transcript>(
                 jolt_core::poly::unipoly::UniPoly::from_coeff(coeffs),
             ))
         }
-        UniSkipFirstRoundProofVariant::Zk(_) => {
-            panic!("ZK uni-skip proofs are not supported in symbolic transpilation")
+        UniSkipFirstRoundProofVariant::Zk(inner) => {
+            let commitment =
+                alloc.alloc_g1_var(&inner.commitment, &format!("{prefix}_commit"));
+            let output_claims_commitment = alloc.alloc_g1_var(
+                &inner.output_claims_commitment,
+                &format!("{prefix}_output_commit"),
+            );
+            UniSkipFirstRoundProofVariant::Zk(ZkUniSkipFirstRoundProof::new(
+                commitment,
+                inner.poly_degree,
+                output_claims_commitment,
+            ))
         }
     }
 }
@@ -441,9 +622,170 @@ fn symbolize_sumcheck_variant<C: JoltCurve, T: Transcript, OutT: Transcript>(
 
             SumcheckInstanceProof::new_standard(compressed_polys)
         }
-        SumcheckInstanceProof::Zk(_) => {
-            panic!("ZK sumcheck proofs are not supported in symbolic transpilation")
+        SumcheckInstanceProof::Zk(zk_proof) => {
+            let round_commitments: Vec<_> = zk_proof
+                .round_commitments
+                .iter()
+                .enumerate()
+                .map(|(round, g1)| {
+                    alloc.alloc_g1_var(g1, &format!("{prefix}_r{round}_commit"))
+                })
+                .collect();
+            let output_claims_commitment = alloc.alloc_g1_var(
+                &zk_proof.output_claims_commitment,
+                &format!("{prefix}_output_commit"),
+            );
+            SumcheckInstanceProof::Zk(ZkSumcheckProof::new(
+                round_commitments,
+                zk_proof.poly_degrees.clone(),
+                output_claims_commitment,
+            ))
         }
+    }
+}
+
+/// Symbolize a concrete BlindFoldProof into symbolic form.
+///
+/// Converts all G1 points to `AstGroupElement` (with G1 operation recording)
+/// and all field elements to symbolic `MleAst` variables.
+///
+/// This enables `BlindFoldVerifier::verify()` to run symbolically, recording
+/// all curve and field operations for gnark code generation.
+#[cfg(feature = "zk")]
+fn symbolize_blindfold_proof<C: jolt_core::curve::JoltCurve>(
+    real_proof: &BlindFoldProof<ark_bn254::Fr, C>,
+    alloc: &mut VarAllocator,
+) -> BlindFoldProof<MleAst, AstCurve>
+where
+    C::G1: CanonicalSerialize,
+{
+    use jolt_core::poly::commitment::hyrax::HyraxOpeningProof;
+
+    // Helper: symbolize a Vec<G1> with indexed names
+    let sym_g1_vec = |points: &[C::G1],
+                      prefix: &str,
+                      alloc: &mut VarAllocator|
+     -> Vec<AstGroupElement> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, g1)| alloc.alloc_g1_var(g1, &format!("{prefix}_{i}")))
+            .collect()
+    };
+
+    // === Symbolize random_instance (RelaxedR1CSInstance) ===
+    let random_instance = RelaxedR1CSInstance {
+        u: alloc.alloc_with_value("bf_random_u", &real_proof.random_instance.u),
+        round_commitments: sym_g1_vec(
+            &real_proof.random_instance.round_commitments,
+            "bf_random_round_commit",
+            alloc,
+        ),
+        noncoeff_row_commitments: sym_g1_vec(
+            &real_proof.random_instance.noncoeff_row_commitments,
+            "bf_random_noncoeff_row",
+            alloc,
+        ),
+        e_row_commitments: sym_g1_vec(
+            &real_proof.random_instance.e_row_commitments,
+            "bf_random_e_row",
+            alloc,
+        ),
+        eval_commitments: sym_g1_vec(
+            &real_proof.random_instance.eval_commitments,
+            "bf_random_eval_commit",
+            alloc,
+        ),
+    };
+
+    // === Symbolize G1 commitment vectors ===
+    let noncoeff_row_commitments = sym_g1_vec(
+        &real_proof.noncoeff_row_commitments,
+        "bf_noncoeff_row",
+        alloc,
+    );
+    let cross_term_row_commitments = sym_g1_vec(
+        &real_proof.cross_term_row_commitments,
+        "bf_cross_term_row",
+        alloc,
+    );
+
+    // === Symbolize Spartan outer sumcheck (CompressedUniPoly coefficients) ===
+    let spartan_proof: Vec<CompressedUniPoly<MleAst>> = real_proof
+        .spartan_proof
+        .iter()
+        .enumerate()
+        .map(|(round, poly)| CompressedUniPoly {
+            coeffs_except_linear_term: alloc.alloc_n_with_values(
+                &poly.coeffs_except_linear_term,
+                &format!("bf_spartan_r{round}"),
+            ),
+        })
+        .collect();
+
+    // === Symbolize field scalars ===
+    let az_r = alloc.alloc_with_value("bf_az_r", &real_proof.az_r);
+    let bz_r = alloc.alloc_with_value("bf_bz_r", &real_proof.bz_r);
+    let cz_r = alloc.alloc_with_value("bf_cz_r", &real_proof.cz_r);
+
+    // === Symbolize inner sumcheck proof ===
+    let inner_sumcheck_proof: Vec<CompressedUniPoly<MleAst>> = real_proof
+        .inner_sumcheck_proof
+        .iter()
+        .enumerate()
+        .map(|(round, poly)| CompressedUniPoly {
+            coeffs_except_linear_term: alloc.alloc_n_with_values(
+                &poly.coeffs_except_linear_term,
+                &format!("bf_inner_r{round}"),
+            ),
+        })
+        .collect();
+
+    // === Symbolize Hyrax opening proofs ===
+    let w_opening = HyraxOpeningProof {
+        combined_row: alloc.alloc_n_with_values(
+            &real_proof.w_opening.combined_row,
+            "bf_w_opening_row",
+        ),
+        combined_blinding: alloc.alloc_with_value(
+            "bf_w_opening_blinding",
+            &real_proof.w_opening.combined_blinding,
+        ),
+    };
+    let e_opening = HyraxOpeningProof {
+        combined_row: alloc.alloc_n_with_values(
+            &real_proof.e_opening.combined_row,
+            "bf_e_opening_row",
+        ),
+        combined_blinding: alloc.alloc_with_value(
+            "bf_e_opening_blinding",
+            &real_proof.e_opening.combined_blinding,
+        ),
+    };
+
+    // === Symbolize folded eval outputs and blindings ===
+    let folded_eval_outputs = alloc.alloc_n_with_values(
+        &real_proof.folded_eval_outputs,
+        "bf_folded_eval_out",
+    );
+    let folded_eval_blindings = alloc.alloc_n_with_values(
+        &real_proof.folded_eval_blindings,
+        "bf_folded_eval_blind",
+    );
+
+    BlindFoldProof {
+        random_instance,
+        noncoeff_row_commitments,
+        cross_term_row_commitments,
+        spartan_proof,
+        az_r,
+        bz_r,
+        cz_r,
+        inner_sumcheck_proof,
+        w_opening,
+        e_opening,
+        folded_eval_outputs,
+        folded_eval_blindings,
     }
 }
 

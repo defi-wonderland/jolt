@@ -40,15 +40,26 @@
 //! - Stage 7: AddressVariables phase (bind address-derived coordinates)
 
 use crate::curve::JoltCurve;
-use crate::poly::commitment::commitment_scheme::CommitmentScheme;
+use crate::poly::commitment::commitment_scheme::{CommitmentScheme, ZkEvalCommitment};
 #[cfg(not(feature = "zk"))]
 use crate::poly::opening_proof::{OpeningPoint, BIG_ENDIAN};
-use crate::subprotocols::sumcheck::{BatchedSumcheck, ClearSumcheckProof, SumcheckInstanceProof};
+#[cfg(feature = "zk")]
+use crate::poly::lagrange_poly::LagrangeHelper;
+use crate::subprotocols::sumcheck::BatchedSumcheck;
+#[cfg(feature = "zk")]
+use crate::subprotocols::sumcheck::SumcheckInstanceProof;
+#[cfg(feature = "zk")]
+use crate::subprotocols::univariate_skip::UniSkipFirstRoundProofVariant;
 use crate::zkvm::claim_reductions::{
     AdviceClaimReductionVerifier, AdviceKind, HammingWeightClaimReductionVerifier, ReductionPhase,
     RegistersClaimReductionSumcheckVerifier,
 };
 use crate::zkvm::config::OneHotParams;
+#[cfg(feature = "zk")]
+use crate::zkvm::r1cs::constraints::{
+    OUTER_FIRST_ROUND_POLY_NUM_COEFFS, OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
+    PRODUCT_VIRTUAL_FIRST_ROUND_POLY_NUM_COEFFS, PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE,
+};
 use crate::zkvm::{
     bytecode::read_raf_checking::BytecodeReadRafSumcheckVerifier,
     claim_reductions::{
@@ -81,6 +92,8 @@ use crate::zkvm::{
     verifier::JoltVerifierPreprocessing,
     ProverDebugInfo,
 };
+#[cfg(feature = "zk")]
+use crate::zkvm::stage8_opening_ids;
 use crate::{
     field::JoltField,
     poly::opening_proof::{OpeningAccumulator, VerifierOpeningAccumulator},
@@ -92,19 +105,172 @@ use crate::{
     transcripts::Transcript,
     utils::{errors::ProofVerifyError, math::Math},
 };
+#[cfg(feature = "zk")]
+use crate::poly::opening_proof::{compute_advice_lagrange_factor, OpeningId, SumcheckId};
+#[cfg(feature = "zk")]
+use crate::zkvm::witness::CommittedPolynomial;
+#[cfg(feature = "zk")]
+use crate::poly::eq_poly::EqPolynomial;
+#[cfg(feature = "zk")]
+use crate::subprotocols::sumcheck_verifier::SumcheckInstanceParams;
+#[cfg(feature = "zk")]
+use crate::subprotocols::blindfold::{
+    pedersen_generator_count_for_r1cs, BakedPublicInputs, BlindFoldVerifier,
+    BlindFoldVerifierInput, ClaimBindingConfig, InputClaimConstraint, OutputClaimConstraint,
+    StageConfig, ValueSource, VerifierR1CSBuilder,
+};
 use tracer::JoltDevice;
 
-/// Extract the Clear (non-ZK) proof from a SumcheckInstanceProof enum.
-/// TranspilableVerifier only handles non-ZK proofs; ZK mode uses the main verifier.
-fn extract_clear_proof<F: JoltField, C: JoltCurve, T: Transcript>(
-    proof: &SumcheckInstanceProof<F, C, T>,
-) -> &ClearSumcheckProof<F, T> {
-    match proof {
-        SumcheckInstanceProof::Clear(p) => p,
-        SumcheckInstanceProof::Zk(_) => {
-            panic!("TranspilableVerifier only supports non-ZK (Clear) proofs")
+// =============================================================================
+// StageVerifyResult — collects ZK constraint data from each batched sumcheck
+// =============================================================================
+
+#[cfg(feature = "zk")]
+struct StageVerifyResult<F: JoltField> {
+    challenges: Vec<F::Challenge>,
+    batched_output_constraint: Option<OutputClaimConstraint>,
+    output_constraint_challenge_values: Vec<F>,
+    batched_input_constraint: InputClaimConstraint,
+    input_constraint_challenge_values: Vec<F>,
+    uniskip_input_constraint: Option<InputClaimConstraint>,
+    uniskip_input_constraint_challenge_values: Vec<F>,
+}
+
+#[cfg(not(feature = "zk"))]
+struct StageVerifyResult<F: JoltField> {
+    #[allow(dead_code)]
+    challenges: Vec<F::Challenge>,
+}
+
+#[cfg(feature = "zk")]
+impl<F: JoltField> StageVerifyResult<F> {
+    fn new(
+        challenges: Vec<F::Challenge>,
+        batched_output_constraint: Option<OutputClaimConstraint>,
+        output_constraint_challenge_values: Vec<F>,
+        batched_input_constraint: InputClaimConstraint,
+        input_constraint_challenge_values: Vec<F>,
+    ) -> Self {
+        Self {
+            challenges,
+            batched_output_constraint,
+            output_constraint_challenge_values,
+            batched_input_constraint,
+            input_constraint_challenge_values,
+            uniskip_input_constraint: None,
+            uniskip_input_constraint_challenge_values: Vec::new(),
         }
     }
+
+    fn with_uniskip(
+        challenges: Vec<F::Challenge>,
+        batched_output_constraint: Option<OutputClaimConstraint>,
+        output_constraint_challenge_values: Vec<F>,
+        batched_input_constraint: InputClaimConstraint,
+        input_constraint_challenge_values: Vec<F>,
+        uniskip_input_constraint: InputClaimConstraint,
+        uniskip_input_constraint_challenge_values: Vec<F>,
+    ) -> Self {
+        Self {
+            challenges,
+            batched_output_constraint,
+            output_constraint_challenge_values,
+            batched_input_constraint,
+            input_constraint_challenge_values,
+            uniskip_input_constraint: Some(uniskip_input_constraint),
+            uniskip_input_constraint_challenge_values,
+        }
+    }
+}
+
+#[cfg(feature = "zk")]
+struct Stage8VerifyData<F: JoltField> {
+    opening_ids: Vec<OpeningId>,
+    constraint_coeffs: Vec<F>,
+}
+
+// =============================================================================
+// ZK constraint extraction helpers
+// =============================================================================
+
+#[cfg(feature = "zk")]
+fn batch_output_constraints<F: JoltField, T: Transcript, A: OpeningAccumulator<F>>(
+    instances: &[&dyn SumcheckInstanceVerifier<F, T, A>],
+) -> Option<OutputClaimConstraint> {
+    let constraints: Vec<Option<OutputClaimConstraint>> = instances
+        .iter()
+        .map(|instance| instance.get_params().output_claim_constraint())
+        .collect();
+    OutputClaimConstraint::batch(&constraints)
+}
+
+#[cfg(feature = "zk")]
+fn batch_input_constraints<F: JoltField, T: Transcript, A: OpeningAccumulator<F>>(
+    instances: &[&dyn SumcheckInstanceVerifier<F, T, A>],
+) -> InputClaimConstraint {
+    let constraints: Vec<InputClaimConstraint> = instances
+        .iter()
+        .map(|instance| instance.get_params().input_claim_constraint())
+        .collect();
+    InputClaimConstraint::batch_required(&constraints, instances.len())
+}
+
+#[cfg(feature = "zk")]
+fn scale_batching_coefficients<F: JoltField, T: Transcript, A: OpeningAccumulator<F>>(
+    batching_coefficients: &[F],
+    instances: &[&dyn SumcheckInstanceVerifier<F, T, A>],
+) -> Vec<F> {
+    let max_num_rounds = instances.iter().map(|i| i.num_rounds()).max().unwrap_or(0);
+    batching_coefficients
+        .iter()
+        .zip(instances.iter())
+        .map(|(coeff, instance)| {
+            let scale = max_num_rounds - instance.num_rounds();
+            coeff.mul_pow_2(scale)
+        })
+        .collect()
+}
+
+/// Extract ZK constraint data from instances after a batched sumcheck.
+#[cfg(feature = "zk")]
+fn extract_stage_constraints<F: JoltField, T: Transcript, A: OpeningAccumulator<F>>(
+    batching_coefficients: &[F],
+    challenges: &[F::Challenge],
+    instances: &[&dyn SumcheckInstanceVerifier<F, T, A>],
+    accumulator: &A,
+) -> (
+    Option<OutputClaimConstraint>,
+    Vec<F>,
+    InputClaimConstraint,
+    Vec<F>,
+) {
+    let batched_output_constraint = batch_output_constraints(instances);
+    let batched_input_constraint = batch_input_constraints(instances);
+    let max_num_rounds = instances.iter().map(|i| i.num_rounds()).max().unwrap();
+    let mut output_constraint_challenge_values: Vec<F> = batching_coefficients.to_vec();
+    let mut input_constraint_challenge_values: Vec<F> =
+        scale_batching_coefficients(batching_coefficients, instances);
+    for instance in instances {
+        let num_rounds = instance.num_rounds();
+        let offset = instance.round_offset(max_num_rounds);
+        let r_slice = &challenges[offset..offset + num_rounds];
+        output_constraint_challenge_values.extend(
+            instance
+                .get_params()
+                .output_constraint_challenge_values(r_slice),
+        );
+        input_constraint_challenge_values.extend(
+            instance
+                .get_params()
+                .input_constraint_challenge_values(accumulator),
+        );
+    }
+    (
+        batched_output_constraint,
+        output_constraint_challenge_values,
+        batched_input_constraint,
+        input_constraint_challenge_values,
+    )
 }
 
 /// Generic verifier that can be used for both real verification and symbolic transpilation.
@@ -140,10 +306,12 @@ impl<
         'a,
         F: JoltField,
         C: JoltCurve,
-        PCS: CommitmentScheme<Field = F>,
+        PCS: CommitmentScheme<Field = F> + ZkEvalCommitment<C>,
         ProofTranscript: Transcript,
         A: OpeningAccumulator<F>,
     > TranspilableVerifier<'a, F, C, PCS, ProofTranscript, A>
+where
+    C::G1: From<crate::curve::Bn254G1>,
 {
     /// Create a TranspilableVerifier for real verification.
     ///
@@ -279,7 +447,7 @@ impl<
         }
     }
 
-    /// Verify the Jolt proof (stages 1-7).
+    /// Verify the Jolt proof (stages 1-7, plus BlindFold in ZK mode).
     ///
     /// Note: Stage 8 (PCS verification) is not included because it uses
     /// VerifierOpeningAccumulator-specific methods. For Gnark transpilation,
@@ -311,27 +479,127 @@ impl<
                 .append_serializable(b"trusted_advice", trusted_advice_commitment);
         }
 
-        self.verify_stage1()
+        let (stage1_result, uniskip_challenge1) = self
+            .verify_stage1()
             .inspect_err(|e| tracing::error!("Stage 1: {e}"))?;
-        self.verify_stage2()
+        let (stage2_result, uniskip_challenge2) = self
+            .verify_stage2()
             .inspect_err(|e| tracing::error!("Stage 2: {e}"))?;
-        self.verify_stage3()
+        let stage3_result = self
+            .verify_stage3()
             .inspect_err(|e| tracing::error!("Stage 3: {e}"))?;
-        self.verify_stage4()
+        let stage4_result = self
+            .verify_stage4()
             .inspect_err(|e| tracing::error!("Stage 4: {e}"))?;
-        self.verify_stage5()
+        let stage5_result = self
+            .verify_stage5()
             .inspect_err(|e| tracing::error!("Stage 5: {e}"))?;
-        self.verify_stage6()
+        let stage6_result = self
+            .verify_stage6()
             .inspect_err(|e| tracing::error!("Stage 6: {e}"))?;
-        self.verify_stage7()
+        let stage7_result = self
+            .verify_stage7()
             .inspect_err(|e| tracing::error!("Stage 7: {e}"))?;
-        // Stage 8 (PCS) is not being transpiled in this version.
+        // Stage 8 (PCS) is not transpiled — handled by native Gnark.
+
+        // Suppress unused variable warnings in non-ZK mode
+        #[cfg(not(feature = "zk"))]
+        {
+            let _ = (
+                stage1_result,
+                stage2_result,
+                stage3_result,
+                stage4_result,
+                stage5_result,
+                stage6_result,
+                stage7_result,
+                uniskip_challenge1,
+                uniskip_challenge2,
+            );
+        }
+
+        #[cfg(feature = "zk")]
+        {
+            let stage8_data = self.compute_stage8_blindfold_data()?;
+
+            let sumcheck_challenges = [
+                stage1_result.challenges.clone(),
+                stage2_result.challenges.clone(),
+                stage3_result.challenges.clone(),
+                stage4_result.challenges.clone(),
+                stage5_result.challenges.clone(),
+                stage6_result.challenges.clone(),
+                stage7_result.challenges.clone(),
+            ];
+            let uniskip_challenges = [uniskip_challenge1, uniskip_challenge2];
+
+            let stage_output_constraints = [
+                stage1_result.batched_output_constraint,
+                stage2_result.batched_output_constraint,
+                stage3_result.batched_output_constraint,
+                stage4_result.batched_output_constraint,
+                stage5_result.batched_output_constraint,
+                stage6_result.batched_output_constraint,
+                stage7_result.batched_output_constraint,
+            ];
+
+            let stage_input_constraints = [
+                stage1_result.uniskip_input_constraint.clone().unwrap(),
+                stage2_result.uniskip_input_constraint.clone().unwrap(),
+                stage3_result.batched_input_constraint.clone(),
+                stage4_result.batched_input_constraint.clone(),
+                stage5_result.batched_input_constraint.clone(),
+                stage6_result.batched_input_constraint.clone(),
+                stage7_result.batched_input_constraint.clone(),
+            ];
+
+            let stage_input_constraint_values = [
+                stage1_result
+                    .uniskip_input_constraint_challenge_values
+                    .clone(),
+                stage2_result
+                    .uniskip_input_constraint_challenge_values
+                    .clone(),
+                stage3_result.input_constraint_challenge_values.clone(),
+                stage4_result.input_constraint_challenge_values.clone(),
+                stage5_result.input_constraint_challenge_values.clone(),
+                stage6_result.input_constraint_challenge_values.clone(),
+                stage7_result.input_constraint_challenge_values.clone(),
+            ];
+
+            let output_constraint_challenge_values: [Vec<F>; 7] = [
+                stage1_result.output_constraint_challenge_values.clone(),
+                stage2_result.output_constraint_challenge_values.clone(),
+                stage3_result.output_constraint_challenge_values.clone(),
+                stage4_result.output_constraint_challenge_values.clone(),
+                stage5_result.output_constraint_challenge_values.clone(),
+                stage6_result.output_constraint_challenge_values.clone(),
+                stage7_result.output_constraint_challenge_values.clone(),
+            ];
+
+            self.verify_blindfold(
+                &sumcheck_challenges,
+                uniskip_challenges,
+                &stage_output_constraints,
+                &output_constraint_challenge_values,
+                &stage_input_constraints,
+                &stage_input_constraint_values,
+                &stage1_result.batched_input_constraint,
+                &stage2_result.batched_input_constraint,
+                &stage1_result.input_constraint_challenge_values,
+                &stage2_result.input_constraint_challenge_values,
+                &stage8_data,
+            )?;
+        }
 
         Ok(())
     }
 
-    fn verify_stage1(&mut self) -> Result<(), ProofVerifyError> {
-        let (uni_skip_params, _uni_skip_challenge) =
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn verify_stage1(
+        &mut self,
+    ) -> Result<(StageVerifyResult<F>, F::Challenge), ProofVerifyError> {
+        let (uni_skip_params, uni_skip_challenge) =
             verify_stage1_uni_skip::<F, C, ProofTranscript, A>(
                 &self.proof.stage1_uni_skip_first_round_proof,
                 &self.spartan_key,
@@ -349,18 +617,58 @@ impl<
         let instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, A>> =
             vec![&spartan_outer_remaining];
 
-        let _r_stage1 = BatchedSumcheck::verify_standard::<F, ProofTranscript, A>(
-            extract_clear_proof(&self.proof.stage1_sumcheck_proof),
-            instances,
-            &mut self.opening_accumulator,
-            &mut self.transcript,
-        )?;
+        let (batching_coefficients, r_stage1) =
+            BatchedSumcheck::verify::<F, C, ProofTranscript, A>(
+                &self.proof.stage1_sumcheck_proof,
+                instances.clone(),
+                &mut self.opening_accumulator,
+                &mut self.transcript,
+            )?;
 
-        Ok(())
+        #[cfg(feature = "zk")]
+        {
+            let (
+                batched_output_constraint,
+                output_constraint_challenge_values,
+                batched_input_constraint,
+                input_constraint_challenge_values,
+            ) = extract_stage_constraints(
+                &batching_coefficients,
+                &r_stage1,
+                &instances,
+                &self.opening_accumulator,
+            );
+
+            let uniskip_input_constraint = uni_skip_params.input_claim_constraint();
+            let uniskip_input_constraint_challenge_values =
+                uni_skip_params.input_constraint_challenge_values(&self.opening_accumulator);
+
+            let stage_result = StageVerifyResult::with_uniskip(
+                r_stage1,
+                batched_output_constraint,
+                output_constraint_challenge_values,
+                batched_input_constraint,
+                input_constraint_challenge_values,
+                uniskip_input_constraint,
+                uniskip_input_constraint_challenge_values,
+            );
+
+            Ok((stage_result, uni_skip_challenge))
+        }
+        #[cfg(not(feature = "zk"))]
+        Ok((
+            StageVerifyResult {
+                challenges: r_stage1,
+            },
+            uni_skip_challenge,
+        ))
     }
 
-    fn verify_stage2(&mut self) -> Result<(), ProofVerifyError> {
-        let (uni_skip_params, _uni_skip_challenge) =
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn verify_stage2(
+        &mut self,
+    ) -> Result<(StageVerifyResult<F>, F::Challenge), ProofVerifyError> {
+        let (uni_skip_params, uni_skip_challenge) =
             verify_stage2_uni_skip::<F, C, ProofTranscript, A>(
                 &self.proof.stage2_uni_skip_first_round_proof,
                 &mut self.opening_accumulator,
@@ -377,7 +685,7 @@ impl<
 
         let spartan_product_virtual_remainder = ProductVirtualRemainderVerifier::new(
             self.proof.trace_length,
-            uni_skip_params,
+            uni_skip_params.clone(),
             &self.opening_accumulator,
         );
 
@@ -411,17 +719,55 @@ impl<
             &ram_output_check,
         ];
 
-        let _r_stage2 = BatchedSumcheck::verify_standard::<F, ProofTranscript, A>(
-            extract_clear_proof(&self.proof.stage2_sumcheck_proof),
-            instances,
-            &mut self.opening_accumulator,
-            &mut self.transcript,
-        )?;
+        let (batching_coefficients, r_stage2) =
+            BatchedSumcheck::verify::<F, C, ProofTranscript, A>(
+                &self.proof.stage2_sumcheck_proof,
+                instances.clone(),
+                &mut self.opening_accumulator,
+                &mut self.transcript,
+            )?;
 
-        Ok(())
+        #[cfg(feature = "zk")]
+        {
+            let (
+                batched_output_constraint,
+                output_constraint_challenge_values,
+                batched_input_constraint,
+                input_constraint_challenge_values,
+            ) = extract_stage_constraints(
+                &batching_coefficients,
+                &r_stage2,
+                &instances,
+                &self.opening_accumulator,
+            );
+
+            let uniskip_input_constraint = uni_skip_params.input_claim_constraint();
+            let uniskip_input_constraint_challenge_values =
+                uni_skip_params.input_constraint_challenge_values(&self.opening_accumulator);
+
+            let stage_result = StageVerifyResult::with_uniskip(
+                r_stage2,
+                batched_output_constraint,
+                output_constraint_challenge_values,
+                batched_input_constraint,
+                input_constraint_challenge_values,
+                uniskip_input_constraint,
+                uniskip_input_constraint_challenge_values,
+            );
+
+            Ok((stage_result, uni_skip_challenge))
+        }
+        #[cfg(not(feature = "zk"))]
+        Ok((
+            StageVerifyResult {
+                challenges: r_stage2,
+            },
+            uni_skip_challenge,
+        ))
     }
 
-    fn verify_stage3(&mut self) -> Result<(), ProofVerifyError> {
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn verify_stage3(&mut self) -> Result<StageVerifyResult<F>, ProofVerifyError> {
         let spartan_shift = ShiftSumcheckVerifier::new(
             self.proof.trace_length.log_2(),
             &self.opening_accumulator,
@@ -441,17 +787,27 @@ impl<
             &spartan_registers_claim_reduction,
         ];
 
-        let _r_stage3 = BatchedSumcheck::verify_standard::<F, ProofTranscript, A>(
-            extract_clear_proof(&self.proof.stage3_sumcheck_proof),
-            instances,
-            &mut self.opening_accumulator,
-            &mut self.transcript,
-        )?;
+        let (batching_coefficients, r_stage3) =
+            BatchedSumcheck::verify::<F, C, ProofTranscript, A>(
+                &self.proof.stage3_sumcheck_proof,
+                instances.clone(),
+                &mut self.opening_accumulator,
+                &mut self.transcript,
+            )?;
 
-        Ok(())
+        #[cfg(feature = "zk")]
+        {
+            let (out_c, out_v, in_c, in_v) = extract_stage_constraints(
+                &batching_coefficients, &r_stage3, &instances, &self.opening_accumulator,
+            );
+            Ok(StageVerifyResult::new(r_stage3, out_c, out_v, in_c, in_v))
+        }
+        #[cfg(not(feature = "zk"))]
+        Ok(StageVerifyResult { challenges: r_stage3 })
     }
 
-    fn verify_stage4(&mut self) -> Result<(), ProofVerifyError> {
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn verify_stage4(&mut self) -> Result<StageVerifyResult<F>, ProofVerifyError> {
         let registers_read_write_checking = RegistersReadWriteCheckingVerifier::new(
             self.proof.trace_length,
             &self.opening_accumulator,
@@ -487,17 +843,27 @@ impl<
         let instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, A>> =
             vec![&registers_read_write_checking, &ram_val_check];
 
-        let _r_stage4 = BatchedSumcheck::verify_standard::<F, ProofTranscript, A>(
-            extract_clear_proof(&self.proof.stage4_sumcheck_proof),
-            instances,
-            &mut self.opening_accumulator,
-            &mut self.transcript,
-        )?;
+        let (batching_coefficients, r_stage4) =
+            BatchedSumcheck::verify::<F, C, ProofTranscript, A>(
+                &self.proof.stage4_sumcheck_proof,
+                instances.clone(),
+                &mut self.opening_accumulator,
+                &mut self.transcript,
+            )?;
 
-        Ok(())
+        #[cfg(feature = "zk")]
+        {
+            let (out_c, out_v, in_c, in_v) = extract_stage_constraints(
+                &batching_coefficients, &r_stage4, &instances, &self.opening_accumulator,
+            );
+            Ok(StageVerifyResult::new(r_stage4, out_c, out_v, in_c, in_v))
+        }
+        #[cfg(not(feature = "zk"))]
+        Ok(StageVerifyResult { challenges: r_stage4 })
     }
 
-    fn verify_stage5(&mut self) -> Result<(), ProofVerifyError> {
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn verify_stage5(&mut self) -> Result<StageVerifyResult<F>, ProofVerifyError> {
         let n_cycle_vars = self.proof.trace_length.log_2();
 
         let lookups_read_raf = InstructionReadRafSumcheckVerifier::new(
@@ -521,17 +887,27 @@ impl<
             &registers_val_evaluation,
         ];
 
-        let _r_stage5 = BatchedSumcheck::verify_standard::<F, ProofTranscript, A>(
-            extract_clear_proof(&self.proof.stage5_sumcheck_proof),
-            instances,
-            &mut self.opening_accumulator,
-            &mut self.transcript,
-        )?;
+        let (batching_coefficients, r_stage5) =
+            BatchedSumcheck::verify::<F, C, ProofTranscript, A>(
+                &self.proof.stage5_sumcheck_proof,
+                instances.clone(),
+                &mut self.opening_accumulator,
+                &mut self.transcript,
+            )?;
 
-        Ok(())
+        #[cfg(feature = "zk")]
+        {
+            let (out_c, out_v, in_c, in_v) = extract_stage_constraints(
+                &batching_coefficients, &r_stage5, &instances, &self.opening_accumulator,
+            );
+            Ok(StageVerifyResult::new(r_stage5, out_c, out_v, in_c, in_v))
+        }
+        #[cfg(not(feature = "zk"))]
+        Ok(StageVerifyResult { challenges: r_stage5 })
     }
 
-    fn verify_stage6(&mut self) -> Result<(), ProofVerifyError> {
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn verify_stage6(&mut self) -> Result<StageVerifyResult<F>, ProofVerifyError> {
         let n_cycle_vars = self.proof.trace_length.log_2();
         let bytecode_read_raf = BytecodeReadRafSumcheckVerifier::gen(
             &self.preprocessing.shared.bytecode,
@@ -601,18 +977,28 @@ impl<
             instances.push(advice);
         }
 
-        let _r_stage6 = BatchedSumcheck::verify_standard::<F, ProofTranscript, A>(
-            extract_clear_proof(&self.proof.stage6_sumcheck_proof),
-            instances,
-            &mut self.opening_accumulator,
-            &mut self.transcript,
-        )?;
+        let (batching_coefficients, r_stage6) =
+            BatchedSumcheck::verify::<F, C, ProofTranscript, A>(
+                &self.proof.stage6_sumcheck_proof,
+                instances.clone(),
+                &mut self.opening_accumulator,
+                &mut self.transcript,
+            )?;
 
-        Ok(())
+        #[cfg(feature = "zk")]
+        {
+            let (out_c, out_v, in_c, in_v) = extract_stage_constraints(
+                &batching_coefficients, &r_stage6, &instances, &self.opening_accumulator,
+            );
+            Ok(StageVerifyResult::new(r_stage6, out_c, out_v, in_c, in_v))
+        }
+        #[cfg(not(feature = "zk"))]
+        Ok(StageVerifyResult { challenges: r_stage6 })
     }
 
     /// Stage 7: HammingWeight claim reduction verification.
-    fn verify_stage7(&mut self) -> Result<(), ProofVerifyError> {
+    #[cfg_attr(not(feature = "zk"), allow(unused_variables))]
+    fn verify_stage7(&mut self) -> Result<StageVerifyResult<F>, ProofVerifyError> {
         // Create verifier for HammingWeight claim reduction.
         // This sumcheck fuses HammingWeight + Address Reduction into a single degree-2 sumcheck.
         let hw_verifier = HammingWeightClaimReductionVerifier::new(
@@ -646,12 +1032,380 @@ impl<
             }
         }
 
-        let _r_stage7 = BatchedSumcheck::verify_standard::<F, ProofTranscript, A>(
-            extract_clear_proof(&self.proof.stage7_sumcheck_proof),
-            instances,
-            &mut self.opening_accumulator,
-            &mut self.transcript,
-        )?;
+        let (batching_coefficients, r_stage7) =
+            BatchedSumcheck::verify::<F, C, ProofTranscript, A>(
+                &self.proof.stage7_sumcheck_proof,
+                instances.clone(),
+                &mut self.opening_accumulator,
+                &mut self.transcript,
+            )?;
+
+        #[cfg(feature = "zk")]
+        {
+            let (out_c, out_v, in_c, in_v) = extract_stage_constraints(
+                &batching_coefficients, &r_stage7, &instances, &self.opening_accumulator,
+            );
+            Ok(StageVerifyResult::new(r_stage7, out_c, out_v, in_c, in_v))
+        }
+        #[cfg(not(feature = "zk"))]
+        Ok(StageVerifyResult { challenges: r_stage7 })
+    }
+
+    // =========================================================================
+    // Stage 8 BlindFold data computation (ZK only)
+    // =========================================================================
+    //
+    // Computes the structural data needed by verify_blindfold() to build
+    // the extra R1CS constraints binding BlindFold to PCS openings.
+    // Does NOT perform actual PCS verification (that's native Gnark).
+
+    #[cfg(feature = "zk")]
+    fn compute_stage8_blindfold_data(&mut self) -> Result<Stage8VerifyData<F>, ProofVerifyError> {
+        // Get the unified opening point from HammingWeightClaimReduction
+        let (opening_point, _) = self.opening_accumulator.get_committed_polynomial_opening(
+            CommittedPolynomial::InstructionRa(0),
+            SumcheckId::HammingWeightClaimReduction,
+        );
+        let log_k_chunk = self.one_hot_params.log_k_chunk;
+        let r_address_stage7 = &opening_point.r[..log_k_chunk];
+
+        // 1. Collect all (polynomial, claim) pairs
+        let mut polynomial_claims = Vec::new();
+        let mut scaling_factors = Vec::new();
+
+        // Dense polynomials: RamInc and RdInc (from IncClaimReduction in Stage 6)
+        let (_, ram_inc_claim) = self.opening_accumulator.get_committed_polynomial_opening(
+            CommittedPolynomial::RamInc,
+            SumcheckId::IncClaimReduction,
+        );
+        let (_, rd_inc_claim) = self.opening_accumulator.get_committed_polynomial_opening(
+            CommittedPolynomial::RdInc,
+            SumcheckId::IncClaimReduction,
+        );
+
+        let lagrange_factor: F = EqPolynomial::zero_selector(r_address_stage7);
+        polynomial_claims.push((CommittedPolynomial::RamInc, ram_inc_claim * lagrange_factor));
+        scaling_factors.push(lagrange_factor);
+        polynomial_claims.push((CommittedPolynomial::RdInc, rd_inc_claim * lagrange_factor));
+        scaling_factors.push(lagrange_factor);
+
+        // Sparse polynomials: all RA polys (from HammingWeightClaimReduction)
+        for i in 0..self.one_hot_params.instruction_d {
+            let (_, claim) = self.opening_accumulator.get_committed_polynomial_opening(
+                CommittedPolynomial::InstructionRa(i),
+                SumcheckId::HammingWeightClaimReduction,
+            );
+            polynomial_claims.push((CommittedPolynomial::InstructionRa(i), claim));
+            scaling_factors.push(F::one());
+        }
+        for i in 0..self.one_hot_params.bytecode_d {
+            let (_, claim) = self.opening_accumulator.get_committed_polynomial_opening(
+                CommittedPolynomial::BytecodeRa(i),
+                SumcheckId::HammingWeightClaimReduction,
+            );
+            polynomial_claims.push((CommittedPolynomial::BytecodeRa(i), claim));
+            scaling_factors.push(F::one());
+        }
+        for i in 0..self.one_hot_params.ram_d {
+            let (_, claim) = self.opening_accumulator.get_committed_polynomial_opening(
+                CommittedPolynomial::RamRa(i),
+                SumcheckId::HammingWeightClaimReduction,
+            );
+            polynomial_claims.push((CommittedPolynomial::RamRa(i), claim));
+            scaling_factors.push(F::one());
+        }
+
+        // Advice polynomials
+        let mut include_trusted_advice = false;
+        let mut include_untrusted_advice = false;
+
+        if let Some((advice_point, advice_claim)) = self
+            .opening_accumulator
+            .get_advice_opening(AdviceKind::Trusted, SumcheckId::AdviceClaimReduction)
+        {
+            let lagrange_factor =
+                compute_advice_lagrange_factor::<F>(&opening_point.r, &advice_point.r);
+            polynomial_claims.push((
+                CommittedPolynomial::TrustedAdvice,
+                advice_claim * lagrange_factor,
+            ));
+            scaling_factors.push(lagrange_factor);
+            include_trusted_advice = true;
+        }
+
+        if let Some((advice_point, advice_claim)) = self
+            .opening_accumulator
+            .get_advice_opening(AdviceKind::Untrusted, SumcheckId::AdviceClaimReduction)
+        {
+            let lagrange_factor =
+                compute_advice_lagrange_factor::<F>(&opening_point.r, &advice_point.r);
+            polynomial_claims.push((
+                CommittedPolynomial::UntrustedAdvice,
+                advice_claim * lagrange_factor,
+            ));
+            scaling_factors.push(lagrange_factor);
+            include_untrusted_advice = true;
+        }
+
+        // 2. Sample gamma and compute powers for RLC
+        let gamma_powers: Vec<F> = self
+            .transcript
+            .challenge_scalar_powers(polynomial_claims.len());
+        let constraint_coeffs: Vec<F> = gamma_powers
+            .iter()
+            .zip(&scaling_factors)
+            .map(|(gamma, scale)| *gamma * *scale)
+            .collect();
+
+        let opening_ids = stage8_opening_ids(
+            &self.one_hot_params,
+            include_trusted_advice,
+            include_untrusted_advice,
+        );
+
+        Ok(Stage8VerifyData {
+            opening_ids,
+            constraint_coeffs,
+        })
+    }
+
+    // =========================================================================
+    // BlindFold verification (ZK only)
+    // =========================================================================
+
+    #[cfg(feature = "zk")]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_blindfold(
+        &mut self,
+        sumcheck_challenges: &[Vec<F::Challenge>; 7],
+        uniskip_challenges: [F::Challenge; 2],
+        stage_output_constraints: &[Option<OutputClaimConstraint>; 7],
+        output_constraint_challenge_values: &[Vec<F>; 7],
+        stage_input_constraints: &[InputClaimConstraint; 7],
+        input_constraint_challenge_values: &[Vec<F>; 7],
+        stage1_batched_input: &InputClaimConstraint,
+        stage2_batched_input: &InputClaimConstraint,
+        stage1_batched_input_values: &[F],
+        stage2_batched_input_values: &[F],
+        stage8_data: &Stage8VerifyData<F>,
+    ) -> Result<(), ProofVerifyError> {
+        // Build stage configurations including uni-skip rounds.
+        let stage_proofs = [
+            &self.proof.stage1_sumcheck_proof,
+            &self.proof.stage2_sumcheck_proof,
+            &self.proof.stage3_sumcheck_proof,
+            &self.proof.stage4_sumcheck_proof,
+            &self.proof.stage5_sumcheck_proof,
+            &self.proof.stage6_sumcheck_proof,
+            &self.proof.stage7_sumcheck_proof,
+        ];
+
+        // Precompute power sums for uni-skip domains
+        let outer_power_sums = LagrangeHelper::power_sums::<
+            OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
+            OUTER_FIRST_ROUND_POLY_NUM_COEFFS,
+        >();
+        let product_power_sums = LagrangeHelper::power_sums::<
+            PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE,
+            PRODUCT_VIRTUAL_FIRST_ROUND_POLY_NUM_COEFFS,
+        >();
+
+        let mut stage_configs = Vec::new();
+        let mut uniskip_indices: Vec<usize> = Vec::new();
+        let mut regular_first_round_indices: Vec<usize> = Vec::new();
+        let mut last_round_indices: Vec<usize> = Vec::new();
+
+        for (stage_idx, proof) in stage_proofs.iter().enumerate() {
+            // For stages 0 and 1, add uni-skip config first
+            if stage_idx < 2 {
+                let uniskip_proof = if stage_idx == 0 {
+                    &self.proof.stage1_uni_skip_first_round_proof
+                } else {
+                    &self.proof.stage2_uni_skip_first_round_proof
+                };
+                let poly_degree = uniskip_proof.poly_degree();
+
+                let power_sums: Vec<i128> = if stage_idx == 0 {
+                    outer_power_sums.to_vec()
+                } else {
+                    product_power_sums.to_vec()
+                };
+
+                uniskip_indices.push(stage_configs.len());
+
+                let config = if stage_idx == 0 {
+                    StageConfig::new_uniskip(poly_degree, power_sums)
+                } else {
+                    StageConfig::new_uniskip_chain(poly_degree, power_sums)
+                };
+                stage_configs.push(config);
+            }
+
+            regular_first_round_indices.push(stage_configs.len());
+
+            // Add regular sumcheck rounds
+            let num_rounds = proof.num_rounds();
+            for round_idx in 0..num_rounds {
+                let poly_degree = match proof {
+                    SumcheckInstanceProof::Clear(std_proof) => {
+                        std_proof.compressed_polys[round_idx]
+                            .coeffs_except_linear_term
+                            .len()
+                    }
+                    SumcheckInstanceProof::Zk(zk_proof) => zk_proof.poly_degrees[round_idx],
+                };
+                let starts_new_chain = round_idx == 0;
+                let config = if starts_new_chain {
+                    StageConfig::new_chain(1, poly_degree)
+                } else {
+                    StageConfig::new(1, poly_degree)
+                };
+                stage_configs.push(config);
+            }
+
+            last_round_indices.push(stage_configs.len() - 1);
+        }
+
+        // Add final_output configurations
+        for (stage_idx, constraint) in stage_output_constraints.iter().enumerate() {
+            if let Some(batched) = constraint {
+                let last_round_idx = last_round_indices[stage_idx];
+                stage_configs[last_round_idx].final_output =
+                    Some(ClaimBindingConfig::with_constraint(batched.clone()));
+            }
+        }
+
+        // Add initial_input configurations for uni-skip stages (stages 0-1)
+        let uniskip_constraints = [
+            stage_input_constraints[0].clone(),
+            stage_input_constraints[1].clone(),
+        ];
+        for (i, constraint) in uniskip_constraints.iter().enumerate() {
+            let idx = uniskip_indices[i];
+            stage_configs[idx].initial_input =
+                Some(ClaimBindingConfig::with_constraint(constraint.clone()));
+        }
+
+        // Add initial_input configurations for regular first rounds (all 7 stages)
+        let regular_constraints = [
+            stage1_batched_input.clone(),
+            stage2_batched_input.clone(),
+            stage_input_constraints[2].clone(),
+            stage_input_constraints[3].clone(),
+            stage_input_constraints[4].clone(),
+            stage_input_constraints[5].clone(),
+            stage_input_constraints[6].clone(),
+        ];
+        for (i, constraint) in regular_constraints.iter().enumerate() {
+            let idx = regular_first_round_indices[i];
+            stage_configs[idx].initial_input =
+                Some(ClaimBindingConfig::with_constraint(constraint.clone()));
+        }
+
+        let extra_constraint_terms: Vec<(ValueSource, ValueSource)> = stage8_data
+            .opening_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (ValueSource::challenge(i), ValueSource::opening(*id)))
+            .collect();
+        let extra_constraint = OutputClaimConstraint::linear(extra_constraint_terms);
+        let extra_constraints = vec![extra_constraint];
+
+        // Build baked public inputs from expected values
+        let mut baked_challenges: Vec<F> = Vec::new();
+        for (stage_idx, stage_challenges) in sumcheck_challenges.iter().enumerate() {
+            if stage_idx < 2 {
+                baked_challenges.push(uniskip_challenges[stage_idx].into());
+            }
+            for challenge in stage_challenges.iter() {
+                baked_challenges.push((*challenge).into());
+            }
+        }
+
+        let all_input_challenge_values: [&[F]; 9] = [
+            &input_constraint_challenge_values[0],
+            stage1_batched_input_values,
+            &input_constraint_challenge_values[1],
+            stage2_batched_input_values,
+            &input_constraint_challenge_values[2],
+            &input_constraint_challenge_values[3],
+            &input_constraint_challenge_values[4],
+            &input_constraint_challenge_values[5],
+            &input_constraint_challenge_values[6],
+        ];
+        let mut baked_input_challenges: Vec<F> = Vec::new();
+        for expected_values in all_input_challenge_values.iter() {
+            baked_input_challenges.extend_from_slice(expected_values);
+        }
+
+        let mut baked_output_challenges: Vec<F> = Vec::new();
+        for expected_values in output_constraint_challenge_values.iter() {
+            baked_output_challenges.extend_from_slice(expected_values);
+        }
+
+        let baked = BakedPublicInputs {
+            challenges: baked_challenges,
+            initial_claims: Vec::new(),
+            batching_coefficients: Vec::new(),
+            output_constraint_challenges: baked_output_challenges,
+            input_constraint_challenges: baked_input_challenges,
+            extra_constraint_challenges: stage8_data.constraint_coeffs.clone(),
+        };
+
+        let builder =
+            VerifierR1CSBuilder::new_with_extra(&stage_configs, &extra_constraints, &baked);
+        let r1cs = builder.build();
+
+        let mut round_commitments: Vec<C::G1> = Vec::new();
+        for (stage_idx, proof) in stage_proofs.iter().enumerate() {
+            // For stages 0-1, include uni-skip commitment first
+            if stage_idx < 2 {
+                let uniskip_proof = if stage_idx == 0 {
+                    &self.proof.stage1_uni_skip_first_round_proof
+                } else {
+                    &self.proof.stage2_uni_skip_first_round_proof
+                };
+                if let UniSkipFirstRoundProofVariant::Zk(zk_uniskip) = uniskip_proof {
+                    round_commitments.push(zk_uniskip.commitment);
+                }
+            }
+            // Add regular sumcheck round commitments
+            if let SumcheckInstanceProof::Zk(zk_proof) = proof {
+                round_commitments.extend(zk_proof.round_commitments.iter().cloned());
+            }
+        }
+
+        let eval_commitment = PCS::eval_commitment(&self.proof.joint_opening_proof)
+            .ok_or(ProofVerifyError::InvalidOpeningProof)?;
+        let eval_commitments = vec![eval_commitment];
+
+        let verifier_input = BlindFoldVerifierInput {
+            round_commitments,
+            eval_commitments,
+        };
+
+        let pedersen_generator_count = pedersen_generator_count_for_r1cs(&r1cs);
+        let pedersen_generators = self
+            .preprocessing
+            .pedersen_generators::<C>(pedersen_generator_count);
+        let eval_commitment_gens =
+            PCS::eval_commitment_gens_verifier(&self.preprocessing.generators);
+        let verifier =
+            BlindFoldVerifier::<_, _>::new(&pedersen_generators, &r1cs, eval_commitment_gens);
+        let mut blindfold_transcript = ProofTranscript::new(b"BlindFold");
+
+        verifier
+            .verify(
+                &self.proof.blindfold_proof,
+                &verifier_input,
+                &mut blindfold_transcript,
+            )
+            .map_err(|e| ProofVerifyError::BlindFoldError(format!("{e:?}")))?;
+
+        tracing::debug!(
+            "BlindFold verification passed: {} R1CS constraints",
+            r1cs.num_constraints
+        );
 
         Ok(())
     }

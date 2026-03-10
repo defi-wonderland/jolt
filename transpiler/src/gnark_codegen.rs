@@ -63,6 +63,7 @@ use zklean_extractor::mle_ast::{
     scalar_add_mod, scalar_mul_mod, scalar_neg_mod, scalar_sub_mod, Atom, Edge, Node, Scalar,
     TargetField, TranscriptHashData,
 };
+use zklean_extractor::{G1Constraint, G1Op};
 
 // =============================================================================
 // Helper Functions
@@ -611,6 +612,15 @@ pub fn generate_circuit_from_bundle_with_stats(
 
     stats.total_constraints = processed_constraints.len();
 
+    // Generate G1 curve operation code (if any)
+    let g1_result = generate_g1_code(
+        &bundle.g1_ops,
+        &bundle.g1_constraints,
+        &bundle.nodes,
+        &var_names,
+        &circuit_name,
+    );
+
     // Collect all struct field names with their target field types
     // Using BTreeMap to deduplicate by name while preserving field type
     let mut struct_fields: BTreeMap<String, TargetField> = BTreeMap::new();
@@ -630,6 +640,12 @@ pub fn generate_circuit_from_bundle_with_stats(
                 .or_insert(TargetField::Fr);
         }
     }
+    // Add G1 witness variable fields (X, Y coordinates as native Fr)
+    for field_name in &g1_result.struct_fields {
+        struct_fields
+            .entry(field_name.clone())
+            .or_insert(TargetField::Fr);
+    }
 
     // Build output
     let mut output = String::new();
@@ -640,6 +656,14 @@ pub fn generate_circuit_from_bundle_with_stats(
     output.push_str("\t\"math/big\"\n");
     output.push('\n');
     output.push_str("\t\"github.com/consensys/gnark/frontend\"\n");
+    if g1_result.needs_sw_grumpkin {
+        output.push_str(
+            "\t\"github.com/consensys/gnark/std/algebra/native/sw_grumpkin\"\n",
+        );
+    }
+    if g1_result.needs_emulated {
+        output.push_str("\t\"github.com/consensys/gnark/std/math/emulated\"\n");
+    }
     if stats.uses_poseidon {
         output.push_str("\t\"jolt_verifier/poseidon\"\n");
     }
@@ -795,13 +819,24 @@ pub fn generate_circuit_from_bundle_with_stats(
         output.push_str("}\n\n");
     }
 
-    // Define method: calls each per-constraint helper
+    // G1 curve operations method (if any)
+    if !g1_result.method_code.is_empty() {
+        output.push_str(&g1_result.method_code);
+    }
+
+    // Define method: calls each per-constraint helper and G1 ops
     output.push_str(&format!(
         "func (circuit *{circuit_name}) Define(api frontend.API) error {{\n"
     ));
 
     for func_name in &constraint_func_names {
         output.push_str(&format!("\tcircuit.{func_name}(api)\n"));
+    }
+
+    if !g1_result.method_code.is_empty() {
+        output.push_str("\tif err := circuit.verifyG1Ops(api); err != nil {\n");
+        output.push_str("\t\treturn err\n");
+        output.push_str("\t}\n");
     }
 
     output.push_str("\treturn nil\n");
@@ -1017,6 +1052,295 @@ fn evaluate_constant_edge_in(nodes: &[Node], edge: Edge) -> Scalar {
 }
 
 // =============================================================================
+// G1 Curve Operation Codegen (sw_grumpkin)
+// =============================================================================
+
+/// CSE constraint index used for scalar expressions referenced by G1 operations.
+/// Uses a high index to avoid collisions with field constraint indices.
+const G1_SCALAR_CSE_IDX: usize = usize::MAX / 2;
+
+/// Result of G1 code generation.
+struct G1CodeGenResult {
+    /// Struct field names for G1 witness variables (X and Y coordinates).
+    /// Each entry is a field name (e.g., "Bf_Round_Commit_0_X").
+    struct_fields: Vec<String>,
+    /// Go code for the `verifyG1Ops` method body.
+    method_code: String,
+    /// Whether the generated code needs the `sw_grumpkin` import.
+    needs_sw_grumpkin: bool,
+    /// Whether the generated code needs the `emulated` import.
+    needs_emulated: bool,
+}
+
+/// Generate gnark Go code for G1 curve operations from the G1 operation arena.
+///
+/// Traverses the G1 operation arena and emits `sw_grumpkin` gnark API calls:
+/// - `G1Op::Var(name)` → struct fields `{Name}_X, {Name}_Y` + point construction
+/// - `G1Op::Add(a, b)` → `curve.Add(g1_a, g1_b)`
+/// - `G1Op::ScalarMul(p, s)` → bit decomposition + `curve.ScalarMul(g1_p, scalar)`
+/// - `G1Op::MSM(bases, scalars)` → `curve.MultiScalarMul(bases, scalars)`
+/// - G1 constraints → `curve.AssertIsEqual(g1_a, g1_b)`
+///
+/// Scalars referenced by ScalarMul/MSM are BN254 Fr (native circuit field) but
+/// Grumpkin expects scalars in its scalar field (= BN254 Fq). Since Fr < Fq,
+/// we convert via bit decomposition: `api.ToBinary(scalar, 254)` →
+/// `scalarField.FromBits(bits...)`.
+fn generate_g1_code(
+    g1_ops: &[G1Op],
+    g1_constraints: &[G1Constraint],
+    nodes: &[Node],
+    var_names: &HashMap<u16, String>,
+    circuit_name: &str,
+) -> G1CodeGenResult {
+    if g1_ops.is_empty() && g1_constraints.is_empty() {
+        return G1CodeGenResult {
+            struct_fields: Vec::new(),
+            method_code: String::new(),
+            needs_sw_grumpkin: false,
+            needs_emulated: false,
+        };
+    }
+
+    let mut struct_fields = Vec::new();
+    let mut body = String::new();
+
+    let has_scalar_ops = g1_ops
+        .iter()
+        .any(|op| matches!(op, G1Op::ScalarMul(_, _) | G1Op::MSM(_, _)));
+    let has_arithmetic = g1_ops.iter().any(|op| !matches!(op, G1Op::Var(_)));
+    let has_constraints = !g1_constraints.is_empty();
+
+    // Only emit the verifyG1Ops method if there are actual operations or constraints
+    if !has_arithmetic && !has_constraints {
+        // Only Var ops — just collect struct fields, no method needed
+        for op in g1_ops {
+            if let G1Op::Var(name) = op {
+                let go_name = sanitize_go_name(name);
+                struct_fields.push(format!("{go_name}_X"));
+                struct_fields.push(format!("{go_name}_Y"));
+            }
+        }
+        return G1CodeGenResult {
+            struct_fields,
+            method_code: String::new(),
+            needs_sw_grumpkin: false,
+            needs_emulated: false,
+        };
+    }
+
+    // Build the verifyG1Ops method
+    body.push_str(&format!(
+        "// verifyG1Ops verifies G1 curve operation constraints (Grumpkin native)\n"
+    ));
+    body.push_str(&format!(
+        "func (circuit *{circuit_name}) verifyG1Ops(api frontend.API) error {{\n"
+    ));
+
+    // Initialize curve
+    body.push_str("\tcurve, err := sw_grumpkin.NewCurve(api)\n");
+    body.push_str("\tif err != nil {\n");
+    body.push_str("\t\treturn err\n");
+    body.push_str("\t}\n");
+
+    if has_scalar_ops {
+        body.push_str(
+            "\tscalarField, err := emulated.NewField[sw_grumpkin.ScalarField](api)\n",
+        );
+        body.push_str("\tif err != nil {\n");
+        body.push_str("\t\treturn err\n");
+        body.push_str("\t}\n");
+    }
+    body.push('\n');
+
+    // Pre-compute all scalar expressions referenced by G1 ops using a SINGLE
+    // GnarkCodeGen instance. This ensures CSE bindings are shared across all
+    // scalar expressions and defined once before any references.
+    let mut scalar_exprs: HashMap<usize, String> = HashMap::new();
+    if has_scalar_ops {
+        let mut scalar_node_ids: Vec<usize> = Vec::new();
+        for op in g1_ops.iter() {
+            match op {
+                G1Op::ScalarMul(_, scalar_id) => {
+                    if !scalar_node_ids.contains(scalar_id) {
+                        scalar_node_ids.push(*scalar_id);
+                    }
+                }
+                G1Op::MSM(_, scalars) => {
+                    for s in scalars {
+                        if !scalar_node_ids.contains(s) {
+                            scalar_node_ids.push(*s);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut codegen =
+            GnarkCodeGen::new(nodes, var_names, G1_SCALAR_CSE_IDX, &[]);
+        for &node_id in &scalar_node_ids {
+            let expr = match &nodes[node_id] {
+                Node::Atom(Atom::Var(idx)) => var_names
+                    .get(idx)
+                    .map(|name| format!("circuit.{}", sanitize_go_name(name)))
+                    .unwrap_or_else(|| format!("circuit.X_{idx}")),
+                Node::Atom(Atom::Scalar(s)) => format_scalar_for_gnark(*s),
+                _ => codegen.generate_expr(node_id),
+            };
+            scalar_exprs.insert(node_id, expr);
+        }
+
+        let bindings = codegen.bindings_code();
+        if !bindings.is_empty() {
+            body.push_str("\t// CSE bindings for G1 scalar expressions\n");
+            body.push_str(&bindings);
+            body.push('\n');
+        }
+    }
+
+    // Generate code for each G1 operation
+    for (idx, op) in g1_ops.iter().enumerate() {
+        match op {
+            G1Op::Var(name) => {
+                let go_name = sanitize_go_name(name);
+                struct_fields.push(format!("{go_name}_X"));
+                struct_fields.push(format!("{go_name}_Y"));
+                body.push_str(&format!(
+                    "\tg1_{idx} := &sw_grumpkin.G1Affine{{X: circuit.{go_name}_X, Y: circuit.{go_name}_Y}}\n"
+                ));
+            }
+            G1Op::Zero => {
+                body.push_str(&format!(
+                    "\tg1_{idx} := &sw_grumpkin.G1Affine{{X: 0, Y: 0}} // identity\n"
+                ));
+            }
+            G1Op::Add(a, b) => {
+                body.push_str(&format!("\tg1_{idx} := curve.Add(g1_{a}, g1_{b})\n"));
+            }
+            G1Op::Sub(a, b) => {
+                body.push_str(&format!("\tg1_{idx}_neg := curve.Neg(g1_{b})\n"));
+                body.push_str(&format!(
+                    "\tg1_{idx} := curve.Add(g1_{a}, g1_{idx}_neg)\n"
+                ));
+            }
+            G1Op::Neg(a) => {
+                body.push_str(&format!("\tg1_{idx} := curve.Neg(g1_{a})\n"));
+            }
+            G1Op::Double(a) => {
+                body.push_str(&format!("\tg1_{idx} := curve.Add(g1_{a}, g1_{a})\n"));
+            }
+            G1Op::ScalarMul(point_id, scalar_node_id) => {
+                let scalar_expr = &scalar_exprs[scalar_node_id];
+                body.push_str(&format!(
+                    "\tg1_{idx}_bits := api.ToBinary({scalar_expr}, 254)\n"
+                ));
+                body.push_str(&format!(
+                    "\tg1_{idx}_s := scalarField.FromBits(g1_{idx}_bits...)\n"
+                ));
+                body.push_str(&format!(
+                    "\tg1_{idx} := curve.ScalarMul(g1_{point_id}, g1_{idx}_s)\n"
+                ));
+            }
+            G1Op::MSM(bases, scalars) => {
+                let n = bases.len();
+                body.push_str(&format!(
+                    "\tg1_{idx}_bases := make([]*sw_grumpkin.G1Affine, {n})\n"
+                ));
+                body.push_str(&format!(
+                    "\tg1_{idx}_scalars := make([]*sw_grumpkin.Scalar, {n})\n"
+                ));
+                for (i, base_id) in bases.iter().enumerate() {
+                    body.push_str(&format!(
+                        "\tg1_{idx}_bases[{i}] = g1_{base_id}\n"
+                    ));
+                }
+                for (i, scalar_node_id) in scalars.iter().enumerate() {
+                    let scalar_expr = &scalar_exprs[scalar_node_id];
+                    body.push_str(&format!(
+                        "\tg1_{idx}_s{i}_bits := api.ToBinary({scalar_expr}, 254)\n"
+                    ));
+                    body.push_str(&format!(
+                        "\tg1_{idx}_s{i} := scalarField.FromBits(g1_{idx}_s{i}_bits...)\n"
+                    ));
+                    body.push_str(&format!(
+                        "\tg1_{idx}_scalars[{i}] = g1_{idx}_s{i}\n"
+                    ));
+                }
+                body.push_str(&format!(
+                    "\tg1_{idx}, err := curve.MultiScalarMul(g1_{idx}_bases, g1_{idx}_scalars)\n"
+                ));
+                body.push_str("\tif err != nil {\n");
+                body.push_str("\t\treturn err\n");
+                body.push_str("\t}\n");
+            }
+        }
+    }
+
+    // G1 equality constraints
+    if !g1_constraints.is_empty() {
+        body.push_str("\n\t// G1 equality constraints\n");
+        for c in g1_constraints {
+            body.push_str(&format!(
+                "\tcurve.AssertIsEqual(g1_{}, g1_{}) // {}\n",
+                c.lhs, c.rhs, c.name
+            ));
+        }
+    }
+
+    // Suppress unused G1 variable warnings.
+    // Collect which g1_idx values are referenced by later ops or constraints.
+    let mut referenced: HashSet<usize> = HashSet::new();
+    for op in g1_ops.iter() {
+        match op {
+            G1Op::Add(a, b) | G1Op::Sub(a, b) => {
+                referenced.insert(*a as usize);
+                referenced.insert(*b as usize);
+            }
+            G1Op::Neg(a) | G1Op::Double(a) => {
+                referenced.insert(*a as usize);
+            }
+            G1Op::ScalarMul(p, _) => {
+                referenced.insert(*p as usize);
+            }
+            G1Op::MSM(bases, _) => {
+                for b in bases {
+                    referenced.insert(*b as usize);
+                }
+            }
+            _ => {}
+        }
+    }
+    for c in g1_constraints.iter() {
+        referenced.insert(c.lhs as usize);
+        referenced.insert(c.rhs as usize);
+    }
+    for idx in 0..g1_ops.len() {
+        if !referenced.contains(&idx) {
+            body.push_str(&format!("\t_ = g1_{idx}\n"));
+        }
+    }
+
+    body.push_str("\t_ = curve\n");
+    if has_scalar_ops {
+        body.push_str("\t_ = scalarField\n");
+    }
+
+    body.push_str("\treturn nil\n");
+    body.push_str("}\n\n");
+
+    G1CodeGenResult {
+        struct_fields,
+        method_code: body,
+        needs_sw_grumpkin: true,
+        needs_emulated: has_scalar_ops,
+    }
+}
+
+// scalar_node_to_gnark was removed — G1 scalar expressions are now pre-computed
+// in generate_g1_code() using a single shared GnarkCodeGen instance, which
+// ensures CSE bindings are defined before any references.
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -1141,5 +1465,123 @@ mod tests {
             sanitize_go_name("bytecode_v_init_final"),
             "Bytecode_V_Init_Final"
         );
+    }
+
+    // =========================================================================
+    // G1 codegen tests
+    // =========================================================================
+
+    #[test]
+    fn test_g1_var_only_emits_struct_fields_no_method() {
+        // When only G1Op::Var entries exist (no arithmetic or constraints),
+        // we should get struct fields but no verifyG1Ops method
+        let g1_ops = vec![
+            G1Op::Var("bf_commit_0".to_string()),
+            G1Op::Var("bf_commit_1".to_string()),
+        ];
+        let g1_constraints = vec![];
+        let nodes = vec![];
+        let var_names = HashMap::new();
+
+        let result = generate_g1_code(&g1_ops, &g1_constraints, &nodes, &var_names, "TestCircuit");
+
+        assert_eq!(result.struct_fields.len(), 4); // 2 points × 2 coords
+        assert!(result.struct_fields.contains(&"Bf_Commit_0_X".to_string()));
+        assert!(result.struct_fields.contains(&"Bf_Commit_0_Y".to_string()));
+        assert!(result.struct_fields.contains(&"Bf_Commit_1_X".to_string()));
+        assert!(result.struct_fields.contains(&"Bf_Commit_1_Y".to_string()));
+        assert!(result.method_code.is_empty());
+        assert!(!result.needs_sw_grumpkin);
+        assert!(!result.needs_emulated);
+    }
+
+    #[test]
+    fn test_g1_add_emits_curve_add() {
+        // G1Op::Add should generate curve.Add call
+        let g1_ops = vec![
+            G1Op::Var("p0".to_string()),
+            G1Op::Var("p1".to_string()),
+            G1Op::Add(0, 1),
+        ];
+        let g1_constraints = vec![];
+        let nodes = vec![];
+        let var_names = HashMap::new();
+
+        let result = generate_g1_code(&g1_ops, &g1_constraints, &nodes, &var_names, "TestCircuit");
+
+        assert!(result.needs_sw_grumpkin);
+        assert!(!result.needs_emulated); // No ScalarMul/MSM
+        assert!(result.method_code.contains("curve.Add(g1_0, g1_1)"));
+        assert!(result.method_code.contains("sw_grumpkin.G1Affine{X: circuit.P0_X, Y: circuit.P0_Y}"));
+    }
+
+    #[test]
+    fn test_g1_scalar_mul_emits_bit_decomposition() {
+        // G1Op::ScalarMul should generate ToBinary + FromBits + ScalarMul
+        let nodes = vec![Node::Atom(Atom::Var(0))];
+        let mut var_names = HashMap::new();
+        var_names.insert(0, "my_scalar".to_string());
+
+        let g1_ops = vec![
+            G1Op::Var("point".to_string()),
+            G1Op::ScalarMul(0, 0), // point 0, scalar node 0
+        ];
+        let g1_constraints = vec![];
+
+        let result = generate_g1_code(&g1_ops, &g1_constraints, &nodes, &var_names, "TestCircuit");
+
+        assert!(result.needs_sw_grumpkin);
+        assert!(result.needs_emulated); // ScalarMul needs emulated field
+        assert!(result.method_code.contains("api.ToBinary(circuit.My_Scalar, 254)"));
+        assert!(result.method_code.contains("scalarField.FromBits(g1_1_bits...)"));
+        assert!(result.method_code.contains("curve.ScalarMul(g1_0, g1_1_s)"));
+    }
+
+    #[test]
+    fn test_g1_constraints_emit_assert_is_equal() {
+        let g1_ops = vec![
+            G1Op::Var("lhs".to_string()),
+            G1Op::Var("rhs".to_string()),
+        ];
+        let g1_constraints = vec![G1Constraint {
+            name: "blindfold_check".to_string(),
+            lhs: 0,
+            rhs: 1,
+        }];
+        let nodes = vec![];
+        let var_names = HashMap::new();
+
+        let result = generate_g1_code(&g1_ops, &g1_constraints, &nodes, &var_names, "TestCircuit");
+
+        assert!(result.needs_sw_grumpkin);
+        assert!(result.method_code.contains("curve.AssertIsEqual(g1_0, g1_1)"));
+        assert!(result.method_code.contains("blindfold_check"));
+    }
+
+    #[test]
+    fn test_g1_sub_emits_neg_then_add() {
+        let g1_ops = vec![
+            G1Op::Var("a".to_string()),
+            G1Op::Var("b".to_string()),
+            G1Op::Sub(0, 1),
+        ];
+        let g1_constraints = vec![];
+        let nodes = vec![];
+        let var_names = HashMap::new();
+
+        let result = generate_g1_code(&g1_ops, &g1_constraints, &nodes, &var_names, "TestCircuit");
+
+        assert!(result.method_code.contains("curve.Neg(g1_1)"));
+        assert!(result.method_code.contains("curve.Add(g1_0, g1_2_neg)"));
+    }
+
+    #[test]
+    fn test_g1_empty_ops_returns_nothing() {
+        let result = generate_g1_code(&[], &[], &[], &HashMap::new(), "TestCircuit");
+
+        assert!(result.struct_fields.is_empty());
+        assert!(result.method_code.is_empty());
+        assert!(!result.needs_sw_grumpkin);
+        assert!(!result.needs_emulated);
     }
 }

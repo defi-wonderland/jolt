@@ -38,6 +38,7 @@
 // Allow non_snake_case to match VerifierOpeningAccumulator naming (log_T)
 #![allow(non_snake_case)]
 
+use ark_ff::Zero;
 use jolt_core::poly::opening_proof::{
     OpeningAccumulator, OpeningId, OpeningPoint, SumcheckId, BIG_ENDIAN,
 };
@@ -66,6 +67,10 @@ pub struct AstOpeningAccumulator {
     /// Log of trace length (matches VerifierOpeningAccumulator for parity).
     /// Currently unused but stored for potential Stage 8 batch opening logic.
     pub log_T: usize,
+    /// When true, missing keys in `store_opening` get a dummy `MleAst::zero()` claim
+    /// instead of panicking. In ZK mode, opening claims are verified by BlindFold,
+    /// not pre-populated from the proof.
+    pub zk_mode: bool,
 }
 
 // =============================================================================
@@ -79,6 +84,7 @@ impl AstOpeningAccumulator {
             openings: BTreeMap::new(),
             pending_claims: Vec::new(),
             log_T,
+            zk_mode: false,
         }
     }
 
@@ -103,6 +109,7 @@ impl AstOpeningAccumulator {
             openings,
             pending_claims: Vec::new(),
             log_T,
+            zk_mode: false,
         }
     }
 
@@ -112,11 +119,14 @@ impl AstOpeningAccumulator {
 
     /// Get an opening by key, returning (point, claim).
     fn get_opening(&self, key: &OpeningId) -> (OpeningPoint<BIG_ENDIAN, MleAst>, MleAst) {
-        let (point, claim) = self
-            .openings
-            .get(key)
-            .unwrap_or_else(|| panic!("No opening found for {key:?}"));
-        (OpeningPoint::new(point.clone()), *claim)
+        if let Some((point, claim)) = self.openings.get(key) {
+            (OpeningPoint::new(point.clone()), *claim)
+        } else if self.zk_mode {
+            // In ZK mode, return dummy values for missing keys.
+            (OpeningPoint::new(vec![]), MleAst::zero())
+        } else {
+            panic!("No opening found for {key:?}")
+        }
     }
 
     /// Store the opening point and push claim to pending_claims.
@@ -125,6 +135,13 @@ impl AstOpeningAccumulator {
         if let Some((stored_point, claim)) = self.openings.get_mut(key) {
             self.pending_claims.push(*claim);
             *stored_point = point;
+        } else if self.zk_mode {
+            // In ZK mode, claims are verified by BlindFold, not pre-populated.
+            // Insert a dummy zero claim — it will be consumed by take_pending_claims
+            // (not flush_to_transcript) so the zero value is never a constraint.
+            let dummy_claim = MleAst::zero();
+            self.pending_claims.push(dummy_claim);
+            self.openings.insert(*key, (point, dummy_claim));
         } else {
             panic!("No opening found for {key:?}");
         }

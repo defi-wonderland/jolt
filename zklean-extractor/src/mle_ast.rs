@@ -198,6 +198,54 @@ pub fn take_pending_commitment_chunks() -> Option<Vec<MleAst>> {
     PENDING_COMMITMENT_CHUNKS.with(|cell| cell.borrow_mut().take())
 }
 
+// === G1 commitment chunk storage for ZK proof symbolization ===
+//
+// ZK proofs contain Pedersen commitments (G1 points) instead of polynomial
+// coefficients. These are appended to the Fiat-Shamir transcript via
+// `append_commitment`. We need two mechanisms:
+//
+// 1. G1_CHUNK_STORE: Persistent store mapping u32 indices to Vec<MleAst> chunks.
+//    AstGroupElement stores a u32 index into this store (preserving Copy).
+//
+// 2. PENDING_G1_CHUNKS: Ephemeral tunnel from AstGroupElement::serialize_compressed
+//    to PoseidonAstTranscript::append_commitment (same pattern as PENDING_COMMITMENT_CHUNKS).
+
+thread_local! {
+    static G1_CHUNK_STORE: RefCell<Vec<Vec<MleAst>>> = const { RefCell::new(Vec::new()) };
+    static PENDING_G1_CHUNKS: RefCell<Option<Vec<MleAst>>> = const { RefCell::new(None) };
+}
+
+/// Store G1 commitment chunks and return a persistent index.
+/// Called during proof symbolization to associate MleAst chunks with an AstGroupElement.
+pub fn store_g1_chunks(chunks: Vec<MleAst>) -> u32 {
+    G1_CHUNK_STORE.with(|store| {
+        let mut s = store.borrow_mut();
+        let idx = s.len() as u32;
+        s.push(chunks);
+        idx
+    })
+}
+
+/// Retrieve G1 commitment chunks by index.
+/// Called by AstGroupElement::serialize_compressed to get the symbolic chunks.
+pub fn get_g1_chunks(idx: u32) -> Vec<MleAst> {
+    G1_CHUNK_STORE.with(|store| store.borrow()[idx as usize].clone())
+}
+
+/// Set pending G1 chunks for PoseidonAstTranscript::append_commitment.
+/// Called by AstGroupElement::serialize_compressed.
+pub fn set_pending_g1_chunks(chunks: Vec<MleAst>) {
+    PENDING_G1_CHUNKS.with(|cell| {
+        *cell.borrow_mut() = Some(chunks);
+    });
+}
+
+/// Take the pending G1 chunks (if any).
+/// Called by PoseidonAstTranscript::append_commitment.
+pub fn take_pending_g1_chunks() -> Option<Vec<MleAst>> {
+    PENDING_G1_CHUNKS.with(|cell| cell.borrow_mut().take())
+}
+
 thread_local! {
     static PENDING_POINT_ELEMENTS: RefCell<Option<Vec<MleAst>>> = const { RefCell::new(None) };
 }
@@ -219,6 +267,109 @@ pub fn set_pending_point_elements(elements: Vec<MleAst>) {
 /// Called by PoseidonAstTranscript::raw_append_point to get the 2 MleAst elements.
 pub fn take_pending_point_elements() -> Option<Vec<MleAst>> {
     PENDING_POINT_ELEMENTS.with(|cell| cell.borrow_mut().take())
+}
+
+// =============================================================================
+// G1 operation arena for BlindFold transpilation
+// =============================================================================
+//
+// BlindFold verification uses ~140 G1 curve operations (scalar_mul, add, MSM).
+// These operations are recorded symbolically and later emitted as gnark
+// `sw_grumpkin` API calls.
+//
+// Design: Same arena pattern as NODE_ARENA for field ops.
+// - G1OpId indexes into G1_OP_ARENA (thread-local)
+// - G1_CONSTRAINTS collects equality assertions between G1 points
+// - AstGroupElement carries a G1OpId alongside its chunk_store_idx
+
+/// Index into the G1 operation arena.
+pub type G1OpId = u32;
+
+/// Sentinel value meaning "no G1 operation" (identity/uninitialized).
+pub const G1_OP_NONE: G1OpId = u32::MAX;
+
+/// A symbolic G1 curve operation.
+///
+/// Each variant records one step of the BlindFold verification's curve arithmetic.
+/// These are later traversed by codegen to emit `sw_grumpkin` gnark API calls.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum G1Op {
+    /// A G1 point witness variable (e.g., a commitment from the proof).
+    /// The name maps to `{Name}_X, {Name}_Y` struct fields in gnark.
+    Var(String),
+    /// The identity point (zero element of the group).
+    Zero,
+    /// Point addition: P + Q
+    Add(G1OpId, G1OpId),
+    /// Point subtraction: P - Q
+    Sub(G1OpId, G1OpId),
+    /// Point negation: -P
+    Neg(G1OpId),
+    /// Point doubling: 2P
+    Double(G1OpId),
+    /// Scalar multiplication: P * scalar (scalar is a field AST node)
+    ScalarMul(G1OpId, NodeId),
+    /// Multi-scalar multiplication: Σ bases[i] * scalars[i]
+    MSM(Vec<G1OpId>, Vec<NodeId>),
+}
+
+/// A G1 equality constraint: assert lhs == rhs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct G1Constraint {
+    pub name: String,
+    pub lhs: G1OpId,
+    pub rhs: G1OpId,
+}
+
+thread_local! {
+    static G1_OP_ARENA: RefCell<Vec<G1Op>> = const { RefCell::new(Vec::new()) };
+    static G1_CONSTRAINTS: RefCell<Vec<G1Constraint>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Allocate a G1 operation in the arena and return its ID.
+pub fn alloc_g1_op(op: G1Op) -> G1OpId {
+    G1_OP_ARENA.with(|arena| {
+        let mut a = arena.borrow_mut();
+        let id = a.len() as G1OpId;
+        a.push(op);
+        id
+    })
+}
+
+/// Read a G1 operation by ID.
+pub fn get_g1_op(id: G1OpId) -> G1Op {
+    G1_OP_ARENA.with(|arena| arena.borrow()[id as usize].clone())
+}
+
+/// Take all G1 operations, draining the arena.
+pub fn take_g1_ops() -> Vec<G1Op> {
+    G1_OP_ARENA.with(|arena| std::mem::take(&mut *arena.borrow_mut()))
+}
+
+/// Register a G1 equality constraint (lhs == rhs).
+pub fn register_g1_constraint(name: impl Into<String>, lhs: G1OpId, rhs: G1OpId) {
+    G1_CONSTRAINTS.with(|constraints| {
+        constraints.borrow_mut().push(G1Constraint {
+            name: name.into(),
+            lhs,
+            rhs,
+        });
+    });
+}
+
+/// Take all G1 constraints, draining the list.
+pub fn take_g1_constraints() -> Vec<G1Constraint> {
+    G1_CONSTRAINTS.with(|constraints| std::mem::take(&mut *constraints.borrow_mut()))
+}
+
+/// Return the number of accumulated G1 operations.
+pub fn num_g1_ops() -> usize {
+    G1_OP_ARENA.with(|arena| arena.borrow().len())
+}
+
+/// Return the number of accumulated G1 constraints.
+pub fn num_g1_constraints() -> usize {
+    G1_CONSTRAINTS.with(|constraints| constraints.borrow().len())
 }
 
 // =============================================================================

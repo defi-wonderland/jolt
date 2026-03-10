@@ -6,7 +6,7 @@ use crate::field::JoltField;
 #[cfg(feature = "zk")]
 use crate::poly::commitment::pedersen::PedersenGenerators;
 use crate::poly::opening_proof::{
-    OpeningAccumulator, ProverOpeningAccumulator, VerifierOpeningAccumulator,
+    OpeningAccumulator, ProverOpeningAccumulator,
 };
 use crate::poly::unipoly::{CompressedUniPoly, UniPoly};
 use crate::subprotocols::sumcheck_prover::SumcheckInstanceProver;
@@ -394,12 +394,15 @@ impl BatchedSumcheck {
         )
     }
 
-    pub fn verify<F: JoltField, C: JoltCurve, ProofTranscript: Transcript>(
+    pub fn verify<
+        F: JoltField,
+        C: JoltCurve,
+        ProofTranscript: Transcript,
+        A: OpeningAccumulator<F>,
+    >(
         proof: &SumcheckInstanceProof<F, C, ProofTranscript>,
-        sumcheck_instances: Vec<
-            &dyn SumcheckInstanceVerifier<F, ProofTranscript, VerifierOpeningAccumulator<F>>,
-        >,
-        opening_accumulator: &mut VerifierOpeningAccumulator<F>,
+        sumcheck_instances: Vec<&dyn SumcheckInstanceVerifier<F, ProofTranscript, A>>,
+        opening_accumulator: &mut A,
         transcript: &mut ProofTranscript,
     ) -> Result<(Vec<F>, Vec<F::Challenge>), ProofVerifyError> {
         let max_degree = sumcheck_instances

@@ -186,6 +186,83 @@ func TestEndToEndMerkleTree(t *testing.T) {
 	t.Log("========================================")
 }
 
+// TestEndToEndPipelineZK runs the complete pipeline with ZK proof mode.
+// This tests the ZK transpilation path: G1 commitments instead of polynomial
+// coefficients, BlindFold proof stub, and take_pending_claims instead of
+// flush_to_transcript.
+//
+// Usage: go test -run TestEndToEndPipelineZK -v -timeout 30m
+func TestEndToEndPipelineZK(t *testing.T) {
+	t.Log("=== End-to-End Pipeline (ZK Mode) ===")
+	root := getWorkspaceRoot()
+	_, thisFile, _, _ := runtime.Caller(0)
+	goDir := filepath.Dir(thisFile)
+
+	// Step 0: Build Rust binaries with zk feature
+	t.Log("--- Step 0: Building Rust binaries (ZK) ---")
+	runCommand(t, "build-fibonacci-zk", root,
+		"cargo", "build", "-p", "fibonacci", "--release",
+		"--features", "transcript-poseidon,zk",
+	)
+	runCommand(t, "build-transpiler-zk", root,
+		"cargo", "build", "-p", "transpiler", "--bin", "transpiler", "--release",
+		"--features", "transcript-poseidon,zk",
+	)
+	t.Log("Rust binaries ready (ZK)")
+
+	totalStart := time.Now()
+
+	// Step 1: Fibonacci proof with ZK
+	t.Log("--- Step 1: Fibonacci Proof (ZK) ---")
+	fibBin := filepath.Join(root, "target", "release", "fibonacci")
+	fibTime := runCommand(t, "fibonacci-zk", root,
+		fibBin, "--save", "50",
+	)
+
+	// Step 2: Transpile (ZK)
+	t.Log("--- Step 2: Transpile (ZK) ---")
+	transpilerBin := filepath.Join(root, "target", "release", "transpiler")
+	transpileTime := runCommand(t, "transpiler-zk", root,
+		transpilerBin,
+	)
+
+	// Step 3: Groth16
+	t.Log("--- Step 3: Groth16 (ZK) ---")
+	groth16Time := runCommand(t, "groth16-zk", goDir,
+		"go", "test", "-run", "TestStagesCircuitProveVerify",
+		"-v", "-timeout", "25m", "-count=1",
+	)
+
+	// Read detailed results
+	resultsPath := filepath.Join(goDir, "groth16_results.json")
+	data, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatalf("Failed to read groth16_results.json: %v", err)
+	}
+	var results map[string]float64
+	if err := json.Unmarshal(data, &results); err != nil {
+		t.Fatalf("Failed to parse groth16_results.json: %v", err)
+	}
+
+	totalTime := time.Since(totalStart)
+	t.Log("")
+	t.Log("========================================")
+	t.Log("=== ZK E2E Summary ===")
+	t.Log("========================================")
+	t.Logf("Fibonacci proof (ZK):    %v", fibTime)
+	t.Logf("Transpile (ZK):          %v", transpileTime)
+	t.Logf("Circuit compile (Go):    %v", time.Duration(results["compile_ms"])*time.Millisecond)
+	t.Logf("Groth16 setup (Go):      %v", time.Duration(results["setup_ms"])*time.Millisecond)
+	t.Logf("Groth16 prove (Go):      %v", time.Duration(results["prove_ms"])*time.Millisecond)
+	t.Logf("Groth16 verify (Go):     %v", time.Duration(results["verify_ms"])*time.Millisecond)
+	t.Log("----------------------------------------")
+	t.Logf("TOTAL pipeline:          %v", totalTime)
+	t.Logf("Groth16 total:           %v", groth16Time)
+	t.Logf("Constraints:             %.0f", results["constraints"])
+	t.Logf("Proof size:              %.0f bytes", results["proof_bytes"])
+	t.Log("========================================")
+}
+
 // loadWitnessMap is a helper to load raw witness JSON
 func loadWitnessMap(path string) (map[string]string, error) {
 	data, err := os.ReadFile(path)

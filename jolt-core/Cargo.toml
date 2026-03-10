@@ -24,7 +24,7 @@ keywords = ["SNARK", "cryptography", "proofs", "zkVM"]
 
 [features]
 default = ["host"]
-zk = ["dory/zk"]
+zk = ["dory/zk", "dep:ark-grumpkin"]
 host = [
     "prover",
     "dep:jolt-inlines-sha2",
@@ -53,6 +53,7 @@ transcript-blake2b = []
 
 [dependencies]
 ark-bn254.workspace = true
+ark-grumpkin = { workspace = true, optional = true }
 jolt-optimizations.workspace = true
 ark-ec.workspace = true
 ark-ff.workspace = true

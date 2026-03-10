@@ -26,7 +26,14 @@ pub mod scalar_ops;
 // Re-export core types
 pub use ast_bundle::{Assertion, AstBundle, AstCommitment, TargetField, WitnessType};
 pub use mle_ast::{
-    set_pending_commitment_chunks, set_pending_point_elements, take_pending_commitment_chunks,
-    take_pending_point_elements,
+    get_g1_chunks, set_pending_commitment_chunks, set_pending_g1_chunks,
+    set_pending_point_elements, store_g1_chunks, take_pending_commitment_chunks,
+    take_pending_g1_chunks, take_pending_point_elements,
 };
 pub use mle_ast::{DefaultMleAst, MleAst};
+// G1 operation arena for BlindFold transpilation
+pub use mle_ast::{
+    alloc_g1_op, get_g1_op, is_constraint_mode, num_g1_constraints, num_g1_ops,
+    register_g1_constraint, take_g1_constraints, take_g1_ops, G1Constraint, G1Op, G1OpId,
+    G1_OP_NONE,
+};

@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::mle_ast::{node_arena, set_pending_commitment_chunks, Edge, MleAst, Node, NodeId};
+use crate::mle_ast::{
+    node_arena, set_pending_commitment_chunks, Edge, G1Constraint, G1Op, MleAst, Node, NodeId,
+};
 
 // =============================================================================
 // Input and Constraint Types
@@ -170,6 +172,16 @@ pub struct AstBundle {
     pub constraints: Vec<Constraint>,
     /// Input variable descriptions.
     pub inputs: Vec<InputVar>,
+
+    /// G1 curve operations recorded during BlindFold symbolic execution.
+    /// Each entry is a symbolic G1 operation (Var, Add, ScalarMul, MSM, etc.).
+    /// Only populated when ZK mode is enabled.
+    #[serde(default)]
+    pub g1_ops: Vec<G1Op>,
+    /// G1 equality constraints (assert lhs == rhs for G1 points).
+    /// These become `curve.AssertIsEqual` calls in gnark.
+    #[serde(default)]
+    pub g1_constraints: Vec<G1Constraint>,
 }
 
 impl AstBundle {
@@ -180,6 +192,8 @@ impl AstBundle {
             constraint_cse: Vec::new(),
             constraints: Vec::new(),
             inputs: Vec::new(),
+            g1_ops: Vec::new(),
+            g1_constraints: Vec::new(),
         }
     }
 

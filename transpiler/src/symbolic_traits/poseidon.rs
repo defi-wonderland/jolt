@@ -35,10 +35,12 @@
 //! will fail silently (assertions won't be zero).
 
 use ark_serialize::CanonicalSerialize;
+use jolt_core::curve::JoltGroupElement;
 use jolt_core::field::JoltField;
 use jolt_core::transcripts::Transcript;
 use zklean_extractor::mle_ast::{
-    set_pending_challenge, take_pending_append, take_pending_commitment_chunks, MleAst,
+    set_pending_challenge, take_pending_append, take_pending_commitment_chunks,
+    take_pending_g1_chunks, MleAst,
 };
 
 /// Symbolic Poseidon transcript for AST-based transpilation.
@@ -209,6 +211,38 @@ impl Transcript for PoseidonAstTranscript {
             self.raw_append_label_with_len(label, buf.len() as u64);
             // LE bytes directly, no byte reversal (Groth16 circuit, not EVM)
             self.raw_append_bytes(&buf);
+        }
+    }
+
+    // === Override append_commitment to handle AstGroupElement G1 chunks ===
+
+    fn append_commitment<G: JoltGroupElement>(&mut self, label: &'static [u8], point: &G) {
+        self.raw_append_label(label);
+        // Trigger serialization — AstGroupElement stores chunks in PENDING_G1_CHUNKS.
+        let mut bytes = Vec::new();
+        let _ = point.serialize_compressed(&mut bytes);
+
+        if let Some(chunks) = take_pending_g1_chunks() {
+            // Symbolic path: hash G1 commitment chunks as field elements.
+            // Matches real Poseidon transcript behavior: raw_append_bytes splits compressed
+            // bytes into 32-byte chunks and hashes each as a field element.
+            self.append_field_elements(&chunks);
+        } else if !bytes.is_empty() {
+            // Concrete fallback (non-AstGroupElement or default sentinel).
+            self.raw_append_bytes(&bytes);
+        }
+    }
+
+    fn append_commitments<G: JoltGroupElement>(&mut self, label: &'static [u8], points: &[G]) {
+        self.raw_append_label_with_len(label, points.len() as u64);
+        for p in points {
+            let mut bytes = Vec::new();
+            let _ = p.serialize_compressed(&mut bytes);
+            if let Some(chunks) = take_pending_g1_chunks() {
+                self.append_field_elements(&chunks);
+            } else if !bytes.is_empty() {
+                self.raw_append_bytes(&bytes);
+            }
         }
     }
 
