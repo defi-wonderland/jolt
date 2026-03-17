@@ -50,6 +50,7 @@ challenge-254-bit = []
 transcript-poseidon = ["dep:light-poseidon", "challenge-254-bit"]
 transcript-keccak = []
 transcript-blake2b = []
+padded-io = []
 
 [dependencies]
 ark-bn254.workspace = true

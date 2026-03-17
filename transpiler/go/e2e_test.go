@@ -17,6 +17,18 @@ func getWorkspaceRoot() string {
 	return filepath.Dir(filepath.Dir(filepath.Dir(currentFile)))
 }
 
+// cargoFeatures returns the Cargo feature flags for the current test run.
+// Defaults to "transcript-poseidon". Override with JOLT_FEATURES env var
+// to test additional features, e.g.:
+//
+//	JOLT_FEATURES=transcript-poseidon,padded-io go test -run TestEndToEndPipeline -v -timeout 30m
+func cargoFeatures() string {
+	if f := os.Getenv("JOLT_FEATURES"); f != "" {
+		return f
+	}
+	return "transcript-poseidon"
+}
+
 func runCommand(t *testing.T, name string, dir string, bin string, args ...string) time.Duration {
 	t.Helper()
 	cmd := exec.Command(bin, args...)
@@ -44,13 +56,15 @@ func TestEndToEndPipeline(t *testing.T) {
 	goDir := filepath.Dir(thisFile)
 
 	// Step 0: Build Rust binaries (not timed)
-	t.Log("--- Step 0: Building Rust binaries ---")
+	features := cargoFeatures()
+	t.Logf("--- Step 0: Building Rust binaries (features: %s) ---", features)
 	runCommand(t, "build-fibonacci", root,
 		"cargo", "build", "-p", "fibonacci", "--release",
-		"--features", "transcript-poseidon",
+		"--features", features,
 	)
 	runCommand(t, "build-transpiler", root,
 		"cargo", "build", "-p", "transpiler", "--bin", "transpiler",
+		"--features", features,
 	)
 	t.Log("Rust binaries ready")
 
@@ -119,14 +133,15 @@ func TestEndToEndMerkleTree(t *testing.T) {
 	goDir := filepath.Dir(thisFile)
 
 	// Step 0: Build Rust binaries
-	t.Log("--- Step 0: Building Rust binaries ---")
+	features := cargoFeatures()
+	t.Logf("--- Step 0: Building Rust binaries (features: %s) ---", features)
 	runCommand(t, "build-merkle-tree-save", root,
 		"cargo", "build", "-p", "merkle-tree-save", "--release",
-		"--features", "transcript-poseidon",
+		"--features", features,
 	)
 	runCommand(t, "build-transpiler", root,
 		"cargo", "build", "-p", "transpiler", "--bin", "transpiler", "--release",
-		"--features", "transcript-poseidon",
+		"--features", features,
 	)
 	t.Log("Rust binaries ready")
 

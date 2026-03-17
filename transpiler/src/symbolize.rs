@@ -58,6 +58,20 @@ pub fn symbolize_io_device(
     io_device: &JoltDevice,
     var_alloc: &mut VarAllocator,
 ) -> (Vec<MleAst>, Vec<MleAst>) {
+    // With padded-io: pad to max sizes so the FIFO and word vectors match
+    // the padded bytes that fiat_shamir_preamble will hash.
+    // Without padded-io: use actual bytes (same as before).
+    #[cfg(feature = "padded-io")]
+    let (input_bytes, output_bytes) = {
+        let mut inp = io_device.inputs.clone();
+        inp.resize(io_device.memory_layout.max_input_size as usize, 0);
+        let mut out = io_device.outputs.clone();
+        out.resize(io_device.memory_layout.max_output_size as usize, 0);
+        (inp, out)
+    };
+    #[cfg(not(feature = "padded-io"))]
+    let (input_bytes, output_bytes) = (io_device.inputs.clone(), io_device.outputs.clone());
+
     // --- Transcript FIFO: symbolic overrides for fiat_shamir_preamble ---
     //
     // One symbolic variable per 32-byte chunk. Consumed in order by
@@ -73,11 +87,9 @@ pub fn symbolize_io_device(
     //   2. RAM MLE: allocated as witness variable "io_panic_val" below, used
     //      by eval_io_mle for panic_contribution and termination checks.
 
-    let _input_chunk_vars =
-        push_byte_chunk_overrides(&io_device.inputs, "io_input_chunk", var_alloc);
+    let _input_chunk_vars = push_byte_chunk_overrides(&input_bytes, "io_input_chunk", var_alloc);
 
-    let _output_chunk_vars =
-        push_byte_chunk_overrides(&io_device.outputs, "io_output_chunk", var_alloc);
+    let _output_chunk_vars = push_byte_chunk_overrides(&output_bytes, "io_output_chunk", var_alloc);
 
     // --- RAM MLE override: symbolic field elements for eval_io_mle ---
     //
@@ -89,8 +101,8 @@ pub fn symbolize_io_device(
     // needs it to compute: panic_contribution = panic_val * eq_eval(panic_addr)
     // and termination = (1 - panic_val) * eq_eval(term_addr).
 
-    let eval_input_words = bytes_to_word_vars(&io_device.inputs, "io_input_word", var_alloc);
-    let eval_output_words = bytes_to_word_vars(&io_device.outputs, "io_output_word", var_alloc);
+    let eval_input_words = bytes_to_word_vars(&input_bytes, "io_input_word", var_alloc);
+    let eval_output_words = bytes_to_word_vars(&output_bytes, "io_output_word", var_alloc);
     let panic_val = var_alloc.alloc_with_value("io_panic_val", &Fr::from(io_device.panic as u64));
 
     set_pending_io_mle(PendingIoMleValues {
