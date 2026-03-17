@@ -27,6 +27,7 @@ default = []
 transcript-poseidon = ["jolt-core/transcript-poseidon"]
 transcript-keccak = ["jolt-core/transcript-keccak"]
 transcript-blake2b = ["jolt-core/transcript-blake2b"]
+padded-io = ["jolt-core/padded-io"]
 zk = ["jolt-core/zk"]
 
 [[bin]]
