@@ -163,6 +163,10 @@ impl Transcript for PoseidonTranscript {
         self.expected_state_history = Some(other.state_history);
     }
 
+    fn snapshot_state(&self) -> (Vec<u8>, u32) {
+        (self.state.to_vec(), self.n_rounds)
+    }
+
     // === Internal raw_append_* methods ===
 
     fn raw_append_label(&mut self, label: &'static [u8]) {

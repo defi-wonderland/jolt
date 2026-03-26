@@ -38,6 +38,7 @@ use crate::symbolic_traits::opening_accumulator::AstOpeningAccumulator;
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
 use jolt_core::curve::{Bn254Curve, JoltCurve};
+#[cfg(not(feature = "zk"))]
 use jolt_core::poly::opening_proof::OpeningPoint;
 use jolt_core::poly::unipoly::CompressedUniPoly;
 use jolt_core::subprotocols::sumcheck::SumcheckInstanceProof;
@@ -45,8 +46,11 @@ use jolt_core::subprotocols::univariate_skip::{
     UniSkipFirstRoundProof, UniSkipFirstRoundProofVariant,
 };
 use jolt_core::transcripts::Transcript;
-use jolt_core::zkvm::proof_serialization::{Claims, JoltProof};
+#[cfg(not(feature = "zk"))]
+use jolt_core::zkvm::proof_serialization::Claims;
+use jolt_core::zkvm::proof_serialization::JoltProof;
 use jolt_core::zkvm::RV64IMACProof;
+#[cfg(not(feature = "zk"))]
 use std::collections::BTreeMap;
 use zklean_extractor::mle_ast::{MleAst, TargetField};
 use zklean_extractor::AstCommitment;
@@ -282,11 +286,15 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
         .collect();
 
     // === Symbolize opening claims (with witness values) ===
-    let mut symbolic_claims = BTreeMap::new();
-    for (key, (_point, claim)) in &real_proof.opening_claims.0 {
-        let symbolic_claim = alloc.alloc_with_value(&format!("claim_{key:?}"), claim);
-        symbolic_claims.insert(*key, (OpeningPoint::default(), symbolic_claim));
-    }
+    #[cfg(not(feature = "zk"))]
+    let symbolic_claims = {
+        let mut claims = BTreeMap::new();
+        for (key, (_point, claim)) in &real_proof.opening_claims.0 {
+            let symbolic_claim = alloc.alloc_with_value(&format!("claim_{key:?}"), claim);
+            claims.insert(*key, (OpeningPoint::default(), symbolic_claim));
+        }
+        claims
+    };
 
     // === Symbolize stage 1 uni-skip proof ===
     let stage1_uni_skip = symbolize_uni_skip_variant::<Bn254Curve, _, OutputTranscript>(
@@ -363,7 +371,10 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
 
     // Build the symbolic proof
     let symbolic_proof = JoltProof {
+        #[cfg(not(feature = "zk"))]
         opening_claims: Claims(symbolic_claims),
+        #[cfg(feature = "zk")]
+        blindfold_proof: unimplemented!("symbolize_proof not supported with zk feature"),
         commitments,
         stage1_uni_skip_first_round_proof: stage1_uni_skip,
         stage1_sumcheck_proof: stage1_sumcheck,
@@ -387,6 +398,7 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
     #[allow(non_snake_case)] // Match VerifierOpeningAccumulator naming
     let log_T = (real_proof.trace_length as f64).log2().ceil() as usize;
     let mut accumulator = AstOpeningAccumulator::new(log_T);
+    #[cfg(not(feature = "zk"))]
     for (key, (_, claim)) in &symbolic_proof.opening_claims.0 {
         accumulator.openings.insert(*key, (vec![], *claim));
     }

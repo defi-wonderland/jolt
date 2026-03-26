@@ -89,6 +89,8 @@ pub trait JoltCurve: Clone + Sync + Send + 'static {
 }
 
 use ark_bn254::{Bn254, Fq12, Fr, G1Affine, G1Projective, G2Affine, G2Projective};
+#[cfg(feature = "zk")]
+use ark_bn254::Fq;
 use ark_ec::{pairing::Pairing, AdditiveGroup, AffineRepr, CurveGroup, VariableBaseMSM};
 use ark_ff::{PrimeField, Zero};
 use ark_std::UniformRand;
@@ -96,7 +98,7 @@ use dory::backends::arkworks::ArkG1;
 use std::ops::MulAssign;
 
 macro_rules! impl_group_ops {
-    ($Name:ident, $Inner:ty) => {
+    ($Name:ident, $Inner:ty, $field_conv:ident) => {
         impl Add for $Name {
             type Output = Self;
             fn add(self, rhs: Self) -> Self {
@@ -140,7 +142,7 @@ macro_rules! impl_group_ops {
         impl<F: JoltField> Mul<F> for $Name {
             type Output = Self;
             fn mul(mut self, rhs: F) -> Self {
-                self.0.mul_assign(jolt_field_to_fr(&rhs));
+                self.0.mul_assign($field_conv(&rhs));
                 self
             }
         }
@@ -148,7 +150,7 @@ macro_rules! impl_group_ops {
 }
 
 macro_rules! impl_group_element {
-    ($Name:ident, $Proj:ty) => {
+    ($Name:ident, $Proj:ty, $field_conv:ident) => {
         impl JoltGroupElement for $Name {
             fn zero() -> Self {
                 $Name(<$Proj>::zero())
@@ -160,7 +162,7 @@ macro_rules! impl_group_element {
                 $Name(AdditiveGroup::double(&self.0))
             }
             fn scalar_mul<F: JoltField>(&self, scalar: &F) -> Self {
-                $Name(self.0 * jolt_field_to_fr(scalar))
+                $Name(self.0 * $field_conv(scalar))
             }
         }
     };
@@ -168,8 +170,8 @@ macro_rules! impl_group_element {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Bn254G1(pub G1Projective);
-impl_group_ops!(Bn254G1, G1Projective);
-impl_group_element!(Bn254G1, G1Projective);
+impl_group_ops!(Bn254G1, G1Projective, jolt_field_to_fr);
+impl_group_element!(Bn254G1, G1Projective, jolt_field_to_fr);
 
 impl From<ArkG1> for Bn254G1 {
     fn from(value: ArkG1) -> Self {
@@ -185,8 +187,8 @@ impl From<G1Projective> for Bn254G1 {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Bn254G2(pub G2Projective);
-impl_group_ops!(Bn254G2, G2Projective);
-impl_group_element!(Bn254G2, G2Projective);
+impl_group_ops!(Bn254G2, G2Projective, jolt_field_to_fr);
+impl_group_element!(Bn254G2, G2Projective, jolt_field_to_fr);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
 pub struct Bn254GT(pub Fq12);
@@ -263,6 +265,113 @@ impl JoltCurve for Bn254Curve {
         Bn254G1(G1Projective::rand(rng))
     }
 }
+
+// ============================================================================
+// Grumpkin curve (ZK Pedersen commitments)
+//
+// Grumpkin's base field = BN254's scalar field (Fr), making Grumpkin G1
+// operations native in BN254 Groth16 circuits (~1,775 constraints/scalar_mul
+// vs ~380K for emulated BN254 G1 ops).
+// ============================================================================
+
+#[cfg(feature = "zk")]
+mod grumpkin {
+    use super::*;
+    use ark_grumpkin::Projective as GrumpkinProjective;
+
+    #[derive(
+        Clone, Copy, Debug, Default, Eq, PartialEq, CanonicalSerialize, CanonicalDeserialize,
+    )]
+    pub struct GrumpkinG1(pub GrumpkinProjective);
+    impl_group_ops!(GrumpkinG1, GrumpkinProjective, jolt_field_to_grumpkin_fr);
+    impl_group_element!(GrumpkinG1, GrumpkinProjective, jolt_field_to_grumpkin_fr);
+
+    /// Convert a JoltField element to Grumpkin's scalar field (= BN254 Fq).
+    ///
+    /// Grumpkin's scalar field and BN254's base field are the same prime field.
+    /// This is the 2-cycle relationship: ark_grumpkin::Fr = ark_bn254::Fq.
+    #[inline]
+    fn jolt_field_to_grumpkin_fr<F: JoltField>(f: &F) -> Fq {
+        let mut bytes = [0u8; 32];
+        f.serialize_uncompressed(&mut bytes[..])
+            .expect("serialization should succeed");
+        Fq::from_le_bytes_mod_order(&bytes)
+    }
+
+    impl From<Bn254G1> for GrumpkinG1 {
+        /// Deterministic mapping from BN254 G1 to Grumpkin G1.
+        ///
+        /// Used to derive Grumpkin Pedersen generators from the Dory URS.
+        /// This is NOT a homomorphism — it's a hash-to-curve derivation.
+        fn from(bn254_point: Bn254G1) -> Self {
+            use rand_chacha::ChaCha20Rng;
+            use rand_core::SeedableRng;
+            use sha3::Digest;
+
+            let mut buf = Vec::new();
+            bn254_point
+                .serialize_compressed(&mut buf)
+                .expect("serialization should succeed");
+            let hash = sha3::Sha3_256::digest(&buf);
+            let mut rng = ChaCha20Rng::from_seed(hash.into());
+            GrumpkinG1(GrumpkinProjective::rand(&mut rng))
+        }
+    }
+
+    impl From<crate::poly::commitment::dory::ArkG1> for GrumpkinG1 {
+        fn from(ark_point: crate::poly::commitment::dory::ArkG1) -> Self {
+            GrumpkinG1::from(Bn254G1(ark_point.0))
+        }
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct GrumpkinCurve;
+
+    impl JoltCurve for GrumpkinCurve {
+        type G1 = GrumpkinG1;
+        type G2 = GrumpkinG1; // stub — Grumpkin has no pairing
+        type GT = Bn254GT; // stub
+
+        fn g1_generator() -> Self::G1 {
+            use ark_ec::AffineRepr;
+            GrumpkinG1(ark_grumpkin::Affine::generator().into())
+        }
+
+        fn g2_generator() -> Self::G2 {
+            unimplemented!("Grumpkin has no G2 for pairing")
+        }
+
+        fn pairing(_g1: &Self::G1, _g2: &Self::G2) -> Self::GT {
+            unimplemented!("Grumpkin has no pairing")
+        }
+
+        fn multi_pairing(_g1s: &[Self::G1], _g2s: &[Self::G2]) -> Self::GT {
+            unimplemented!("Grumpkin has no pairing")
+        }
+
+        fn g1_msm<F: JoltField>(bases: &[Self::G1], scalars: &[F]) -> Self::G1 {
+            debug_assert_eq!(bases.len(), scalars.len());
+
+            let affine_bases: Vec<ark_grumpkin::Affine> =
+                bases.iter().map(|b| b.0.into_affine()).collect();
+            let fq_scalars: Vec<Fq> = scalars.iter().map(jolt_field_to_grumpkin_fr).collect();
+            let bigint_scalars: Vec<_> = fq_scalars.iter().map(|s| s.into_bigint()).collect();
+
+            GrumpkinG1(GrumpkinProjective::msm_bigint(&affine_bases, &bigint_scalars))
+        }
+
+        fn g2_msm<F: JoltField>(_bases: &[Self::G2], _scalars: &[F]) -> Self::G2 {
+            unimplemented!("Grumpkin has no G2 for pairing")
+        }
+
+        fn random_g1<R: rand_core::RngCore>(rng: &mut R) -> Self::G1 {
+            GrumpkinG1(GrumpkinProjective::rand(rng))
+        }
+    }
+}
+
+#[cfg(feature = "zk")]
+pub use grumpkin::{GrumpkinCurve, GrumpkinG1};
 
 /// Convert a JoltField element to BN254 Fr.
 ///

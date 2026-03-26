@@ -82,6 +82,8 @@
 //! ```
 
 pub mod gnark_codegen;
+#[cfg(feature = "zk")]
+pub mod gnark_blindfold_transcript;
 pub mod symbolic_proof;
 pub mod symbolic_traits;
 

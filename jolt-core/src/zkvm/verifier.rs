@@ -13,9 +13,9 @@ use crate::poly::commitment::dory::{bind_opening_inputs, DoryContext, DoryGlobal
 use crate::poly::lagrange_poly::LagrangeHelper;
 #[cfg(feature = "zk")]
 use crate::subprotocols::blindfold::{
-    pedersen_generator_count_for_r1cs, BakedPublicInputs, BlindFoldVerifier,
+    pedersen_generator_count_for_r1cs, BakedPublicInputs, BlindFoldProof, BlindFoldVerifier,
     BlindFoldVerifierInput, ClaimBindingConfig, InputClaimConstraint, OutputClaimConstraint,
-    StageConfig, ValueSource, VerifierR1CSBuilder,
+    StageConfig, ValueSource, VerifierR1CS, VerifierR1CSBuilder,
 };
 use crate::subprotocols::sumcheck::BatchedSumcheck;
 #[cfg(feature = "zk")]
@@ -217,6 +217,34 @@ pub struct JoltVerifier<
 struct Stage8VerifyData<F: JoltField> {
     opening_ids: Vec<OpeningId>,
     constraint_coeffs: Vec<F>,
+}
+
+/// All data needed to export BlindFold verification to a gnark circuit.
+///
+/// Returned by `verify_and_export_blindfold_data()`. Contains the R1CS,
+/// stage configs, baked public inputs, the BlindFold proof, and the round
+/// commitments needed by the gnark ZK Fiat-Shamir circuit.
+#[cfg(feature = "zk")]
+pub struct BlindFoldExportData<F: JoltField, C: JoltCurve> {
+    /// Stage configurations used to build the R1CS
+    pub stage_configs: Vec<StageConfig>,
+    /// Baked public inputs (challenges, constraint values)
+    pub baked: BakedPublicInputs<F>,
+    /// The built R1CS (A, B, C matrices + dimensions)
+    pub r1cs: VerifierR1CS<F>,
+    /// The BlindFold proof from the Jolt proof (moved out)
+    pub blindfold_proof: BlindFoldProof<F, C>,
+    /// Round commitments for the BlindFold verifier input (flat, all stages)
+    pub round_commitments: Vec<C::G1>,
+    /// Eval commitments from stage 8
+    pub eval_commitments: Vec<C::G1>,
+    /// Per-stage round commitments for ZK Fiat-Shamir export
+    pub stage_round_commitments: Vec<Vec<C::G1>>,
+    /// Opening accumulator with all opening values from stages 1-7
+    pub opening_accumulator: VerifierOpeningAccumulator<F>,
+    /// Transcript state (bytes, n_rounds) right before stage 1 starts.
+    /// Used by the Go ZK Fiat-Shamir circuit to initialize the Poseidon transcript.
+    pub transcript_state_before_stages: (Vec<u8>, u32),
 }
 
 impl<
@@ -1244,6 +1272,338 @@ where
         );
 
         Ok(())
+    }
+
+    /// Run stages 1-8 verification and export all BlindFold data for gnark circuit.
+    ///
+    /// This is the same as `verify()` but instead of calling `verify_blindfold()` to
+    /// verify the proof, it returns all intermediate data needed to export the
+    /// BlindFold config + witness JSON files for the gnark circuit.
+    #[cfg(feature = "zk")]
+    pub fn verify_and_export_blindfold_data(
+        mut self,
+    ) -> Result<BlindFoldExportData<F, C>, ProofVerifyError> {
+        fiat_shamir_preamble(
+            &self.program_io,
+            self.proof.ram_K,
+            self.proof.trace_length,
+            &mut self.transcript,
+        );
+
+        // Append commitments to transcript (same as verify())
+        for commitment in &self.proof.commitments {
+            self.transcript
+                .append_serializable(b"commitment", commitment);
+        }
+        if let Some(ref untrusted_advice_commitment) = self.proof.untrusted_advice_commitment {
+            self.transcript
+                .append_serializable(b"untrusted_advice", untrusted_advice_commitment);
+        }
+        if let Some(ref trusted_advice_commitment) = self.trusted_advice_commitment {
+            self.transcript
+                .append_serializable(b"trusted_advice", trusted_advice_commitment);
+        }
+
+        // Snapshot transcript state before stages 1-7 (for Go ZK FS circuit)
+        let transcript_state_before_stages = self.transcript.snapshot_state();
+
+        // Run stages 1-7 verification (same as verify())
+        let (stage1_result, uniskip_challenge1) = self
+            .verify_stage1()
+            .inspect_err(|e| tracing::error!("Stage 1: {e}"))?;
+        let (stage2_result, uniskip_challenge2) = self
+            .verify_stage2()
+            .inspect_err(|e| tracing::error!("Stage 2: {e}"))?;
+        let stage3_result = self
+            .verify_stage3()
+            .inspect_err(|e| tracing::error!("Stage 3: {e}"))?;
+        let stage4_result = self
+            .verify_stage4()
+            .inspect_err(|e| tracing::error!("Stage 4: {e}"))?;
+        let stage5_result = self
+            .verify_stage5()
+            .inspect_err(|e| tracing::error!("Stage 5: {e}"))?;
+        let stage6_result = self
+            .verify_stage6()
+            .inspect_err(|e| tracing::error!("Stage 6: {e}"))?;
+        let stage7_result = self
+            .verify_stage7()
+            .inspect_err(|e| tracing::error!("Stage 7: {e}"))?;
+        let stage8_data = self
+            .verify_stage8()
+            .inspect_err(|e| tracing::error!("Stage 8: {e}"))?;
+
+        // Build blindfold data (same logic as verify_blindfold but returns data)
+        let sumcheck_challenges = [
+            stage1_result.challenges.clone(),
+            stage2_result.challenges.clone(),
+            stage3_result.challenges.clone(),
+            stage4_result.challenges.clone(),
+            stage5_result.challenges.clone(),
+            stage6_result.challenges.clone(),
+            stage7_result.challenges.clone(),
+        ];
+        let uniskip_challenges = [uniskip_challenge1, uniskip_challenge2];
+
+        let stage_output_constraints = [
+            stage1_result.batched_output_constraint,
+            stage2_result.batched_output_constraint,
+            stage3_result.batched_output_constraint,
+            stage4_result.batched_output_constraint,
+            stage5_result.batched_output_constraint,
+            stage6_result.batched_output_constraint,
+            stage7_result.batched_output_constraint,
+        ];
+
+        let stage_input_constraints = [
+            stage1_result.uniskip_input_constraint.clone().unwrap(),
+            stage2_result.uniskip_input_constraint.clone().unwrap(),
+            stage3_result.batched_input_constraint.clone(),
+            stage4_result.batched_input_constraint.clone(),
+            stage5_result.batched_input_constraint.clone(),
+            stage6_result.batched_input_constraint.clone(),
+            stage7_result.batched_input_constraint.clone(),
+        ];
+
+        let input_constraint_challenge_values = [
+            stage1_result
+                .uniskip_input_constraint_challenge_values
+                .clone(),
+            stage2_result
+                .uniskip_input_constraint_challenge_values
+                .clone(),
+            stage3_result.input_constraint_challenge_values.clone(),
+            stage4_result.input_constraint_challenge_values.clone(),
+            stage5_result.input_constraint_challenge_values.clone(),
+            stage6_result.input_constraint_challenge_values.clone(),
+            stage7_result.input_constraint_challenge_values.clone(),
+        ];
+
+        let output_constraint_challenge_values: [Vec<F>; 7] = [
+            stage1_result.output_constraint_challenge_values.clone(),
+            stage2_result.output_constraint_challenge_values.clone(),
+            stage3_result.output_constraint_challenge_values.clone(),
+            stage4_result.output_constraint_challenge_values.clone(),
+            stage5_result.output_constraint_challenge_values.clone(),
+            stage6_result.output_constraint_challenge_values.clone(),
+            stage7_result.output_constraint_challenge_values.clone(),
+        ];
+
+        let stage1_batched_input = &stage1_result.batched_input_constraint;
+        let stage2_batched_input = &stage2_result.batched_input_constraint;
+        let stage1_batched_input_values = &stage1_result.input_constraint_challenge_values;
+        let stage2_batched_input_values = &stage2_result.input_constraint_challenge_values;
+
+        // --- Build stage configs (same as verify_blindfold lines 1019-1139) ---
+        let stage_proofs = [
+            &self.proof.stage1_sumcheck_proof,
+            &self.proof.stage2_sumcheck_proof,
+            &self.proof.stage3_sumcheck_proof,
+            &self.proof.stage4_sumcheck_proof,
+            &self.proof.stage5_sumcheck_proof,
+            &self.proof.stage6_sumcheck_proof,
+            &self.proof.stage7_sumcheck_proof,
+        ];
+
+        let outer_power_sums = LagrangeHelper::power_sums::<
+            OUTER_UNIVARIATE_SKIP_DOMAIN_SIZE,
+            OUTER_FIRST_ROUND_POLY_NUM_COEFFS,
+        >();
+        let product_power_sums = LagrangeHelper::power_sums::<
+            PRODUCT_VIRTUAL_UNIVARIATE_SKIP_DOMAIN_SIZE,
+            PRODUCT_VIRTUAL_FIRST_ROUND_POLY_NUM_COEFFS,
+        >();
+
+        let mut stage_configs = Vec::new();
+        let mut uniskip_indices: Vec<usize> = Vec::new();
+        let mut regular_first_round_indices: Vec<usize> = Vec::new();
+        let mut last_round_indices: Vec<usize> = Vec::new();
+
+        for (stage_idx, proof) in stage_proofs.iter().enumerate() {
+            if stage_idx < 2 {
+                let uniskip_proof = if stage_idx == 0 {
+                    &self.proof.stage1_uni_skip_first_round_proof
+                } else {
+                    &self.proof.stage2_uni_skip_first_round_proof
+                };
+                let poly_degree = uniskip_proof.poly_degree();
+                let power_sums: Vec<i128> = if stage_idx == 0 {
+                    outer_power_sums.to_vec()
+                } else {
+                    product_power_sums.to_vec()
+                };
+                uniskip_indices.push(stage_configs.len());
+                let config = if stage_idx == 0 {
+                    StageConfig::new_uniskip(poly_degree, power_sums)
+                } else {
+                    StageConfig::new_uniskip_chain(poly_degree, power_sums)
+                };
+                stage_configs.push(config);
+            }
+
+            regular_first_round_indices.push(stage_configs.len());
+
+            let num_rounds = proof.num_rounds();
+            for round_idx in 0..num_rounds {
+                let poly_degree = match proof {
+                    SumcheckInstanceProof::Clear(std_proof) => {
+                        std_proof.compressed_polys[round_idx]
+                            .coeffs_except_linear_term
+                            .len()
+                    }
+                    SumcheckInstanceProof::Zk(zk_proof) => zk_proof.poly_degrees[round_idx],
+                };
+                let starts_new_chain = round_idx == 0;
+                let config = if starts_new_chain {
+                    StageConfig::new_chain(1, poly_degree)
+                } else {
+                    StageConfig::new(1, poly_degree)
+                };
+                stage_configs.push(config);
+            }
+
+            last_round_indices.push(stage_configs.len() - 1);
+        }
+
+        // Add final_output constraints
+        for (stage_idx, constraint) in stage_output_constraints.iter().enumerate() {
+            if let Some(batched) = constraint {
+                let last_round_idx = last_round_indices[stage_idx];
+                stage_configs[last_round_idx].final_output =
+                    Some(ClaimBindingConfig::with_constraint(batched.clone()));
+            }
+        }
+
+        // Add initial_input for uni-skip stages
+        let uniskip_constraints = [
+            stage_input_constraints[0].clone(),
+            stage_input_constraints[1].clone(),
+        ];
+        for (i, constraint) in uniskip_constraints.iter().enumerate() {
+            let idx = uniskip_indices[i];
+            stage_configs[idx].initial_input =
+                Some(ClaimBindingConfig::with_constraint(constraint.clone()));
+        }
+
+        // Add initial_input for regular first rounds
+        let regular_constraints = [
+            stage1_batched_input.clone(),
+            stage2_batched_input.clone(),
+            stage_input_constraints[2].clone(),
+            stage_input_constraints[3].clone(),
+            stage_input_constraints[4].clone(),
+            stage_input_constraints[5].clone(),
+            stage_input_constraints[6].clone(),
+        ];
+        for (i, constraint) in regular_constraints.iter().enumerate() {
+            let idx = regular_first_round_indices[i];
+            stage_configs[idx].initial_input =
+                Some(ClaimBindingConfig::with_constraint(constraint.clone()));
+        }
+
+        // Extra constraint (stage 8 PCS binding)
+        let extra_constraint_terms: Vec<(ValueSource, ValueSource)> = stage8_data
+            .opening_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (ValueSource::challenge(i), ValueSource::opening(*id)))
+            .collect();
+        let extra_constraint = OutputClaimConstraint::linear(extra_constraint_terms);
+        let extra_constraints = vec![extra_constraint];
+
+        // Build baked public inputs
+        let mut baked_challenges: Vec<F> = Vec::new();
+        for (stage_idx, stage_challenges) in sumcheck_challenges.iter().enumerate() {
+            if stage_idx < 2 {
+                baked_challenges.push(uniskip_challenges[stage_idx].into());
+            }
+            for challenge in stage_challenges.iter() {
+                baked_challenges.push((*challenge).into());
+            }
+        }
+
+        let all_input_challenge_values: [&[F]; 9] = [
+            &input_constraint_challenge_values[0],
+            stage1_batched_input_values,
+            &input_constraint_challenge_values[1],
+            stage2_batched_input_values,
+            &input_constraint_challenge_values[2],
+            &input_constraint_challenge_values[3],
+            &input_constraint_challenge_values[4],
+            &input_constraint_challenge_values[5],
+            &input_constraint_challenge_values[6],
+        ];
+        let mut baked_input_challenges: Vec<F> = Vec::new();
+        for expected_values in all_input_challenge_values.iter() {
+            baked_input_challenges.extend_from_slice(expected_values);
+        }
+
+        let mut baked_output_challenges: Vec<F> = Vec::new();
+        for expected_values in output_constraint_challenge_values.iter() {
+            baked_output_challenges.extend_from_slice(expected_values);
+        }
+
+        let baked = BakedPublicInputs {
+            challenges: baked_challenges,
+            initial_claims: Vec::new(),
+            batching_coefficients: Vec::new(),
+            output_constraint_challenges: baked_output_challenges,
+            input_constraint_challenges: baked_input_challenges,
+            extra_constraint_challenges: stage8_data.constraint_coeffs.clone(),
+        };
+
+        let builder =
+            VerifierR1CSBuilder::new_with_extra(&stage_configs, &extra_constraints, &baked);
+        let r1cs = builder.build();
+
+        // --- Collect round commitments (same as verify_blindfold lines 1195-1216) ---
+        let mut round_commitments: Vec<C::G1> = Vec::new();
+        let mut stage_round_commitments: Vec<Vec<C::G1>> = Vec::new();
+
+        for (stage_idx, proof) in stage_proofs.iter().enumerate() {
+            let mut stage_coms: Vec<C::G1> = Vec::new();
+
+            if stage_idx < 2 {
+                let uniskip_proof = if stage_idx == 0 {
+                    &self.proof.stage1_uni_skip_first_round_proof
+                } else {
+                    &self.proof.stage2_uni_skip_first_round_proof
+                };
+                if let UniSkipFirstRoundProofVariant::Zk(zk_uniskip) = uniskip_proof {
+                    round_commitments.push(zk_uniskip.commitment);
+                    stage_coms.push(zk_uniskip.commitment);
+                }
+            }
+            if let SumcheckInstanceProof::Zk(zk_proof) = proof {
+                round_commitments.extend(zk_proof.round_commitments.iter().cloned());
+                stage_coms.extend(zk_proof.round_commitments.iter().cloned());
+            }
+
+            stage_round_commitments.push(stage_coms);
+        }
+
+        let eval_commitment = PCS::eval_commitment(&self.proof.joint_opening_proof)
+            .ok_or(ProofVerifyError::InvalidOpeningProof)?;
+        let eval_commitments = vec![eval_commitment];
+
+        tracing::info!(
+            "BlindFold export: {} R1CS constraints, {} stage configs, {} round commitments",
+            r1cs.num_constraints,
+            stage_configs.len(),
+            round_commitments.len()
+        );
+
+        Ok(BlindFoldExportData {
+            stage_configs,
+            baked,
+            r1cs,
+            blindfold_proof: self.proof.blindfold_proof,
+            round_commitments,
+            eval_commitments,
+            stage_round_commitments,
+            opening_accumulator: self.opening_accumulator,
+            transcript_state_before_stages,
+        })
     }
 
     #[cfg_attr(not(feature = "zk"), allow(unused_variables))]

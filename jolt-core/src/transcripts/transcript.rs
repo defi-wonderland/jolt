@@ -132,6 +132,14 @@ pub trait Transcript: Default + Clone + Sync + Send + 'static {
         }
     }
 
+    // === State inspection (for export/debugging) ===
+
+    /// Snapshot transcript state as (state_bytes, n_rounds).
+    /// Default: returns empty state. Override in concrete implementations.
+    fn snapshot_state(&self) -> (Vec<u8>, u32) {
+        (vec![], 0)
+    }
+
     // === Challenge generation methods (signatures unchanged) ===
 
     fn challenge_u128(&mut self) -> u128;
