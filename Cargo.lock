@@ -4742,6 +4742,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rsa-verify"
+version = "0.1.0"
+dependencies = [
+ "jolt-sdk",
+ "rsa-verify-guest",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "rsa-verify-guest"
+version = "0.1.0"
+dependencies = [
+ "jolt-sdk",
+]
+
+[[package]]
 name = "ruint"
 version = "1.17.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
