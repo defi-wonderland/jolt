@@ -150,3 +150,29 @@ fn bytes_to_word_vars(bytes: &[u8], prefix: &str, var_alloc: &mut VarAllocator) 
         })
         .collect()
 }
+
+/// Convert bytecode_words (u64 program image) to symbolic witness variables,
+/// padded to `target_len` for cross-program universality.
+///
+/// Without this, each bytecode word becomes a constant (`MleAst::from_u64`),
+/// baking the specific program into the circuit. With it, the program image
+/// becomes witness data, so the same circuit works for any program.
+pub fn symbolize_bytecode_words(
+    bytecode_words: &[u64],
+    target_len: usize,
+    var_alloc: &mut VarAllocator,
+) -> Vec<MleAst> {
+    assert!(
+        bytecode_words.len() <= target_len,
+        "bytecode_words ({}) exceeds target_len ({})",
+        bytecode_words.len(),
+        target_len,
+    );
+    (0..target_len)
+        .map(|i| {
+            let word = bytecode_words.get(i).copied().unwrap_or(0);
+            let fr_val = Fr::from(word);
+            var_alloc.alloc_with_value(&format!("bytecode_word_{i}"), &fr_val)
+        })
+        .collect()
+}

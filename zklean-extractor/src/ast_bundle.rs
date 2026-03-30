@@ -375,8 +375,14 @@ impl AstBundle {
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut stack: Vec<(NodeId, bool)> = Vec::new();
 
-        // Start from all nodes in the subset
-        for &node_id in subset {
+        // Sort starting nodes for deterministic traversal order.
+        // HashSet iteration is non-deterministic; without sorting, different
+        // arena layouts (e.g., from different bytecode) would produce different
+        // GCSE orderings even for structurally identical constraint trees.
+        let mut sorted_roots: Vec<NodeId> = subset.iter().copied().collect();
+        sorted_roots.sort_unstable();
+
+        for &node_id in &sorted_roots {
             if visited.contains(&node_id) {
                 continue;
             }

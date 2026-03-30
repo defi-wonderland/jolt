@@ -6,6 +6,7 @@ pub use jolt_core::zkvm::proof_serialization::serialize_and_print_size;
 pub use jolt_core::zkvm::{prover::JoltProverPreprocessing, RV64IMACProver};
 
 pub use common::jolt_device::{JoltDevice, MemoryConfig, MemoryLayout};
+pub use common::size_class;
 pub use jolt_core::ark_bn254::Fr as F;
 pub use jolt_core::curve::Bn254Curve as Curve;
 pub use jolt_core::curve::JoltCurve;

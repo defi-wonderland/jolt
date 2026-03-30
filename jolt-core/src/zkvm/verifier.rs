@@ -1647,6 +1647,10 @@ pub struct JoltSharedPreprocessing {
     pub ram: RAMPreprocessing,
     pub memory_layout: MemoryLayout,
     pub max_padded_trace_length: usize,
+    /// If set, the prover pads trace to this length instead of the minimum power-of-2.
+    pub target_trace_length: Option<usize>,
+    /// If set, the prover pads RAM address space to this size instead of the minimum power-of-2.
+    pub target_ram_k: Option<usize>,
 }
 
 impl CanonicalSerialize for JoltSharedPreprocessing {
@@ -1663,6 +1667,10 @@ impl CanonicalSerialize for JoltSharedPreprocessing {
             .serialize_with_mode(&mut writer, compress)?;
         self.max_padded_trace_length
             .serialize_with_mode(&mut writer, compress)?;
+        self.target_trace_length
+            .serialize_with_mode(&mut writer, compress)?;
+        self.target_ram_k
+            .serialize_with_mode(&mut writer, compress)?;
         Ok(())
     }
 
@@ -1671,6 +1679,8 @@ impl CanonicalSerialize for JoltSharedPreprocessing {
             + self.ram.serialized_size(compress)
             + self.memory_layout.serialized_size(compress)
             + self.max_padded_trace_length.serialized_size(compress)
+            + self.target_trace_length.serialized_size(compress)
+            + self.target_ram_k.serialized_size(compress)
     }
 }
 
@@ -1686,11 +1696,17 @@ impl CanonicalDeserialize for JoltSharedPreprocessing {
         let memory_layout = MemoryLayout::deserialize_with_mode(&mut reader, compress, validate)?;
         let max_padded_trace_length =
             usize::deserialize_with_mode(&mut reader, compress, validate)?;
+        let target_trace_length =
+            Option::<usize>::deserialize_with_mode(&mut reader, compress, validate).unwrap_or(None);
+        let target_ram_k =
+            Option::<usize>::deserialize_with_mode(&mut reader, compress, validate).unwrap_or(None);
         Ok(Self {
             bytecode: Arc::new(bytecode),
             ram,
             memory_layout,
             max_padded_trace_length,
+            target_trace_length,
+            target_ram_k,
         })
     }
 }
@@ -1720,6 +1736,36 @@ impl JoltSharedPreprocessing {
             ram,
             memory_layout,
             max_padded_trace_length,
+            target_trace_length: None,
+            target_ram_k: None,
+        })
+    }
+
+    /// Like `new`, but pads bytecode/trace/RAM to size-class bounds.
+    #[tracing::instrument(skip_all, name = "JoltSharedPreprocessing::new_with_targets")]
+    pub fn new_with_targets(
+        bytecode: Vec<Instruction>,
+        memory_layout: MemoryLayout,
+        memory_init: Vec<(u64, u8)>,
+        max_padded_trace_length: usize,
+        entry_address: u64,
+        target_trace_length: Option<usize>,
+        target_ram_k: Option<usize>,
+        target_bytecode_k: Option<usize>,
+    ) -> Result<JoltSharedPreprocessing, PreprocessingError> {
+        let bytecode = Arc::new(BytecodePreprocessing::preprocess_with_target(
+            bytecode,
+            entry_address,
+            target_bytecode_k,
+        )?);
+        let ram = RAMPreprocessing::preprocess(memory_init);
+        Ok(Self {
+            bytecode,
+            ram,
+            memory_layout,
+            max_padded_trace_length,
+            target_trace_length,
+            target_ram_k,
         })
     }
 }

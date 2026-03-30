@@ -48,11 +48,59 @@ use allocative::FlameGraphBuilder;
 use common::constants::{REGISTER_COUNT, XLEN};
 use itertools::{zip_eq, Itertools};
 use rayon::prelude::*;
+use std::any::Any;
+use std::cell::RefCell;
 use strum::{EnumCount, IntoEnumIterator};
 use tracer::instruction::{Cycle, Instruction};
 
 /// Number of batched read-checking sumchecks bespokely
 const N_STAGES: usize = 5;
+
+// Thread-local override for val_poly evaluations during symbolic execution.
+// When set, `expected_output_claim` uses these pre-computed witness variables
+// instead of evaluating val_polys from concrete instruction data, enabling
+// byte-identical circuits across different programs in the same size class.
+thread_local! {
+    static PENDING_VAL_POLY_EVALS: RefCell<Option<Box<dyn Any>>> = RefCell::new(None);
+}
+
+pub fn set_pending_val_poly_evals<F: JoltField + 'static>(evals: [F; N_STAGES]) {
+    PENDING_VAL_POLY_EVALS.with(|cell| *cell.borrow_mut() = Some(Box::new(evals)));
+}
+
+pub fn take_pending_val_poly_evals<F: JoltField + 'static>() -> Option<[F; N_STAGES]> {
+    PENDING_VAL_POLY_EVALS.with(|cell| {
+        cell.borrow_mut()
+            .take()
+            .and_then(|b| b.downcast::<[F; N_STAGES]>().ok().map(|b| *b))
+    })
+}
+
+// Thread-local capture: during concrete verification, captures the val_poly
+// evaluations at the sumcheck challenge point for later use as witness values.
+thread_local! {
+    static CAPTURED_VAL_POLY_EVALS: RefCell<Option<Box<dyn Any>>> = RefCell::new(None);
+}
+
+pub fn enable_capture_val_poly_evals() {
+    CAPTURED_VAL_POLY_EVALS.with(|cell| *cell.borrow_mut() = Some(Box::new(()) as Box<dyn Any>));
+}
+
+fn capture_val_poly_evals_impl<F: JoltField + 'static>(evals: [F; N_STAGES]) {
+    CAPTURED_VAL_POLY_EVALS.with(|cell| *cell.borrow_mut() = Some(Box::new(evals)));
+}
+
+fn should_capture_val_poly_evals() -> bool {
+    CAPTURED_VAL_POLY_EVALS.with(|cell| cell.borrow().is_some())
+}
+
+pub fn take_captured_val_poly_evals<F: JoltField + 'static>() -> Option<[F; N_STAGES]> {
+    CAPTURED_VAL_POLY_EVALS.with(|cell| {
+        cell.borrow_mut()
+            .take()
+            .and_then(|b| b.downcast::<[F; N_STAGES]>().ok().map(|b| *b))
+    })
+}
 
 /// Bytecode instruction: multi-stage Read + RAF sumcheck (N_STAGES = 5).
 ///
@@ -731,7 +779,6 @@ impl<F: JoltField, T: Transcript, A: AbstractVerifierOpeningAccumulator<F>>
     fn expected_output_claim(&self, accumulator: &A, sumcheck_challenges: &[F::Challenge]) -> F {
         let opening_point = self.params.normalize_opening_point(sumcheck_challenges);
         let (r_address_prime, r_cycle_prime) = opening_point.split_at(self.params.log_K);
-        // r_cycle is bound LowToHigh, so reverse
 
         let int_poly = self.params.int_poly.evaluate(&r_address_prime.r);
 
@@ -744,19 +791,28 @@ impl<F: JoltField, T: Transcript, A: AbstractVerifierOpeningAccumulator<F>>
                 .1
         });
 
-        // We have a separate Val polynomial for each stage
-        // Additionally, for stages 1 and 3 we have an Int polynomial for RAF
-        // So we would have:
+        // Compute val_poly evaluations: either from override (universal circuit)
+        // or by evaluating the concrete val_polys (normal path).
+        let val_evals: [F; N_STAGES] =
+            if let Some(overrides) = take_pending_val_poly_evals::<F>() {
+                overrides
+            } else {
+                let evals: [F; N_STAGES] = array::from_fn(|s| {
+                    self.params.val_polys[s].evaluate(&r_address_prime.r)
+                });
+                // Capture concrete evaluations if requested (for pre-computation)
+                if should_capture_val_poly_evals() {
+                    capture_val_poly_evals_impl(evals);
+                }
+                evals
+            };
+
         // Stage 1: gamma^0 * (Val_1 + gamma^5 * Int)
         // Stage 2: gamma^1 * (Val_2)
         // Stage 3: gamma^2 * (Val_3 + gamma^4 * Int)
         // Stage 4: gamma^3 * (Val_4)
         // Stage 5: gamma^4 * (Val_5)
-        // Which matches with the input claim:
-        // rv_1 + gamma * rv_2 + gamma^2 * rv_3 + gamma^3 * rv_4 + gamma^4 * rv_5 + gamma^5 * raf_1 + gamma^6 * raf_3
-        let val = self
-            .params
-            .val_polys
+        let val = val_evals
             .iter()
             .zip(&self.params.r_cycles)
             .zip(&self.params.gamma_powers)
@@ -767,8 +823,8 @@ impl<F: JoltField, T: Transcript, A: AbstractVerifierOpeningAccumulator<F>>
                 F::zero(),                              // There's no raf for Stage4
                 F::zero(),                              // There's no raf for Stage5
             ])
-            .map(|(((val, r_cycle), gamma), int_poly)| {
-                (val.evaluate(&r_address_prime.r) + int_poly)
+            .map(|(((val_eval, r_cycle), gamma), int_poly)| {
+                (*val_eval + int_poly)
                     * EqPolynomial::<F>::mle(r_cycle, &r_cycle_prime.r)
                     * gamma
             })
