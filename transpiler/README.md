@@ -62,6 +62,57 @@ cargo run -p transpiler --release --features transcript-poseidon
 cd transpiler/go && go test -v -run TestStagesCircuitProveVerify
 ```
 
+### Full Pipeline Including Solidity Export (5 steps)
+
+This produces a deployable Solidity verifier and runs it against a local EVM via Foundry.
+The example below uses `fibonacci`; substitute any example that has `--save` and `transcript-poseidon`.
+
+```bash
+# 1. Prove and save artifacts to /tmp/
+cargo run -p fibonacci --release --features transcript-poseidon -- --save
+```
+
+Writes `fib_proof.bin`, `fib_io_device.bin`, and `jolt_verifier_preprocessing.dat` to `/tmp/`.
+
+```bash
+# 2. Transpile: symbolic-execute the Jolt verifier and emit a Gnark circuit
+cargo run -p transpiler --bin transpiler --release --features transcript-poseidon \
+  -- --proof /tmp/fib_proof.bin --io-device /tmp/fib_io_device.bin
+```
+
+Outputs `transpiler/go/stages_circuit.go` (the Gnark R1CS circuit) and `stages_witness.json` (the concrete witness).
+
+Now move to `transpiler/go` folder.
+
+```bash
+# 3. (Optional) Solver check — verifies the witness satisfies the circuit, no crypto (~1s)
+go test -v -run TestStagesCircuitSolver -timeout 30m
+```
+
+Cheap sanity check before spending ~60s on the trusted setup.
+
+```bash
+# 4. Export Solidity verifier — runs Groth16 setup + prove + verify, then writes the contract
+JOLT_EXAMPLE=fibonacci go test -v -run TestExportSolidity -timeout 60m
+```
+
+Writes `examples/fibonacci/foundry/src/JoltVerifier.sol` (the verifier contract) and
+`examples/fibonacci/foundry/test/JoltVerifier.t.sol` (a Foundry test with the embedded proof).
+The `JOLT_EXAMPLE` env var controls which `examples/<name>/foundry/` directory receives the output.
+
+```bash
+# 5. On-chain verification via Foundry
+cd examples/fibonacci/foundry/
+
+# First time only: install forge-std
+forge install foundry-rs/forge-std --no-git
+
+forge test -vv
+```
+
+Deploys the verifier to an in-memory EVM and verifies the Groth16 proof. A passing test confirms the
+full chain: RISC-V execution → Jolt proof → Gnark Groth16 → Solidity → EVM.
+
 ## Transcript Feature Flags
 
 The transpiler must use the **same transcript** as proof generation:
