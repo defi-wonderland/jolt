@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
+	bn254fr "github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/constraint"
+	groth16bn254 "github.com/consensys/gnark/backend/groth16/bn254"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/test"
@@ -358,6 +360,180 @@ func TestStagesCircuitProveVerify(t *testing.T) {
 			t.Logf("Warning: failed to write results JSON: %v", werr)
 		}
 	}
+}
+
+// TestExportSolidity runs the full groth16 pipeline and writes:
+//   - JoltVerifier.sol  — Solidity verifier with vk baked in
+//   - proof.hex         — 164-byte proof as hex string
+//   - public_inputs.json — public witness values for the verifyProof call
+//
+// Requires the JOLT_EXAMPLE env var to be set to the target example name, e.g.:
+//	JOLT_EXAMPLE=rsa-verify go test -v -run TestExportSolidity -timeout 60m
+//
+// Output is written to examples/<JOLT_EXAMPLE>/foundry/.
+func TestExportSolidity(t *testing.T) {
+	t.Log("Jolt Stages 1-7 Verifier - Export Solidity Verifier and Proof Data")
+
+	exampleName := os.Getenv("JOLT_EXAMPLE")
+	if exampleName == "" {
+		t.Fatal("JOLT_EXAMPLE env var is not set — run as: JOLT_EXAMPLE=<example-name> go test -run TestExportSolidity")
+	}
+	t.Logf("Target example: %s", exampleName)
+
+	witnessPath := getStagesWitnessPath()
+	assignment, err := LoadStagesAssignment(witnessPath)
+	if err != nil {
+		t.Fatalf("Failed to load witness: %v", err)
+	}
+	t.Logf("Loaded witness from: %s", witnessPath)
+
+	circuit := &JoltStagesCircuit{}
+	t.Log("Compiling circuit...")
+	r1cs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, circuit)
+	if err != nil {
+		t.Fatalf("Failed to compile circuit: %v", err)
+	}
+	t.Logf("Compiled: %d constraints", r1cs.GetNbConstraints())
+
+	t.Log("Running Groth16 setup...")
+	pk, vk, err := groth16.Setup(r1cs)
+	if err != nil {
+		t.Fatalf("Setup failed: %v", err)
+	}
+
+	witness, err := frontend.NewWitness(assignment, ecc.BN254.ScalarField())
+	if err != nil {
+		t.Fatalf("Failed to create witness: %v", err)
+	}
+
+	t.Log("Generating proof...")
+	proof, err := groth16.Prove(r1cs, pk, witness)
+	if err != nil {
+		t.Fatalf("Prove failed: %v", err)
+	}
+
+	publicWitness, err := witness.Public()
+	if err != nil {
+		t.Fatalf("Failed to get public witness: %v", err)
+	}
+
+	if err := groth16.Verify(proof, vk, publicWitness); err != nil {
+		t.Fatalf("Verification failed: %v", err)
+	}
+	t.Log("Proof verified ✓")
+
+	_, thisFile, _, _ := runtime.Caller(0)
+	outDir := filepath.Dir(thisFile)
+
+	solPath := filepath.Join(outDir, "JoltVerifier.sol")
+	f, err := os.Create(solPath)
+	if err != nil {
+		t.Fatalf("Failed to create JoltVerifier.sol: %v", err)
+	}
+	defer f.Close()
+	if err := vk.ExportSolidity(f); err != nil {
+		t.Fatalf("ExportSolidity failed: %v", err)
+	}
+	t.Logf("Solidity verifier written to: %s", solPath)
+
+	// MarshalSolidity returns [Ax,Ay, Bx0,Bx1,By0,By1, Cx,Cy] as 8×32 bytes.
+	bn254Proof, ok := proof.(*groth16bn254.Proof)
+	if !ok {
+		t.Fatal("proof is not a BN254 proof — unexpected curve")
+	}
+	solidityBytes := bn254Proof.MarshalSolidity()
+	toUint256 := func(b []byte) string { return "0x" + fmt.Sprintf("%064x", new(big.Int).SetBytes(b)) }
+	pA0 := toUint256(solidityBytes[0:32])
+	pA1 := toUint256(solidityBytes[32:64])
+	pB00 := toUint256(solidityBytes[64:96])
+	pB01 := toUint256(solidityBytes[96:128])
+	pB10 := toUint256(solidityBytes[128:160])
+	pB11 := toUint256(solidityBytes[160:192])
+	pC0 := toUint256(solidityBytes[192:224])
+	pC1 := toUint256(solidityBytes[224:256])
+
+	vec, ok := publicWitness.Vector().(bn254fr.Vector)
+	if !ok {
+		t.Fatalf("unexpected public witness type: %T", publicWitness.Vector())
+	}
+	inputStrs := make([]string, len(vec))
+	for i, e := range vec {
+		var b big.Int
+		e.BigInt(&b)
+		inputStrs[i] = "0x" + fmt.Sprintf("%064x", &b)
+	}
+	t.Logf("Public inputs: %d values", len(vec))
+
+	inputsPath := filepath.Join(outDir, "public_inputs.json")
+	if data, err := json.MarshalIndent(inputStrs, "", "  "); err == nil {
+		_ = os.WriteFile(inputsPath, data, 0644)
+		t.Logf("Public inputs written to: %s", inputsPath)
+	}
+
+	inputLines := make([]string, len(inputStrs))
+	for i, s := range inputStrs {
+		inputLines[i] = fmt.Sprintf("            input[%d] = %s;", i, s)
+	}
+	proofLines := []string{
+		fmt.Sprintf("        proof[0] = %s;", pA0),
+		fmt.Sprintf("        proof[1] = %s;", pA1),
+		fmt.Sprintf("        proof[2] = %s;", pB00),
+		fmt.Sprintf("        proof[3] = %s;", pB01),
+		fmt.Sprintf("        proof[4] = %s;", pB10),
+		fmt.Sprintf("        proof[5] = %s;", pB11),
+		fmt.Sprintf("        proof[6] = %s;", pC0),
+		fmt.Sprintf("        proof[7] = %s;", pC1),
+	}
+
+	testFnName := strings.ReplaceAll(exampleName, "-", "_")
+	foundryTest := fmt.Sprintf(`// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Test} from "forge-std/Test.sol";
+import {Verifier} from "../src/JoltVerifier.sol";
+
+contract JoltVerifierTest is Test {
+    Verifier verifier;
+
+    function setUp() public {
+        verifier = new Verifier();
+    }
+
+    function test_%s() public view {
+        uint256[8] memory proof;
+%s
+
+        uint256[%d] memory input;
+%s
+
+        verifier.verifyProof(proof, input);
+    }
+}
+`,
+		testFnName,
+		strings.Join(proofLines, "\n"),
+		len(inputStrs),
+		strings.Join(inputLines, "\n"),
+	)
+
+	foundryDir := filepath.Join(outDir, "../../examples", exampleName, "foundry")
+	_ = os.MkdirAll(filepath.Join(foundryDir, "src"), 0755)
+	_ = os.MkdirAll(filepath.Join(foundryDir, "test"), 0755)
+	_ = os.MkdirAll(filepath.Join(foundryDir, "lib"), 0755)
+
+	// Write foundry.toml if not already present — committed as a template alongside the example.
+	foundryToml := filepath.Join(foundryDir, "foundry.toml")
+	if _, err := os.Stat(foundryToml); os.IsNotExist(err) {
+		_ = os.WriteFile(foundryToml, []byte("[profile.default]\nsrc = \"src\"\ntest = \"test\"\nout = \"out\"\nlibs = [\"lib\"]\n"), 0644)
+	}
+
+	verifierSrc, _ := os.ReadFile(solPath)
+	_ = os.WriteFile(filepath.Join(foundryDir, "src", "JoltVerifier.sol"), verifierSrc, 0644)
+
+	testPath := filepath.Join(foundryDir, "test", "JoltVerifier.t.sol")
+	_ = os.WriteFile(testPath, []byte(foundryTest), 0644)
+	t.Logf("Foundry test written to: %s", testPath)
+	t.Logf("Run: cd %s && forge install foundry-rs/forge-std --no-git && forge test -vv", foundryDir)
 }
 
 // =============================================================================
