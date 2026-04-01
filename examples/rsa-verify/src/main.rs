@@ -88,16 +88,58 @@ const EXPECTED: [u64; 32] = [
 pub fn main() {
     tracing_subscriber::fmt::init();
 
-    let save = std::env::args().any(|a| a == "--save");
+    let args: Vec<String> = std::env::args().collect();
+    let save = args.iter().any(|a| a == "--save");
+    let force_class: Option<&str> = args
+        .iter()
+        .position(|a| a == "--class")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str());
 
     let target_dir = "/tmp/jolt-guest-targets";
     let mut program = guest::compile_rsa_verify(target_dir);
 
-    let shared_preprocessing = guest::preprocess_shared_rsa_verify(&mut program);
+    let shared_preprocessing = if let Some(class_name) = force_class {
+        use jolt_sdk::{JoltSharedPreprocessing, MemoryConfig, MemoryLayout};
+        let class = jolt_sdk::size_class::find_class_by_name(class_name)
+            .unwrap_or_else(|| panic!("Unknown size class: {class_name}"));
+
+        let (bytecode, memory_init, program_size, entry_address) = program.decode();
+        let memory_config = MemoryConfig {
+            max_input_size: 4096,
+            max_output_size: 4096,
+            max_untrusted_advice_size: 4096,
+            max_trusted_advice_size: 4096,
+            stack_size: 4096,
+            heap_size: 65536,
+            program_size: Some(program_size),
+        };
+        let memory_layout = MemoryLayout::new(&memory_config);
+
+        info!(
+            "Forcing size class {} (log_T={}, bytecode_K={}, ram_K={})",
+            class.name, class.max_log_t, class.max_bytecode_k, class.max_ram_k
+        );
+        JoltSharedPreprocessing::new_with_targets(
+            bytecode,
+            memory_layout,
+            memory_init,
+            65536,
+            entry_address,
+            Some(1 << class.max_log_t),
+            Some(class.max_ram_k),
+            Some(class.max_bytecode_k),
+        )
+        .unwrap()
+    } else {
+        guest::preprocess_shared_rsa_verify(&mut program).unwrap()
+    };
+
     let prover_preprocessing = guest::preprocess_prover_rsa_verify(shared_preprocessing.clone());
     let verifier_preprocessing = guest::preprocess_verifier_rsa_verify(
         shared_preprocessing,
         prover_preprocessing.generators.to_verifier_setup(),
+        None,
     );
 
     if save {
