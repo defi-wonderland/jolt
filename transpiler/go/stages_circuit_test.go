@@ -187,8 +187,9 @@ func TestStagesCircuitSolver(t *testing.T) {
 	}
 }
 
-// cachedSetup runs Groth16 setup with disk caching. If pk/vk files exist in cacheDir,
-// they are loaded from disk. Otherwise, setup runs fresh and results are saved to disk.
+// cachedSetup runs Groth16 setup with disk caching. If pk/vk files exist in cacheDir
+// and were generated for the same number of constraints, they are loaded from disk.
+// Otherwise, setup runs fresh and results are saved to disk.
 // Returns (pk, vk, setupTime, fromCache).
 func cachedSetup(
 	t *testing.T,
@@ -197,25 +198,40 @@ func cachedSetup(
 ) (groth16.ProvingKey, groth16.VerifyingKey, time.Duration, bool) {
 	pkPath := filepath.Join(cacheDir, "proving_key.bin")
 	vkPath := filepath.Join(cacheDir, "verifying_key.bin")
+	constraintsPath := filepath.Join(cacheDir, "constraints.txt")
+
+	// Check that the cached keys match the current circuit's constraint count.
+	cacheValid := false
+	if data, err := os.ReadFile(constraintsPath); err == nil {
+		var cachedCount int
+		if _, err := fmt.Sscanf(string(data), "%d", &cachedCount); err == nil {
+			cacheValid = cachedCount == r1cs.GetNbConstraints()
+		}
+	}
+	if !cacheValid {
+		t.Logf("Constraint count mismatch or missing — skipping cache, running fresh setup")
+	}
 
 	// Try loading from cache
-	if pkData, err := os.ReadFile(pkPath); err == nil {
-		if vkData, err := os.ReadFile(vkPath); err == nil {
-			t.Log("Loading cached pk/vk from disk...")
-			startLoad := time.Now()
+	if cacheValid {
+		if pkData, err := os.ReadFile(pkPath); err == nil {
+			if vkData, err := os.ReadFile(vkPath); err == nil {
+				t.Log("Loading cached pk/vk from disk...")
+				startLoad := time.Now()
 
-			pk := groth16.NewProvingKey(ecc.BN254)
-			if _, err := pk.ReadFrom(bytes.NewReader(pkData)); err != nil {
-				t.Logf("Warning: failed to read cached pk, running fresh setup: %v", err)
-			} else {
-				vk := groth16.NewVerifyingKey(ecc.BN254)
-				if _, err := vk.ReadFrom(bytes.NewReader(vkData)); err != nil {
-					t.Logf("Warning: failed to read cached vk, running fresh setup: %v", err)
+				pk := groth16.NewProvingKey(ecc.BN254)
+				if _, err := pk.ReadFrom(bytes.NewReader(pkData)); err != nil {
+					t.Logf("Warning: failed to read cached pk, running fresh setup: %v", err)
 				} else {
-					loadTime := time.Since(startLoad)
-					t.Logf("Loaded cached pk (%.2f MB) + vk (%.2f KB) [%v]",
-						float64(len(pkData))/1024/1024, float64(len(vkData))/1024, loadTime)
-					return pk, vk, loadTime, true
+					vk := groth16.NewVerifyingKey(ecc.BN254)
+					if _, err := vk.ReadFrom(bytes.NewReader(vkData)); err != nil {
+						t.Logf("Warning: failed to read cached vk, running fresh setup: %v", err)
+					} else {
+						loadTime := time.Since(startLoad)
+						t.Logf("Loaded cached pk (%.2f MB) + vk (%.2f KB) [%v]",
+							float64(len(pkData))/1024/1024, float64(len(vkData))/1024, loadTime)
+						return pk, vk, loadTime, true
+					}
 				}
 			}
 		}
@@ -243,6 +259,7 @@ func cachedSetup(
 		if err := os.WriteFile(vkPath, vkBuf.Bytes(), 0644); err != nil {
 			t.Logf("Warning: failed to cache vk: %v", err)
 		}
+		_ = os.WriteFile(constraintsPath, []byte(fmt.Sprintf("%d", r1cs.GetNbConstraints())), 0644)
 		t.Logf("Cached pk (%.2f MB) + vk (%.2f KB) to %s",
 			float64(pkBuf.Len())/1024/1024, float64(vkBuf.Len())/1024, cacheDir)
 	}
@@ -364,13 +381,16 @@ func TestStagesCircuitProveVerify(t *testing.T) {
 }
 
 // TestExportSolidity runs the full groth16 pipeline and writes:
-//   - JoltVerifier.sol  — Solidity verifier with vk baked in
-//   - proof.hex         — 164-byte proof as hex string
-//   - public_inputs.json — public witness values for the verifyProof call
+//   - JoltVerifier_<class>.sol — Solidity verifier with vk baked in (per size class)
+//   - public_inputs.json       — public witness values for the verifyProof call
 //
 // Requires the JOLT_EXAMPLE env var to be set to the target example name, e.g.:
-//	JOLT_EXAMPLE=rsa-verify go test -v -run TestExportSolidity -timeout 60m
 //
+//	JOLT_EXAMPLE=fibonacci go test -v -run TestExportSolidity -timeout 60m
+//
+// The size class is auto-detected from whichever class_X directory the transpiler
+// created. The pk/vk are cached in that directory and reused across programs in
+// the same class, so the ~1min setup only runs once per class.
 // Output is written to examples/<JOLT_EXAMPLE>/foundry/.
 func TestExportSolidity(t *testing.T) {
 	t.Log("Jolt Stages 1-7 Verifier - Export Solidity Verifier and Proof Data")
@@ -381,7 +401,33 @@ func TestExportSolidity(t *testing.T) {
 	}
 	t.Logf("Target example: %s", exampleName)
 
-	witnessPath := getStagesWitnessPath()
+	_, thisFile, _, _ := runtime.Caller(0)
+	goDir := filepath.Dir(thisFile)
+
+	// Detect which class directory the transpiler most recently wrote to,
+	// by picking the one with the newest stages_witness.json. This avoids
+	// picking a stale class directory from a previous run.
+	classDir := ""
+	className := ""
+	var newestMod time.Time
+	for _, name := range []string{"class_S", "class_M", "class_L", "class_XL"} {
+		witnessCandidate := filepath.Join(goDir, name, "stages_witness.json")
+		info, err := os.Stat(witnessCandidate)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestMod) {
+			newestMod = info.ModTime()
+			classDir = filepath.Join(goDir, name)
+			className = name[len("class_"):]
+		}
+	}
+	if classDir == "" {
+		t.Fatal("No class directory found — run the transpiler first")
+	}
+	t.Logf("Auto-detected class directory: class_%s (newest witness)", className)
+
+	witnessPath := filepath.Join(classDir, "stages_witness.json")
 	assignment, err := LoadStagesAssignment(witnessPath)
 	if err != nil {
 		t.Fatalf("Failed to load witness: %v", err)
@@ -396,11 +442,9 @@ func TestExportSolidity(t *testing.T) {
 	}
 	t.Logf("Compiled: %d constraints", r1cs.GetNbConstraints())
 
-	t.Log("Running Groth16 setup...")
-	pk, vk, err := groth16.Setup(r1cs)
-	if err != nil {
-		t.Fatalf("Setup failed: %v", err)
-	}
+	// Use cached pk/vk keyed to the class directory — shared across all programs
+	// in this class, so the ~1min setup only runs once per class.
+	pk, vk, _, _ := cachedSetup(t, r1cs, classDir)
 
 	witness, err := frontend.NewWitness(assignment, ecc.BN254.ScalarField())
 	if err != nil {
@@ -423,19 +467,21 @@ func TestExportSolidity(t *testing.T) {
 	}
 	t.Log("Proof verified ✓")
 
-	_, thisFile, _, _ := runtime.Caller(0)
-	outDir := filepath.Dir(thisFile)
+	solFileName := fmt.Sprintf("JoltVerifier_%s.sol", className)
+	solPath := filepath.Join(classDir, solFileName)
 
-	solPath := filepath.Join(outDir, "JoltVerifier.sol")
-	f, err := os.Create(solPath)
-	if err != nil {
-		t.Fatalf("Failed to create JoltVerifier.sol: %v", err)
-	}
-	defer f.Close()
-	if err := vk.ExportSolidity(f); err != nil {
+	var newSol bytes.Buffer
+	if err := vk.ExportSolidity(&newSol); err != nil {
 		t.Fatalf("ExportSolidity failed: %v", err)
 	}
-	t.Logf("Solidity verifier written to: %s", solPath)
+	if existing, err := os.ReadFile(solPath); err == nil && bytes.Equal(existing, newSol.Bytes()) {
+		t.Logf("Reusing existing contract (unchanged): %s", solPath)
+	} else {
+		if err := os.WriteFile(solPath, newSol.Bytes(), 0644); err != nil {
+			t.Fatalf("Failed to write %s: %v", solFileName, err)
+		}
+		t.Logf("Solidity verifier written to: %s", solPath)
+	}
 
 	// MarshalSolidity returns [Ax,Ay, Bx0,Bx1,By0,By1, Cx,Cy] as 8×32 bytes.
 	bn254Proof, ok := proof.(*groth16bn254.Proof)
@@ -465,7 +511,7 @@ func TestExportSolidity(t *testing.T) {
 	}
 	t.Logf("Public inputs: %d values", len(vec))
 
-	inputsPath := filepath.Join(outDir, "public_inputs.json")
+	inputsPath := filepath.Join(classDir, "public_inputs.json")
 	if data, err := json.MarshalIndent(inputStrs, "", "  "); err == nil {
 		_ = os.WriteFile(inputsPath, data, 0644)
 		t.Logf("Public inputs written to: %s", inputsPath)
@@ -491,7 +537,7 @@ func TestExportSolidity(t *testing.T) {
 pragma solidity ^0.8.0;
 
 import {Test} from "forge-std/Test.sol";
-import {Verifier} from "../src/JoltVerifier.sol";
+import {Verifier} from "../src/%s";
 
 contract JoltVerifierTest is Test {
     Verifier verifier;
@@ -511,13 +557,14 @@ contract JoltVerifierTest is Test {
     }
 }
 `,
+		solFileName,
 		testFnName,
 		strings.Join(proofLines, "\n"),
 		len(inputStrs),
 		strings.Join(inputLines, "\n"),
 	)
 
-	foundryDir := filepath.Join(outDir, "../../examples", exampleName, "foundry")
+	foundryDir := filepath.Join(goDir, "../../examples", exampleName, "foundry")
 	_ = os.MkdirAll(filepath.Join(foundryDir, "src"), 0755)
 	_ = os.MkdirAll(filepath.Join(foundryDir, "test"), 0755)
 	_ = os.MkdirAll(filepath.Join(foundryDir, "lib"), 0755)
@@ -528,8 +575,7 @@ contract JoltVerifierTest is Test {
 		_ = os.WriteFile(foundryToml, []byte("[profile.default]\nsrc = \"src\"\ntest = \"test\"\nout = \"out\"\nlibs = [\"lib\"]\n"), 0644)
 	}
 
-	verifierSrc, _ := os.ReadFile(solPath)
-	_ = os.WriteFile(filepath.Join(foundryDir, "src", "JoltVerifier.sol"), verifierSrc, 0644)
+	_ = os.WriteFile(filepath.Join(foundryDir, "src", solFileName), newSol.Bytes(), 0644)
 
 	testPath := filepath.Join(foundryDir, "test", "JoltVerifier.t.sol")
 	_ = os.WriteFile(testPath, []byte(foundryTest), 0644)

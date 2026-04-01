@@ -80,7 +80,7 @@ cargo run -p transpiler --bin transpiler --release --features transcript-poseido
   -- --proof /tmp/fib_proof.bin --io-device /tmp/fib_io_device.bin
 ```
 
-Outputs `transpiler/go/stages_circuit.go` (the Gnark R1CS circuit) and `stages_witness.json` (the concrete witness).
+Outputs `transpiler/go/class_M/stages_circuit.go` (the Gnark R1CS circuit) and `class_M/stages_witness.json` (the concrete witness), where `M` is the auto-detected size class.
 
 Now move to `transpiler/go` folder.
 
@@ -93,12 +93,15 @@ Cheap sanity check before spending ~60s on the trusted setup.
 
 ```bash
 # 4. Export Solidity verifier — runs Groth16 setup + prove + verify, then writes the contract
+# First, sync the root circuit file with the class directory (required for Go compilation)
+cp $(ls -dt class_*/stages_circuit.go | head -1) stages_circuit.go
 JOLT_EXAMPLE=fibonacci go test -v -run TestExportSolidity -timeout 60m
 ```
 
-Writes `examples/fibonacci/foundry/src/JoltVerifier.sol` (the verifier contract) and
+Writes `examples/fibonacci/foundry/src/JoltVerifier_M.sol` (the verifier contract, named by size class) and
 `examples/fibonacci/foundry/test/JoltVerifier.t.sol` (a Foundry test with the embedded proof).
 The `JOLT_EXAMPLE` env var controls which `examples/<name>/foundry/` directory receives the output.
+The pk/vk are cached in `transpiler/go/class_M/` and reused for any program in the same class.
 
 ```bash
 # 5. On-chain verification via Foundry
