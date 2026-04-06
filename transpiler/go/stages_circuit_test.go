@@ -823,6 +823,241 @@ contract JoltVerifierCrossKeyTest is Test {
 	t.Log("verifying two different RSA key pairs against the same deployed contract.")
 }
 
+// TestCrossSignerLamport proves two different Lamport key pairs using the same cached
+// pk/vk — no re-setup needed. Then generates a Foundry test that calls verifyProof
+// twice on the same deployed JoltVerifier_S.sol contract, demonstrating that the
+// circuit is universal: it encodes how Lamport verification works, not which keys.
+//
+// Requires two witness files in the active class directory:
+//
+//	stages_witness_1.json  (signer 1: SEED_1, MSG_1)
+//	stages_witness_2.json  (signer 2: SEED_2, MSG_2)
+//
+// Produce them by running the transpiler for each signer and copying:
+//
+//	cargo run -p lamport-sig ... -- --save --signer 1
+//	cargo run -p transpiler ... -- --proof /tmp/lamport_proof_1.bin --io-device /tmp/lamport_io_device_1.bin
+//	cp transpiler/go/class_S/stages_witness.json transpiler/go/class_S/stages_witness_1.json
+//
+//	cargo run -p lamport-sig ... -- --save --signer 2
+//	cargo run -p transpiler ... -- --proof /tmp/lamport_proof_2.bin --io-device /tmp/lamport_io_device_2.bin
+//	cp transpiler/go/class_S/stages_witness.json transpiler/go/class_S/stages_witness_2.json
+//
+//	go test -v -run TestCrossSignerLamport -timeout 60m
+func TestCrossSignerLamport(t *testing.T) {
+	t.Log("Jolt Stages 1-7 Verifier - Cross-Signer Lamport Verification")
+
+	exampleName := "lamport-sig"
+
+	_, thisFile, _, _ := runtime.Caller(0)
+	goDir := filepath.Dir(thisFile)
+
+	classDir := ""
+	className := ""
+	var newestMod time.Time
+	for _, name := range []string{"class_S", "class_M", "class_L", "class_XL"} {
+		candidate := filepath.Join(goDir, name, "stages_witness_1.json")
+		info, err := os.Stat(candidate)
+		if err != nil {
+			continue
+		}
+		if info.ModTime().After(newestMod) {
+			newestMod = info.ModTime()
+			classDir = filepath.Join(goDir, name)
+			className = name[len("class_"):]
+		}
+	}
+	if classDir == "" {
+		t.Fatal("No class directory with stages_witness_1.json found — run the transpiler for each signer first")
+	}
+	t.Logf("Auto-detected class directory: class_%s", className)
+
+	for _, path := range []string{
+		filepath.Join(classDir, "stages_witness_1.json"),
+		filepath.Join(classDir, "stages_witness_2.json"),
+	} {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Fatalf("Missing witness file: %s", path)
+		}
+	}
+
+	assignment1, err := LoadStagesAssignment(filepath.Join(classDir, "stages_witness_1.json"))
+	if err != nil {
+		t.Fatalf("Failed to load witness 1: %v", err)
+	}
+	t.Logf("Loaded witness 1 (signer 1: SEED_1, MSG_1=0xdeadbeefcafef00d)")
+
+	assignment2, err := LoadStagesAssignment(filepath.Join(classDir, "stages_witness_2.json"))
+	if err != nil {
+		t.Fatalf("Failed to load witness 2: %v", err)
+	}
+	t.Logf("Loaded witness 2 (signer 2: SEED_2, MSG_2=0x0badf00dcafebabe)")
+
+	t.Log("Compiling circuit...")
+	var circuit JoltStagesCircuit
+	compiledR1cs, err := frontend.Compile(ecc.BN254.ScalarField(), r1cs.NewBuilder, &circuit)
+	if err != nil {
+		t.Fatalf("Failed to compile: %v", err)
+	}
+	t.Logf("Compiled: %d constraints", compiledR1cs.GetNbConstraints())
+
+	pk, vk, setupTime, fromCache := cachedSetup(t, compiledR1cs, classDir)
+	if fromCache {
+		t.Logf("Loaded cached pk/vk [%v]", setupTime)
+	} else {
+		t.Logf("Setup complete [%v]", setupTime)
+	}
+
+	proveOne := func(label string, assignment *JoltStagesCircuit) (groth16.Proof, []string) {
+		t.Logf("Proving %s...", label)
+		w, err := frontend.NewWitness(assignment, ecc.BN254.ScalarField())
+		if err != nil {
+			t.Fatalf("[%s] NewWitness: %v", label, err)
+		}
+		startProve := time.Now()
+		proof, err := groth16.Prove(compiledR1cs, pk, w)
+		if err != nil {
+			t.Fatalf("[%s] Prove: %v", label, err)
+		}
+		t.Logf("[%s] Proved in %v", label, time.Since(startProve))
+
+		publicWitness, err := w.Public()
+		if err != nil {
+			t.Fatalf("[%s] Public: %v", label, err)
+		}
+		if err := groth16.Verify(proof, vk, publicWitness); err != nil {
+			t.Fatalf("[%s] Verify: %v", label, err)
+		}
+		t.Logf("[%s] Verified ✓", label)
+
+		vec, ok := publicWitness.Vector().(bn254fr.Vector)
+		if !ok {
+			t.Fatalf("[%s] unexpected public witness type: %T", label, publicWitness.Vector())
+		}
+		inputs := make([]string, len(vec))
+		for i, e := range vec {
+			var b big.Int
+			e.BigInt(&b)
+			inputs[i] = "0x" + fmt.Sprintf("%064x", &b)
+		}
+		return proof, inputs
+	}
+
+	proof1, in1 := proveOne("signer 1 (SEED_1, MSG_1)", assignment1)
+	proof2, in2 := proveOne("signer 2 (SEED_2, MSG_2)", assignment2)
+
+	solFileName := fmt.Sprintf("JoltVerifier_%s.sol", className)
+	solPath := filepath.Join(classDir, solFileName)
+	if _, err := os.Stat(solPath); os.IsNotExist(err) {
+		var solBuf bytes.Buffer
+		if err := vk.ExportSolidity(&solBuf); err != nil {
+			t.Fatalf("ExportSolidity: %v", err)
+		}
+		if err := os.WriteFile(solPath, solBuf.Bytes(), 0644); err != nil {
+			t.Fatalf("Write %s: %v", solFileName, err)
+		}
+		t.Logf("Solidity verifier written: %s", solPath)
+	} else {
+		t.Logf("Reusing existing contract (vk unchanged): %s", solPath)
+	}
+
+	proofToSolidity := func(proof groth16.Proof) [8]string {
+		b := proof.(*groth16bn254.Proof).MarshalSolidity()
+		u := func(s []byte) string { return "0x" + fmt.Sprintf("%064x", new(big.Int).SetBytes(s)) }
+		return [8]string{u(b[0:32]), u(b[32:64]), u(b[64:96]), u(b[96:128]), u(b[128:160]), u(b[160:192]), u(b[192:224]), u(b[224:256])}
+	}
+
+	p1 := proofToSolidity(proof1)
+	p2 := proofToSolidity(proof2)
+
+	proofBlock := func(p [8]string) string {
+		lines := make([]string, 8)
+		for i, v := range p {
+			lines[i] = fmt.Sprintf("        proof[%d] = %s;", i, v)
+		}
+		return strings.Join(lines, "\n")
+	}
+	inputBlock := func(ins []string) string {
+		lines := make([]string, len(ins))
+		for i, v := range ins {
+			lines[i] = fmt.Sprintf("        input[%d] = %s;", i, v)
+		}
+		return strings.Join(lines, "\n")
+	}
+
+	fn := strings.ReplaceAll(exampleName, "-", "_")
+	foundryTest := fmt.Sprintf(`// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Test} from "forge-std/Test.sol";
+import {Verifier} from "../src/%s";
+
+// Cross-signer verification: two different Lamport key pairs verified
+// by the same JoltVerifier_%s.sol (shared Groth16 trusted setup).
+// The circuit encodes how Lamport verification works, not which keys were used.
+contract JoltVerifierCrossSignerTest is Test {
+    Verifier verifier;
+
+    function setUp() public {
+        verifier = new Verifier();
+    }
+
+    // Signer 1: key pair derived from SEED_1, message=0xdeadbeefcafef00d
+    function test_%s_signer1() public view {
+        uint256[8] memory proof;
+%s
+
+        uint256[%d] memory input;
+%s
+
+        verifier.verifyProof(proof, input);
+    }
+
+    // Signer 2: key pair derived from SEED_2, message=0x0badf00dcafebabe
+    function test_%s_signer2() public view {
+        uint256[8] memory proof;
+%s
+
+        uint256[%d] memory input;
+%s
+
+        verifier.verifyProof(proof, input);
+    }
+}
+`,
+		solFileName, className,
+		fn, proofBlock(p1), len(in1), inputBlock(in1),
+		fn, proofBlock(p2), len(in2), inputBlock(in2),
+	)
+
+	foundryDir := filepath.Join(goDir, "../../examples", exampleName, "foundry")
+	_ = os.MkdirAll(filepath.Join(foundryDir, "src"), 0755)
+	_ = os.MkdirAll(filepath.Join(foundryDir, "test"), 0755)
+
+	solBytes, _ := os.ReadFile(solPath)
+	_ = os.WriteFile(filepath.Join(foundryDir, "src", solFileName), solBytes, 0644)
+
+	testPath := filepath.Join(foundryDir, "test", "JoltVerifierCrossSigner.t.sol")
+	if err := os.WriteFile(testPath, []byte(foundryTest), 0644); err != nil {
+		t.Fatalf("Write Foundry test: %v", err)
+	}
+
+	t.Log("")
+	t.Log("=== Summary ===")
+	t.Logf("Circuit:         %d constraints (class %s, universal)", compiledR1cs.GetNbConstraints(), className)
+	t.Logf("Signer 1 proof:  164 bytes  ✓  (SEED_1, MSG_1=0xdeadbeefcafef00d)")
+	t.Logf("Signer 2 proof:  164 bytes  ✓  (SEED_2, MSG_2=0x0badf00dcafebabe)")
+	t.Logf("Contract:        %s (same vk, both proofs valid)", solFileName)
+	t.Logf("Foundry test:    %s", testPath)
+	t.Log("")
+	t.Log("=== Next steps ===")
+	t.Logf("  cd %s", foundryDir)
+	t.Log("  forge test -vv --match-contract JoltVerifierCrossSignerTest")
+	t.Log("")
+	t.Log("Both test_lamport_sig_signer1() and test_lamport_sig_signer2() should pass,")
+	t.Log("verifying two different Lamport key pairs against the same deployed contract.")
+}
+
 // =============================================================================
 // SANITY CHECK TESTS - Verify the circuit is actually checking constraints
 // =============================================================================

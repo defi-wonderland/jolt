@@ -67,6 +67,8 @@ members = [
     "examples/muldiv/guest",
     "examples/rsa-verify",
     "examples/rsa-verify/guest",
+    "examples/lamport-sig",
+    "examples/lamport-sig/guest",
     "examples/overflow",
     "examples/overflow/guest",
     "examples/memory-ops",

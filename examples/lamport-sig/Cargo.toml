@@ -1,0 +1,16 @@
+[package]
+name = "lamport-sig"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+transcript-poseidon = ["jolt-sdk/transcript-poseidon"]
+transcript-keccak   = ["jolt-sdk/transcript-keccak"]
+transcript-blake2b  = ["jolt-sdk/transcript-blake2b"]
+padded-io           = ["jolt-sdk/padded-io"]
+
+[dependencies]
+jolt-sdk = { workspace = true, features = ["host"] }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+guest = { package = "lamport-sig-guest", path = "./guest" }
