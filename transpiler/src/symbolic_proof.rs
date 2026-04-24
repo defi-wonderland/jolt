@@ -422,6 +422,7 @@ pub fn symbolize_proof<OutputTranscript: Transcript>(
 
 /// Symbolize a UniSkipFirstRoundProofVariant by extracting the Standard inner proof,
 /// converting its polynomial coefficients to symbolic variables, and re-wrapping.
+#[cfg(not(feature = "zk"))]
 fn symbolize_uni_skip_variant<C: JoltCurve<F = ark_bn254::Fr>, T: Transcript, OutT: Transcript>(
     real: &UniSkipFirstRoundProofVariant<ark_bn254::Fr, C, T>,
     alloc: &mut VarAllocator,
@@ -444,6 +445,7 @@ fn symbolize_uni_skip_variant<C: JoltCurve<F = ark_bn254::Fr>, T: Transcript, Ou
 /// Symbolize a SumcheckInstanceProof by extracting the Clear inner proof,
 /// converting its compressed polynomial coefficients to symbolic variables,
 /// and re-wrapping.
+#[cfg(not(feature = "zk"))]
 fn symbolize_sumcheck_variant<C: JoltCurve<F = ark_bn254::Fr>, T: Transcript, OutT: Transcript>(
     real: &SumcheckInstanceProof<ark_bn254::Fr, C, T>,
     alloc: &mut VarAllocator,

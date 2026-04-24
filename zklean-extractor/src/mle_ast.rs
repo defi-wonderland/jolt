@@ -409,6 +409,51 @@ pub enum Node {
     AppendU64Transform(Edge),
 }
 
+impl Node {
+    /// Child `NodeId`s in left-to-right order. `Edge::Atom` children are
+    /// filtered out.
+    pub fn child_node_ids(&self) -> Vec<NodeId> {
+        fn edge_to_node_id(edge: Edge) -> Option<NodeId> {
+            match edge {
+                Edge::NodeRef(id) => Some(id),
+                Edge::Atom(_) => None,
+            }
+        }
+
+        match self {
+            Node::Atom(_) => Vec::new(),
+            Node::Neg(e)
+            | Node::Inv(e)
+            | Node::ByteReverse(e)
+            | Node::Truncate128Reverse(e)
+            | Node::Truncate128(e)
+            | Node::AppendU64Transform(e) => edge_to_node_id(*e).into_iter().collect(),
+            Node::Add(l, r) | Node::Mul(l, r) | Node::Sub(l, r) | Node::Div(l, r) => {
+                [edge_to_node_id(*l), edge_to_node_id(*r)]
+                    .into_iter()
+                    .flatten()
+                    .collect()
+            }
+            Node::TranscriptHash(hash_data, state, n_rounds) => {
+                // state, n_rounds, then hash_data children: gnark codegen
+                // post-order relies on this to keep `cse_K_N` numbering stable.
+                let mut children: Vec<NodeId> =
+                    [edge_to_node_id(*state), edge_to_node_id(*n_rounds)]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                children.extend(
+                    hash_data
+                        .as_slice()
+                        .iter()
+                        .filter_map(|e| edge_to_node_id(*e)),
+                );
+                children
+            }
+        }
+    }
+}
+
 /// An AST intended for representing an MLE computation (although it will actually work for any
 /// multivariate polynomial). The nodes are stored in a global arena, which allows each AST handle
 /// to remain [`Copy`] and [`Sized`] while supporting unbounded growth of the underlying graph.

@@ -7,7 +7,7 @@ use ark_bn254::Fr;
 use ark_ff::{Field, PrimeField};
 use light_poseidon::{Poseidon, PoseidonHasher};
 use std::collections::HashMap;
-use zklean_extractor::ast_bundle::Constraint;
+use zklean_extractor::ast_bundle::{Assertion, Constraint};
 use zklean_extractor::mle_ast::{Atom, Edge, Node, NodeId, Scalar, TranscriptHashData};
 
 /// Evaluate an Edge to a concrete Fr value.
@@ -156,9 +156,10 @@ pub struct AssertionValue {
 
 /// Evaluate all constraints in the bundle, returning LHS and RHS for each.
 ///
-/// For constraints with `EqualZero` assertion:
-/// - If root is `Sub(lhs, rhs)`: returns the two sides separately
-/// - Otherwise (e.g., sum_zero): LHS = the expression, RHS = 0
+/// Only supports `Assertion::EqualZero`. If the root is `Sub(lhs, rhs)` the
+/// two sides are returned separately; otherwise LHS is the expression and
+/// RHS is 0. Panics on `EqualPublicInput` or `EqualNode`, which crossval
+/// does not emit today.
 pub fn evaluate_assertions(
     nodes: &[Node],
     constraints: &[Constraint],
@@ -168,6 +169,18 @@ pub fn evaluate_assertions(
     let mut results = Vec::new();
 
     for constraint in constraints {
+        match &constraint.assertion {
+            Assertion::EqualZero => {}
+            Assertion::EqualPublicInput { name } => panic!(
+                "evaluate_assertions: Assertion::EqualPublicInput (name={name}) not supported. \
+                 Update ast_evaluator.rs if crossval needs to handle this variant."
+            ),
+            Assertion::EqualNode(other) => panic!(
+                "evaluate_assertions: Assertion::EqualNode(other={other}) not supported. \
+                 Update ast_evaluator.rs if crossval needs to handle this variant."
+            ),
+        }
+
         let root_node = &nodes[constraint.root];
 
         let (lhs, rhs) = match root_node {
@@ -221,14 +234,61 @@ mod tests {
         assert_eq!(val, Fr::from(42u64));
     }
 
+    // Pins the output of `light_poseidon::new_circom(3)` for two inputs, so a
+    // version bump that silently changes the parameters trips this test. The
+    // same decimals live in transpiler/go/poseidon/poseidon_test.go, which is
+    // what actually cross-checks Go against Rust.
     #[test]
-    fn test_poseidon_hash_zeros() {
-        // Verify our Poseidon evaluation matches known test vectors
-        let mut hasher = Poseidon::<Fr>::new_circom(3).unwrap();
-        let result = hasher
-            .hash(&[Fr::from(0u64), Fr::from(0u64), Fr::from(0u64)])
-            .unwrap();
-        // This should match Go's poseidon.Hash(0, 0, 0)
-        assert_ne!(result, Fr::from(0u64)); // just verify it's non-trivial
+    fn test_light_poseidon_output_pinned() {
+        use std::str::FromStr;
+
+        let cases: [([Fr; 3], &str); 2] = [
+            (
+                [Fr::from(0u64), Fr::from(0u64), Fr::from(0u64)],
+                "5317387130258456662214331362918410991734007599705406860481038345552731150762",
+            ),
+            (
+                [Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)],
+                "6542985608222806190361240322586112750744169038454362455181422643027100751666",
+            ),
+        ];
+
+        for (inputs, expected_dec) in cases {
+            let mut hasher = Poseidon::<Fr>::new_circom(3).unwrap();
+            let got = hasher.hash(&inputs).unwrap();
+            let expected =
+                Fr::from_str(expected_dec).expect("reference vector is valid decimal Fr");
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "Assertion::EqualPublicInput")]
+    fn test_evaluate_assertions_panics_on_equal_public_input() {
+        use zklean_extractor::ast_bundle::{Assertion, Constraint};
+
+        let nodes = vec![Node::Atom(Atom::Scalar([0, 0, 0, 0]))];
+        let constraints = vec![Constraint {
+            name: "test".into(),
+            root: 0,
+            assertion: Assertion::EqualPublicInput { name: "x".into() },
+        }];
+        let witness = HashMap::new();
+        let _ = evaluate_assertions(&nodes, &constraints, &witness);
+    }
+
+    #[test]
+    #[should_panic(expected = "Assertion::EqualNode")]
+    fn test_evaluate_assertions_panics_on_equal_node() {
+        use zklean_extractor::ast_bundle::{Assertion, Constraint};
+
+        let nodes = vec![Node::Atom(Atom::Scalar([0, 0, 0, 0]))];
+        let constraints = vec![Constraint {
+            name: "test".into(),
+            root: 0,
+            assertion: Assertion::EqualNode(0),
+        }];
+        let witness = HashMap::new();
+        let _ = evaluate_assertions(&nodes, &constraints, &witness);
     }
 }
