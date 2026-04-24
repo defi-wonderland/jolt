@@ -65,44 +65,6 @@ use zklean_extractor::mle_ast::{
 };
 
 // =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// Extract child node IDs from a Node (used by generate_expr for traversal).
-fn node_children(node: &Node) -> Vec<usize> {
-    fn edge_to_child(edge: &Edge) -> Option<usize> {
-        match edge {
-            Edge::NodeRef(id) => Some(*id),
-            Edge::Atom(_) => None,
-        }
-    }
-
-    match node {
-        Node::Atom(_) => vec![],
-        Node::Neg(e)
-        | Node::Inv(e)
-        | Node::ByteReverse(e)
-        | Node::Truncate128Reverse(e)
-        | Node::Truncate128(e)
-        | Node::AppendU64Transform(e) => edge_to_child(e).into_iter().collect(),
-        Node::Add(e1, e2) | Node::Mul(e1, e2) | Node::Sub(e1, e2) | Node::Div(e1, e2) => {
-            [edge_to_child(e1), edge_to_child(e2)]
-                .into_iter()
-                .flatten()
-                .collect()
-        }
-        Node::TranscriptHash(hash_data, e1, e2) => {
-            let mut v: Vec<usize> = [edge_to_child(e1), edge_to_child(e2)]
-                .into_iter()
-                .flatten()
-                .collect();
-            v.extend(hash_data.as_slice().iter().filter_map(edge_to_child));
-            v
-        }
-    }
-}
-
-// =============================================================================
 // Types
 // =============================================================================
 
@@ -126,9 +88,9 @@ struct ProcessedConstraint {
     /// Constraint name (for comments and variable naming)
     name: String,
     /// Generated Go expression for the constraint's root
-    expr: String,
-    /// CSE bindings code for this constraint
-    bindings: String,
+    expr: Expr,
+    /// CSE bindings for this constraint, in declaration order.
+    bindings: Vec<(usize, Expr)>,
     /// The assertion type
     assertion: ConstraintAssertion,
     /// Whether the expression is entirely constant
@@ -136,9 +98,9 @@ struct ProcessedConstraint {
     /// Evaluated constant value (if is_const is true)
     const_val: Option<[u64; 4]>,
     /// Crossval: LHS expression (only for Sub roots in crossval mode)
-    crossval_lhs: Option<String>,
+    crossval_lhs: Option<Expr>,
     /// Crossval: RHS expression (only for Sub roots in crossval mode)
-    crossval_rhs: Option<String>,
+    crossval_rhs: Option<Expr>,
 }
 
 /// Assertion type for processed constraints (owned version of Assertion).
@@ -146,7 +108,7 @@ struct ProcessedConstraint {
 enum ConstraintAssertion {
     EqualZero,
     EqualPublicInput { name: String },
-    EqualNode { other_expr: String },
+    EqualNode { other_expr: Expr },
 }
 
 /// Memoized code generator that converts AST nodes to Gnark expressions.
@@ -160,9 +122,8 @@ enum ConstraintAssertion {
 ///
 /// ```ignore
 /// let mut codegen = GnarkCodeGen::new(&bundle.nodes, var_names, constraint_idx);
-/// codegen.count_refs(root_node_id);  // First pass: count references
-/// let expr = codegen.generate_expr(root_node_id);  // Second pass: generate code
-/// let bindings = codegen.bindings_code();  // Get CSE variable definitions
+/// let expr = codegen.generate_expr(root_node_id);     // Build structured Expr
+/// let bindings = codegen.take_bindings();              // (cse_idx, Expr) pairs
 /// ```
 ///
 /// # Per-Constraint Isolation
@@ -178,15 +139,63 @@ enum CseContext {
     Constraint(usize),
 }
 
+/// Fragment of a generated Go expression. Keeping CSE/GCSE references
+/// structured (instead of baking them into strings) lets the emit loop
+/// flip between `cse_K_N` and `cse[N]` at render time without re-parsing
+/// the source.
+#[derive(Clone, Debug)]
+pub(crate) enum ExprFragment {
+    Lit(String),
+    CseRef(usize),
+    GcseRef(usize),
+}
+
+pub(crate) type Expr = Vec<ExprFragment>;
+
+/// Conservative size estimate for an [`ExprFragment`]. Used by hoisting to
+/// decide when an inline expression would be too big for the Go compiler.
+fn fragment_len_estimate(f: &ExprFragment) -> usize {
+    match f {
+        ExprFragment::Lit(s) => s.len(),
+        // `cse[N]` / `gcse[N]` — assume 3 digits, still a coarse bound.
+        ExprFragment::CseRef(_) | ExprFragment::GcseRef(_) => 10,
+    }
+}
+
+/// Render an [`Expr`] to Go source. `constraint_idx` is required whenever a
+/// `CseRef` appears and `slice_mode` is false (named-var emission). With
+/// `slice_mode = true`, CSE references become `cse[N]` slice indexes and
+/// `constraint_idx` is ignored.
+fn render_expr(expr: &[ExprFragment], constraint_idx: Option<usize>, slice_mode: bool) -> String {
+    let mut out = String::new();
+    for frag in expr {
+        match frag {
+            ExprFragment::Lit(s) => out.push_str(s),
+            ExprFragment::CseRef(n) => {
+                if slice_mode {
+                    out.push_str(&format!("cse[{n}]"));
+                } else {
+                    let idx = constraint_idx
+                        .expect("render_expr: CseRef without constraint_idx (slice_mode=false)");
+                    out.push_str(&format!("cse_{idx}_{n}"));
+                }
+            }
+            ExprFragment::GcseRef(n) => out.push_str(&format!("gcse[{n}]")),
+        }
+    }
+    out
+}
+
 pub(crate) struct GnarkCodeGen<'a> {
     /// Reference to the node arena (from AstBundle.nodes)
     nodes: &'a [Node],
     /// Reference counts for each NodeId (computed in first pass)
     ref_counts: HashMap<usize, usize>,
-    /// Maps NodeId to CSE variable name (e.g., "cse_0" or "cse_3_0" for constraint 3)
-    pub(crate) generated: HashMap<usize, String>,
-    /// CSE variable definitions in order
-    bindings: Vec<String>,
+    /// Maps NodeId to its resolved expression (inline fragments or a single
+    /// CseRef/GcseRef if hoisted).
+    pub(crate) generated: HashMap<usize, Expr>,
+    /// CSE bindings in declaration order: `(cse_index, rhs_expression)`.
+    bindings: Vec<(usize, Expr)>,
     /// Next CSE variable index
     pub(crate) cse_counter: usize,
     /// Maps variable index to input name (e.g., 0 -> "UniSkipCoeff0")
@@ -224,9 +233,9 @@ impl<'a> GnarkCodeGen<'a> {
         }
 
         // Pre-populate `generated` for global CSE nodes so they resolve to gcse[i]
-        let mut generated = HashMap::new();
+        let mut generated: HashMap<usize, Expr> = HashMap::new();
         for (&node_id, &gcse_idx) in global_node_map {
-            generated.insert(node_id, format!("gcse[{gcse_idx}]"));
+            generated.insert(node_id, vec![ExprFragment::GcseRef(gcse_idx)]);
         }
 
         Self {
@@ -271,9 +280,9 @@ impl<'a> GnarkCodeGen<'a> {
         self.uses_poseidon
     }
 
-    /// Get all CSE bindings as Go code
-    pub(crate) fn bindings_code(&self) -> String {
-        self.bindings.join("")
+    /// Return all CSE bindings as (index, expression) pairs in declaration order.
+    pub(crate) fn take_bindings(&mut self) -> Vec<(usize, Expr)> {
+        std::mem::take(&mut self.bindings)
     }
 
     /// Generate Gnark expression for a node, with memoization based on ref count.
@@ -287,7 +296,7 @@ impl<'a> GnarkCodeGen<'a> {
     /// Uses iterative traversal to avoid stack overflow on deep ASTs.
     /// The Jolt verifier can produce ASTs with thousands of nodes in
     /// a single chain (e.g., sumcheck polynomial evaluations).
-    pub(crate) fn generate_expr(&mut self, root_node_id: usize) -> String {
+    pub(crate) fn generate_expr(&mut self, root_node_id: usize) -> Expr {
         // Phase 1: Build post-order traversal (children before parents)
         // We need to process nodes in an order where all children are processed before their parent
         let mut post_order: Vec<usize> = Vec::new();
@@ -307,11 +316,20 @@ impl<'a> GnarkCodeGen<'a> {
             }
             visited.insert(node_id);
 
+            // Nodes that already have a cached expression (globally hoisted
+            // or resolved earlier in this constraint) short-circuit: their
+            // descendants must not be walked, otherwise Phase 2 would emit
+            // unreferenced CSE bindings for them.
+            if self.generated.contains_key(&node_id) {
+                post_order.push(node_id);
+                continue;
+            }
+
             // Push this node back with children_processed = true
             stack.push((node_id, true));
 
             // Push unvisited children (reversed so left-to-right processing due to LIFO)
-            for child_id in node_children(&self.nodes[node_id]).into_iter().rev() {
+            for child_id in self.nodes[node_id].child_node_ids().into_iter().rev() {
                 if !visited.contains(&child_id) {
                     stack.push((child_id, false));
                 }
@@ -370,7 +388,15 @@ impl<'a> GnarkCodeGen<'a> {
                         TranscriptHashData::Poseidon(data_edge) => {
                             self.uses_poseidon = true;
                             let d = self.edge_to_gnark_iterative(*data_edge);
-                            format!("poseidon.Hash(api, {s}, {r}, {d})")
+                            let mut expr = Vec::with_capacity(s.len() + r.len() + d.len() + 4);
+                            expr.push(ExprFragment::Lit("poseidon.Hash(api, ".to_string()));
+                            expr.extend(s);
+                            expr.push(ExprFragment::Lit(", ".to_string()));
+                            expr.extend(r);
+                            expr.push(ExprFragment::Lit(", ".to_string()));
+                            expr.extend(d);
+                            expr.push(ExprFragment::Lit(")".to_string()));
+                            expr
                         }
                         TranscriptHashData::Blake2b(_data_edges) => {
                             todo!("Blake2b Go codegen will be implemented in Phase 4")
@@ -389,7 +415,13 @@ impl<'a> GnarkCodeGen<'a> {
                     // gnark has no api.Div; implement as Mul(a, Inverse(b))
                     let a = self.edge_to_gnark_iterative(e1);
                     let b_inv = self.edge_to_gnark_iterative(e2);
-                    format!("api.Mul({a}, api.Inverse({b_inv}))")
+                    let mut expr = Vec::with_capacity(a.len() + b_inv.len() + 3);
+                    expr.push(ExprFragment::Lit("api.Mul(".to_string()));
+                    expr.extend(a);
+                    expr.push(ExprFragment::Lit(", api.Inverse(".to_string()));
+                    expr.extend(b_inv);
+                    expr.push(ExprFragment::Lit("))".to_string()));
+                    expr
                 }
             };
 
@@ -401,22 +433,21 @@ impl<'a> GnarkCodeGen<'a> {
             const MAX_INLINE_EXPR_LEN: usize = 1000;
             let ref_count = self.ref_counts.get(&node_id).copied().unwrap_or(1);
             let is_global = self.cse_context == CseContext::Global;
+            let inline_len = expr.iter().map(fragment_len_estimate).sum::<usize>();
             let should_hoist = if is_global {
                 ref_count > 1
             } else {
-                ref_count > 1 || expr.len() > MAX_INLINE_EXPR_LEN
+                ref_count > 1 || inline_len > MAX_INLINE_EXPR_LEN
             };
             if should_hoist {
-                let var_name = self.make_cse_name();
+                let cse_idx = self.cse_counter;
                 self.cse_counter += 1;
-                if self.cse_context == CseContext::Global {
-                    // Global CSE: slice assignment (gcse[N] = expr)
-                    self.bindings.push(format!("\t{var_name} = {expr}\n"));
-                } else {
-                    // Per-constraint CSE: declaration (cse_K_N := expr)
-                    self.bindings.push(format!("\t{var_name} := {expr}\n"));
-                }
-                self.generated.insert(node_id, var_name);
+                let reference = match self.cse_context {
+                    CseContext::Global => ExprFragment::GcseRef(cse_idx),
+                    CseContext::Constraint(_) => ExprFragment::CseRef(cse_idx),
+                };
+                self.bindings.push((cse_idx, expr));
+                self.generated.insert(node_id, vec![reference]);
             } else {
                 // Store the expression for single-use nodes too, so children can reference it
                 self.generated.insert(node_id, expr);
@@ -438,59 +469,59 @@ impl<'a> GnarkCodeGen<'a> {
     }
 
     /// Generate a binary operation expression (api.Op(left, right))
-    fn binary_op(&mut self, op: &str, left: Edge, right: Edge) -> String {
+    fn binary_op(&mut self, op: &str, left: Edge, right: Edge) -> Expr {
         let l = self.edge_to_gnark_iterative(left);
         let r = self.edge_to_gnark_iterative(right);
-        format!("api.{op}({l}, {r})")
+        let mut expr = Vec::with_capacity(l.len() + r.len() + 3);
+        expr.push(ExprFragment::Lit(format!("api.{op}(")));
+        expr.extend(l);
+        expr.push(ExprFragment::Lit(", ".to_string()));
+        expr.extend(r);
+        expr.push(ExprFragment::Lit(")".to_string()));
+        expr
     }
 
-    /// Generate a unary operation expression (func(api, arg))
-    fn unary_op(&mut self, func: &str, arg: Edge) -> String {
+    /// Generate a unary operation expression (func(api, arg) or func(arg)).
+    fn unary_op(&mut self, func: &str, arg: Edge) -> Expr {
         let a = self.edge_to_gnark_iterative(arg);
-        // api.Inverse doesn't take api as first arg, poseidon helpers do
-        if func.starts_with("api.") {
-            format!("{func}({a})")
+        // api.Inverse doesn't take api as first arg, poseidon helpers do.
+        let prefix = if func.starts_with("api.") {
+            format!("{func}(")
         } else {
-            format!("{func}(api, {a})")
-        }
+            format!("{func}(api, ")
+        };
+        let mut expr = Vec::with_capacity(a.len() + 2);
+        expr.push(ExprFragment::Lit(prefix));
+        expr.extend(a);
+        expr.push(ExprFragment::Lit(")".to_string()));
+        expr
     }
 
     // -------------------------------------------------------------------------
     // Private helper methods
     // -------------------------------------------------------------------------
 
-    /// Generate a CSE variable name using the configured prefix
-    fn make_cse_name(&self) -> String {
-        match self.cse_context {
-            CseContext::Global => {
-                let cse_counter = self.cse_counter;
-                format!("gcse[{cse_counter}]")
-            }
-            CseContext::Constraint(idx) => {
-                let cse_counter = self.cse_counter;
-                format!("cse_{idx}_{cse_counter}")
-            }
-        }
-    }
-
     /// Generate Gnark expression for an atom
-    fn atom_to_gnark(&mut self, atom: Atom) -> String {
+    fn atom_to_gnark(&mut self, atom: Atom) -> Expr {
         match atom {
-            Atom::Scalar(value) => format_scalar_for_gnark(value),
-            Atom::Var(index) => self
-                .var_names
-                .get(&index)
-                .map(|name| format!("circuit.{}", sanitize_go_name(name)))
-                .unwrap_or_else(|| format!("circuit.X_{index}")),
+            Atom::Scalar(value) => vec![ExprFragment::Lit(format_scalar_for_gnark(value))],
+            Atom::Var(index) => {
+                let name = self
+                    .var_names
+                    .get(&index)
+                    .map(|name| format!("circuit.{}", sanitize_go_name(name)))
+                    .unwrap_or_else(|| format!("circuit.X_{index}"));
+                vec![ExprFragment::Lit(name)]
+            }
             Atom::NamedVar(index) => match self.cse_context {
-                CseContext::Global => format!("gcse[{index}]"),
-                CseContext::Constraint(idx) => format!("cse_{idx}_{index}"),
+                CseContext::Global => vec![ExprFragment::GcseRef(index)],
+                CseContext::Constraint(_) => vec![ExprFragment::CseRef(index)],
             },
         }
     }
 
     /// Non-recursive edge_to_gnark that looks up already-generated expressions
-    pub(crate) fn edge_to_gnark_iterative(&mut self, edge: Edge) -> String {
+    pub(crate) fn edge_to_gnark_iterative(&mut self, edge: Edge) -> Expr {
         match edge {
             Edge::Atom(atom) => self.atom_to_gnark(atom),
             Edge::NodeRef(node_id) => {
@@ -568,6 +599,90 @@ pub fn generate_circuit_from_bundle(
     }
 
     code
+}
+
+/// Build the Go source for `computeGlobalCse` (plus any split sub-part
+/// functions) over the globally-hoisted bindings in `bundle`. Returns
+/// `(code, uses_poseidon)`; the boolean feeds the import section.
+fn render_global_cse_functions(
+    bundle: &zklean_extractor::mle_ast::AstBundle,
+    var_names: &HashMap<u16, String>,
+    circuit_name: &str,
+) -> (String, bool) {
+    let global_bindings = &bundle.global_cse.bindings;
+    let num_global = global_bindings.len();
+    let mut global_codegen = GnarkCodeGen::new_global(&bundle.nodes, var_names, global_bindings);
+
+    // Generate expressions for all global nodes (in topological order)
+    for &node_id in global_bindings {
+        global_codegen.generate_expr(node_id);
+    }
+
+    assert_eq!(
+        global_codegen.cse_counter, num_global,
+        "global CSE counter ({}) != global bindings count ({}): index mapping would be inconsistent",
+        global_codegen.cse_counter, num_global
+    );
+
+    let uses_poseidon = global_codegen.uses_poseidon();
+    let global_bindings = global_codegen.take_bindings();
+
+    const MAX_GLOBAL_BINDING_LINES: usize = 2000;
+    let needs_global_splitting = global_bindings.len() > MAX_GLOBAL_BINDING_LINES;
+
+    let mut output = String::new();
+
+    if needs_global_splitting {
+        let num_parts = global_bindings.len().div_ceil(MAX_GLOBAL_BINDING_LINES);
+        for part in 0..num_parts {
+            let start = part * MAX_GLOBAL_BINDING_LINES;
+            let end = std::cmp::min(start + MAX_GLOBAL_BINDING_LINES, global_bindings.len());
+
+            output.push_str(&format!(
+                "func (circuit *{circuit_name}) computeGlobalCsePart{part}(api frontend.API, gcse []frontend.Variable) {{\n"
+            ));
+            for (cse_idx, rhs) in &global_bindings[start..end] {
+                let rendered = render_expr(rhs, None, false);
+                output.push_str(&format!("\tgcse[{cse_idx}] = {rendered}\n"));
+            }
+            output.push_str("}\n\n");
+        }
+
+        output.push_str(&format!(
+            "// computeGlobalCse computes {num_global} nodes shared across multiple constraints.\n"
+        ));
+        output.push_str(&format!(
+            "func (circuit *{circuit_name}) computeGlobalCse(api frontend.API) []frontend.Variable {{\n"
+        ));
+        output.push_str(&format!(
+            "\tgcse := make([]frontend.Variable, {num_global})\n"
+        ));
+        for part in 0..num_parts {
+            output.push_str(&format!(
+                "\tcircuit.computeGlobalCsePart{part}(api, gcse)\n"
+            ));
+        }
+        output.push_str("\treturn gcse\n");
+        output.push_str("}\n\n");
+    } else {
+        output.push_str(&format!(
+            "// computeGlobalCse computes {num_global} nodes shared across multiple constraints.\n"
+        ));
+        output.push_str(&format!(
+            "func (circuit *{circuit_name}) computeGlobalCse(api frontend.API) []frontend.Variable {{\n"
+        ));
+        output.push_str(&format!(
+            "\tgcse := make([]frontend.Variable, {num_global})\n"
+        ));
+        for (cse_idx, rhs) in &global_bindings {
+            let rendered = render_expr(rhs, None, false);
+            output.push_str(&format!("\tgcse[{cse_idx}] = {rendered}\n"));
+        }
+        output.push_str("\treturn gcse\n");
+        output.push_str("}\n\n");
+    }
+
+    (output, uses_poseidon)
 }
 
 /// Generate a complete Gnark circuit from an AstBundle, returning statistics.
@@ -651,7 +766,7 @@ pub fn generate_circuit_from_bundle_with_stats(
 
         // Generate expression for this constraint.
         // In crossval mode, for Sub roots, generate lhs and rhs separately for api.Println hooks.
-        let (expr, crossval_lhs, crossval_rhs) = if crossval {
+        let (expr, crossval_lhs, crossval_rhs): (Expr, Option<Expr>, Option<Expr>) = if crossval {
             if let Node::Sub(lhs_edge, rhs_edge) = bundle.nodes[c.root].clone() {
                 // Generate subtrees for both edges first
                 if let Edge::NodeRef(id) = lhs_edge {
@@ -663,7 +778,12 @@ pub fn generate_circuit_from_bundle_with_stats(
                 // Now resolve edges (subtrees are in codegen.generated)
                 let lhs_expr = codegen.edge_to_gnark_iterative(lhs_edge);
                 let rhs_expr = codegen.edge_to_gnark_iterative(rhs_edge);
-                let full_expr = format!("api.Sub({}, {})", &lhs_expr, &rhs_expr);
+                let mut full_expr: Expr = Vec::with_capacity(lhs_expr.len() + rhs_expr.len() + 3);
+                full_expr.push(ExprFragment::Lit("api.Sub(".to_string()));
+                full_expr.extend(lhs_expr.clone());
+                full_expr.push(ExprFragment::Lit(", ".to_string()));
+                full_expr.extend(rhs_expr.clone());
+                full_expr.push(ExprFragment::Lit(")".to_string()));
                 codegen.generated.insert(c.root, full_expr.clone());
                 (full_expr, Some(lhs_expr), Some(rhs_expr))
             } else {
@@ -700,15 +820,7 @@ pub fn generate_circuit_from_bundle_with_stats(
             stats.uses_poseidon = true;
         }
 
-        // Get bindings (will be empty string if none)
-        let bindings = if codegen.bindings_code().is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\t// CSE bindings for constraint {constraint_idx}\n{}",
-                codegen.bindings_code()
-            )
-        };
+        let bindings = codegen.take_bindings();
 
         processed_constraints.push(ProcessedConstraint {
             name: c.name.clone(),
@@ -723,6 +835,19 @@ pub fn generate_circuit_from_bundle_with_stats(
     }
 
     stats.total_constraints = processed_constraints.len();
+
+    // Render global CSE first so `uses_poseidon` is known before the imports
+    // are written.
+    let global_cse_code: String = if has_global_cse {
+        let (code, global_uses_poseidon) =
+            render_global_cse_functions(bundle, &var_names, &circuit_name);
+        if global_uses_poseidon {
+            stats.uses_poseidon = true;
+        }
+        code
+    } else {
+        String::new()
+    };
 
     // Collect all struct field names with their target field types
     // Using BTreeMap to deduplicate by name while preserving field type
@@ -800,95 +925,8 @@ pub fn generate_circuit_from_bundle_with_stats(
     }
     output.push_str("}\n\n");
 
-    // Emit global CSE function if there are global bindings
-    if has_global_cse {
-        let global_bindings = &bundle.global_cse.bindings;
-        let num_global = global_bindings.len();
-        let mut global_codegen =
-            GnarkCodeGen::new_global(&bundle.nodes, &var_names, global_bindings);
-
-        // Generate expressions for all global nodes (in topological order)
-        for &node_id in global_bindings {
-            global_codegen.generate_expr(node_id);
-        }
-
-        assert_eq!(
-            global_codegen.cse_counter, num_global,
-            "global CSE counter ({}) != global bindings count ({}): index mapping would be inconsistent",
-            global_codegen.cse_counter, num_global
-        );
-
-        if global_codegen.uses_poseidon() {
-            stats.uses_poseidon = true;
-        }
-
-        let global_bindings_code = global_codegen.bindings_code();
-
-        // Split into sub-functions if too large
-        let global_binding_lines: Vec<&str> = if global_bindings_code.is_empty() {
-            Vec::new()
-        } else {
-            global_bindings_code
-                .lines()
-                .filter(|l| !l.is_empty())
-                .collect()
-        };
-
-        const MAX_GLOBAL_BINDING_LINES: usize = 2000;
-        let needs_global_splitting = global_binding_lines.len() > MAX_GLOBAL_BINDING_LINES;
-
-        if needs_global_splitting {
-            let num_parts = global_binding_lines
-                .len()
-                .div_ceil(MAX_GLOBAL_BINDING_LINES);
-            for part in 0..num_parts {
-                let start = part * MAX_GLOBAL_BINDING_LINES;
-                let end =
-                    std::cmp::min(start + MAX_GLOBAL_BINDING_LINES, global_binding_lines.len());
-
-                output.push_str(&format!(
-                    "func (circuit *{circuit_name}) computeGlobalCsePart{part}(api frontend.API, gcse []frontend.Variable) {{\n"
-                ));
-                for line in &global_binding_lines[start..end] {
-                    output.push_str(line);
-                    output.push('\n');
-                }
-                output.push_str("}\n\n");
-            }
-
-            output.push_str(&format!(
-                "// computeGlobalCse computes {num_global} nodes shared across multiple constraints.\n"
-            ));
-            output.push_str(&format!(
-                "func (circuit *{circuit_name}) computeGlobalCse(api frontend.API) []frontend.Variable {{\n"
-            ));
-            output.push_str(&format!(
-                "\tgcse := make([]frontend.Variable, {num_global})\n"
-            ));
-            for part in 0..num_parts {
-                output.push_str(&format!(
-                    "\tcircuit.computeGlobalCsePart{part}(api, gcse)\n"
-                ));
-            }
-            output.push_str("\treturn gcse\n");
-            output.push_str("}\n\n");
-        } else {
-            output.push_str(&format!(
-                "// computeGlobalCse computes {num_global} nodes shared across multiple constraints.\n"
-            ));
-            output.push_str(&format!(
-                "func (circuit *{circuit_name}) computeGlobalCse(api frontend.API) []frontend.Variable {{\n"
-            ));
-            output.push_str(&format!(
-                "\tgcse := make([]frontend.Variable, {num_global})\n"
-            ));
-            if !global_bindings_code.is_empty() {
-                output.push_str(&global_bindings_code);
-            }
-            output.push_str("\treturn gcse\n");
-            output.push_str("}\n\n");
-        }
-    }
+    // Emit global CSE functions (built earlier into `global_cse_code`)
+    output.push_str(&global_cse_code);
 
     // Emit per-constraint helper methods.
     // Each constraint gets its own function to avoid arm64 "branch too far" compiler
@@ -919,34 +957,31 @@ pub fn generate_circuit_from_bundle_with_stats(
                     continue;
                 }
             } else {
-                // Constant != 0 - static failure, emit warning comment but still generate constraint
+                // Static failure. Skip the body in normal mode (callers check
+                // `stats.constant_failed`); keep it under crossval for inspection.
                 output.push_str(&format!("// {} STATIC FAILURE: constant != 0\n", pc.name));
                 stats.constant_failed += 1;
                 stats.failed_names.push(pc.name.clone());
+                if !crossval {
+                    continue;
+                }
             }
         }
 
         let func_name = format!("verifyConstraint{idx}");
         constraint_func_names.push(func_name.clone());
 
-        // Count binding lines to decide if we need sub-function splitting
-        let binding_lines: Vec<&str> = if pc.bindings.is_empty() {
-            Vec::new()
-        } else {
-            pc.bindings.lines().filter(|l| !l.is_empty()).collect()
-        };
-
-        let needs_splitting = binding_lines.len() > MAX_BINDING_LINES;
+        let num_bindings = pc.bindings.len();
+        let needs_splitting = num_bindings > MAX_BINDING_LINES;
+        // In splitting mode, sub-functions share bindings via a `cse` slice,
+        // so CSE references render as `cse[N]`. Otherwise they render as
+        // `cse_K_N` named vars.
+        let slice_mode = needs_splitting;
         let var_name = sanitize_go_name(&pc.name);
 
         if needs_splitting {
-            // Split bindings into sub-functions that share state via a slice.
-            // CSE bindings reference each other by name (cse_K_N). We rewrite them
-            // to use a slice (cse[N]) so sub-functions can share intermediate values.
-            let num_bindings = binding_lines.len();
             let num_parts = num_bindings.div_ceil(MAX_BINDING_LINES);
 
-            // Emit sub-functions for binding batches
             for part in 0..num_parts {
                 let start = part * MAX_BINDING_LINES;
                 let end = std::cmp::min(start + MAX_BINDING_LINES, num_bindings);
@@ -954,19 +989,18 @@ pub fn generate_circuit_from_bundle_with_stats(
                 output.push_str(&format!(
                     "func (circuit *{circuit_name}) {func_name}Bindings{part}(api frontend.API, cse []frontend.Variable{gcse_param}) {{\n"
                 ));
+                if part == 0 {
+                    output.push_str(&format!("\t// CSE bindings for constraint {idx}\n"));
+                }
 
-                for line in &binding_lines[start..end] {
-                    // Rewrite "cse_K_N := expr" to "cse[N] = expr" and
-                    // references to "cse_K_M" to "cse[M]" within the expression
-                    let rewritten = rewrite_cse_names_to_slice(line, idx, true);
-                    output.push_str(&rewritten);
-                    output.push('\n');
+                for (cse_idx, rhs) in &pc.bindings[start..end] {
+                    let rendered = render_expr(rhs, Some(idx), true);
+                    output.push_str(&format!("\tcse[{cse_idx}] = {rendered}\n"));
                 }
 
                 output.push_str("}\n\n");
             }
 
-            // Emit the main constraint function that calls sub-functions
             let gcse_arg = if has_global_cse { ", gcse" } else { "" };
             output.push_str(&format!("// {func_name} verifies: {}\n", pc.name));
             output.push_str(&format!(
@@ -982,38 +1016,33 @@ pub fn generate_circuit_from_bundle_with_stats(
                 ));
             }
 
-            // Rewrite the final expression to use cse[N] references
-            let rewritten_expr = rewrite_cse_names_to_slice(&pc.expr, idx, false);
-            output.push_str(&format!("\t{var_name} := {rewritten_expr}\n"));
+            let rendered_expr = render_expr(&pc.expr, Some(idx), true);
+            output.push_str(&format!("\t{var_name} := {rendered_expr}\n"));
         } else {
-            // Small constraint: emit as a single function with named CSE variables
             output.push_str(&format!("// {func_name} verifies: {}\n", pc.name));
             output.push_str(&format!(
                 "func (circuit *{circuit_name}) {func_name}(api frontend.API{gcse_param}) {{\n"
             ));
 
             if !pc.bindings.is_empty() {
-                output.push_str(&pc.bindings);
+                output.push_str(&format!("\t// CSE bindings for constraint {idx}\n"));
+                for (cse_idx, rhs) in &pc.bindings {
+                    let rendered = render_expr(rhs, Some(idx), false);
+                    output.push_str(&format!("\tcse_{idx}_{cse_idx} := {rendered}\n"));
+                }
             }
 
-            output.push_str(&format!("\t{var_name} := {}\n", pc.expr));
+            let rendered_expr = render_expr(&pc.expr, Some(idx), false);
+            output.push_str(&format!("\t{var_name} := {rendered_expr}\n"));
         }
 
         // Crossval: emit api.Println hooks for LHS/RHS before the assertion
         if crossval {
             if let (Some(lhs), Some(rhs)) = (&pc.crossval_lhs, &pc.crossval_rhs) {
-                let lhs_rewritten = if needs_splitting {
-                    rewrite_cse_names_to_slice(lhs, idx, false)
-                } else {
-                    lhs.clone()
-                };
-                let rhs_rewritten = if needs_splitting {
-                    rewrite_cse_names_to_slice(rhs, idx, false)
-                } else {
-                    rhs.clone()
-                };
-                output.push_str(&format!("\tcrossval_lhs_{idx} := {lhs_rewritten}\n"));
-                output.push_str(&format!("\tcrossval_rhs_{idx} := {rhs_rewritten}\n"));
+                let lhs_rendered = render_expr(lhs, Some(idx), slice_mode);
+                let rhs_rendered = render_expr(rhs, Some(idx), slice_mode);
+                output.push_str(&format!("\tcrossval_lhs_{idx} := {lhs_rendered}\n"));
+                output.push_str(&format!("\tcrossval_rhs_{idx} := {rhs_rendered}\n"));
                 output.push_str(&format!(
                     "\tapi.Println(\"a{idx}_lhs\", crossval_lhs_{idx})\n"
                 ));
@@ -1037,12 +1066,8 @@ pub fn generate_circuit_from_bundle_with_stats(
                 ));
             }
             ConstraintAssertion::EqualNode { other_expr } => {
-                let rewritten = if needs_splitting {
-                    rewrite_cse_names_to_slice(other_expr, idx, false)
-                } else {
-                    other_expr.clone()
-                };
-                output.push_str(&format!("\tapi.AssertIsEqual({var_name}, {rewritten})\n"));
+                let rendered = render_expr(other_expr, Some(idx), slice_mode);
+                output.push_str(&format!("\tapi.AssertIsEqual({var_name}, {rendered})\n"));
             }
         }
 
@@ -1069,39 +1094,6 @@ pub fn generate_circuit_from_bundle_with_stats(
     output.push_str("}\n");
 
     (output, stats)
-}
-
-/// Rewrite CSE named variables (`cse_K_N`) to slice indexing (`cse[N]`).
-///
-/// If `is_binding` is true, also converts the first `:=` to `=` (slice assignment).
-/// Used for both binding lines and expression references.
-fn rewrite_cse_names_to_slice(text: &str, constraint_idx: usize, is_binding: bool) -> String {
-    let prefix = format!("cse_{constraint_idx}_");
-    let mut result = String::with_capacity(text.len());
-    let mut i = 0;
-    let bytes = text.as_bytes();
-
-    while i < bytes.len() {
-        if text[i..].starts_with(&prefix) {
-            let num_start = i + prefix.len();
-            let mut num_end = num_start;
-            while num_end < bytes.len() && bytes[num_end].is_ascii_digit() {
-                num_end += 1;
-            }
-            let num = &text[num_start..num_end];
-            result.push_str(&format!("cse[{num}]"));
-            i = num_end;
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
-        }
-    }
-
-    if is_binding {
-        result.replacen(":=", "=", 1)
-    } else {
-        result
-    }
 }
 
 /// Sanitize a name for use as a Go identifier (PascalCase with underscores).
@@ -1441,5 +1433,107 @@ mod tests {
             sanitize_go_name("bytecode_v_init_final"),
             "Bytecode_V_Init_Final"
         );
+    }
+
+    fn build_bundle_all_poseidon_hoisted() -> AstBundle {
+        use zklean_extractor::mle_ast::{Atom, Edge, Node, TranscriptHashData};
+
+        let mut bundle = AstBundle::new();
+        bundle.add_input(0, "state", WitnessType::ProofData);
+        bundle.add_input(1, "rounds", WitnessType::ProofData);
+        bundle.add_input(2, "data", WitnessType::ProofData);
+
+        bundle.nodes.push(Node::TranscriptHash(
+            TranscriptHashData::Poseidon(Edge::Atom(Atom::Var(2))),
+            Edge::Atom(Atom::Var(0)),
+            Edge::Atom(Atom::Var(1)),
+        ));
+
+        // Two constraints share the hash node so it gets globally hoisted.
+        bundle.add_constraint_eq_zero("a0", 0);
+        bundle.add_constraint_eq_zero("a1", 0);
+
+        bundle.run_global_cse();
+        bundle.run_cse();
+        bundle
+    }
+
+    #[test]
+    fn test_poseidon_import_emitted_when_all_hoisted() {
+        let bundle = build_bundle_all_poseidon_hoisted();
+        assert_eq!(bundle.global_cse.bindings.len(), 1);
+
+        let code = generate_circuit_from_bundle(&bundle, "TestCircuit");
+        assert!(code.contains("\"jolt_verifier/poseidon\""));
+        assert!(code.contains("poseidon.Hash"));
+    }
+
+    #[test]
+    fn test_global_cse_bindings_deterministic() {
+        let reference = build_bundle_all_poseidon_hoisted().global_cse.bindings;
+        for _ in 0..30 {
+            let run = build_bundle_all_poseidon_hoisted().global_cse.bindings;
+            assert_eq!(run, reference);
+        }
+    }
+
+    #[test]
+    fn test_constant_failure_skips_function_emission() {
+        use zklean_extractor::mle_ast::{Atom, Node};
+
+        let mut bundle = AstBundle::new();
+        // Constant scalar 5 as root: asserts (5 == 0), which is false.
+        bundle.nodes.push(Node::Atom(Atom::Scalar([5, 0, 0, 0])));
+        bundle.add_constraint_eq_zero("will_fail", 0);
+
+        bundle.run_global_cse();
+        bundle.run_cse();
+
+        let (code, stats) = generate_circuit_from_bundle_with_stats(&bundle, "TestCircuit", false);
+        assert_eq!(stats.constant_failed, 1);
+        assert!(!code.contains("verifyConstraint0"));
+
+        let (crossval_code, _) =
+            generate_circuit_from_bundle_with_stats(&bundle, "TestCircuit", true);
+        assert!(crossval_code.contains("verifyConstraint0"));
+    }
+
+    #[test]
+    fn test_render_expr_named_vs_slice() {
+        let expr = vec![
+            ExprFragment::Lit("api.Mul(".to_string()),
+            ExprFragment::CseRef(5),
+            ExprFragment::Lit(", ".to_string()),
+            ExprFragment::CseRef(12),
+            ExprFragment::Lit(")".to_string()),
+        ];
+        assert_eq!(
+            render_expr(&expr, Some(3), false),
+            "api.Mul(cse_3_5, cse_3_12)"
+        );
+        assert_eq!(render_expr(&expr, None, true), "api.Mul(cse[5], cse[12])");
+    }
+
+    #[test]
+    fn test_render_expr_gcse_ref_is_context_free() {
+        let expr = vec![
+            ExprFragment::Lit("api.Add(".to_string()),
+            ExprFragment::GcseRef(7),
+            ExprFragment::Lit(", ".to_string()),
+            ExprFragment::CseRef(2),
+            ExprFragment::Lit(")".to_string()),
+        ];
+        assert_eq!(
+            render_expr(&expr, Some(0), false),
+            "api.Add(gcse[7], cse_0_2)"
+        );
+        assert_eq!(render_expr(&expr, None, true), "api.Add(gcse[7], cse[2])");
+    }
+
+    #[test]
+    #[should_panic(expected = "CseRef without constraint_idx")]
+    fn test_render_expr_panics_on_cse_ref_without_context() {
+        let expr = vec![ExprFragment::CseRef(0)];
+        let _ = render_expr(&expr, None, false);
     }
 }

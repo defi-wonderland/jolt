@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use std::collections::{HashMap, HashSet};
 
-use crate::mle_ast::{node_arena, set_pending_commitment_chunks, Edge, MleAst, Node, NodeId};
+use crate::mle_ast::{node_arena, set_pending_commitment_chunks, MleAst, Node, NodeId};
 
 // =============================================================================
 // Input and Constraint Types
@@ -375,8 +375,12 @@ impl AstBundle {
         let mut visited: HashSet<NodeId> = HashSet::new();
         let mut stack: Vec<(NodeId, bool)> = Vec::new();
 
-        // Start from all nodes in the subset
-        for &node_id in subset {
+        // HashSet iteration uses RandomState; sort the seeds so the post-order
+        // is stable across runs (matters for disjoint sub-DAGs).
+        let mut sorted_roots: Vec<NodeId> = subset.iter().copied().collect();
+        sorted_roots.sort_unstable();
+
+        for &node_id in &sorted_roots {
             if visited.contains(&node_id) {
                 continue;
             }
@@ -422,7 +426,7 @@ impl AstBundle {
     /// ```ignore
     /// bundle.snapshot_arena();
     /// bundle.run_global_cse();
-    /// bundle.run_cse();
+    /// bundle.run_cse();   
     /// // Now generate code. CSE bindings are pre-computed
     /// ```
     pub fn run_cse(&mut self) {
@@ -521,39 +525,10 @@ impl AstBundle {
         post_order
     }
 
-    /// Get child NodeIds for a node.
+    /// Get child NodeIds for a node. Delegates to [`Node::child_node_ids`]
+    /// (single source of truth for Node traversal).
     fn node_children(&self, node_id: NodeId) -> Vec<NodeId> {
-        fn edge_to_node_id(edge: Edge) -> Option<NodeId> {
-            match edge {
-                Edge::NodeRef(id) => Some(id),
-                Edge::Atom(_) => None,
-            }
-        }
-
-        match &self.nodes[node_id] {
-            Node::Atom(_) => vec![],
-            Node::Neg(e) | Node::Inv(e) => edge_to_node_id(*e).into_iter().collect(),
-            Node::ByteReverse(e)
-            | Node::Truncate128Reverse(e)
-            | Node::Truncate128(e)
-            | Node::AppendU64Transform(e) => edge_to_node_id(*e).into_iter().collect(),
-            Node::Add(l, r) | Node::Mul(l, r) | Node::Sub(l, r) | Node::Div(l, r) => {
-                [edge_to_node_id(*l), edge_to_node_id(*r)]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-            }
-            Node::TranscriptHash(hash_data, state, n_rounds) => {
-                let mut children: Vec<NodeId> = hash_data
-                    .as_slice()
-                    .iter()
-                    .filter_map(|e| edge_to_node_id(*e))
-                    .collect();
-                children.extend(edge_to_node_id(*state));
-                children.extend(edge_to_node_id(*n_rounds));
-                children
-            }
-        }
+        self.nodes[node_id].child_node_ids()
     }
 
     /// Check if CSE has been computed for this bundle.
