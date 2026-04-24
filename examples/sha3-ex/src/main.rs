@@ -1,8 +1,11 @@
+use jolt_sdk::serialize_and_print_size;
 use std::time::Instant;
 use tracing::info;
 
 pub fn main() {
     tracing_subscriber::fmt::init();
+
+    let save_to_disk = std::env::args().any(|arg| arg == "--save");
 
     let target_dir = "/tmp/jolt-guest-targets";
     let mut program = guest::compile_sha3(target_dir);
@@ -14,6 +17,15 @@ pub fn main() {
         None,
     );
 
+    if save_to_disk {
+        serialize_and_print_size(
+            "Verifier Preprocessing",
+            "/tmp/jolt_verifier_preprocessing.dat",
+            &verifier_preprocessing,
+        )
+        .expect("Could not serialize preprocessing.");
+    }
+
     let prove_sha3 = guest::build_prover_sha3(program, prover_preprocessing);
     let verify_sha3 = guest::build_verifier_sha3(verifier_preprocessing);
 
@@ -22,6 +34,14 @@ pub fn main() {
     let now = Instant::now();
     let (output, proof, program_io) = prove_sha3(input);
     info!("Prover runtime: {} s", now.elapsed().as_secs_f64());
+
+    if save_to_disk {
+        serialize_and_print_size("Proof", "/tmp/sha3_proof.bin", &proof)
+            .expect("Could not serialize proof.");
+        serialize_and_print_size("io_device", "/tmp/sha3_io_device.bin", &program_io)
+            .expect("Could not serialize io_device.");
+    }
+
     let is_valid = verify_sha3(input, output, program_io.panic, proof);
 
     assert_eq!(output, native_output, "output mismatch");

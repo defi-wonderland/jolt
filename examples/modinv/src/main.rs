@@ -1,8 +1,11 @@
+use jolt_sdk::serialize_and_print_size;
 use std::time::Instant;
 use tracing::info;
 
 pub fn main() {
     tracing_subscriber::fmt::init();
+
+    let save_to_disk = std::env::args().any(|arg| arg == "--save");
 
     let target_dir = "/tmp/jolt-guest-targets";
 
@@ -20,6 +23,16 @@ pub fn main() {
     let verifier_setup = prover_preprocessing.generators.to_verifier_setup();
     let verifier_preprocessing =
         guest::preprocess_verifier_modinv(shared_preprocessing, verifier_setup, None);
+
+    if save_to_disk {
+        serialize_and_print_size(
+            "Verifier Preprocessing",
+            "/tmp/jolt_verifier_preprocessing.dat",
+            &verifier_preprocessing,
+        )
+        .expect("Could not serialize preprocessing.");
+    }
+
     let prove_modinv = guest::build_prover_modinv(program, prover_preprocessing);
     let verify_modinv = guest::build_verifier_modinv(verifier_preprocessing);
 
@@ -27,6 +40,13 @@ pub fn main() {
     let (output_advice, proof_advice, io_device_advice) = prove_modinv(a, m);
     let prove_time_advice = now.elapsed();
     info!("Prover runtime: {} s", prove_time_advice.as_secs_f64());
+
+    if save_to_disk {
+        serialize_and_print_size("Proof", "/tmp/modinv_proof.bin", &proof_advice)
+            .expect("Could not serialize proof.");
+        serialize_and_print_size("io_device", "/tmp/modinv_io_device.bin", &io_device_advice)
+            .expect("Could not serialize io_device.");
+    }
 
     let trace_length_advice = proof_advice.trace_length;
 

@@ -186,6 +186,104 @@ func TestEndToEndMerkleTree(t *testing.T) {
 	t.Log("========================================")
 }
 
+// runExamplePipeline is the generic end-to-end driver for examples that wire
+// `--save` to produce /tmp/<name>_proof.bin and /tmp/<name>_io_device.bin.
+//
+// Callers pass the cargo package name, the in-tree binary name (usually the
+// same), the prefix used for the saved artifacts, and any extra args for the
+// example binary after `--save` (e.g. fibonacci needs "50").
+func runExamplePipeline(t *testing.T, pkg, bin, prefix string, binArgs ...string) {
+	t.Helper()
+	t.Logf("=== End-to-End %s Pipeline ===", pkg)
+	root := getWorkspaceRoot()
+	_, thisFile, _, _ := runtime.Caller(0)
+	goDir := filepath.Dir(thisFile)
+
+	t.Logf("--- Step 0: Building Rust binaries (%s) ---", pkg)
+	runCommand(t, "build-"+pkg, root,
+		"cargo", "build", "-p", pkg, "--release",
+		"--features", "transcript-poseidon",
+	)
+	runCommand(t, "build-transpiler", root,
+		"cargo", "build", "-p", "transpiler", "--bin", "transpiler",
+	)
+	t.Log("Rust binaries ready")
+
+	totalStart := time.Now()
+
+	t.Logf("--- Step 1: %s Proof ---", pkg)
+	exampleBin := filepath.Join(root, "target", "release", bin)
+	exampleTime := runCommand(t, pkg, root,
+		exampleBin, append([]string{"--save"}, binArgs...)...,
+	)
+
+	t.Log("--- Step 2: Transpile ---")
+	transpilerBin := filepath.Join(root, "target", "debug", "transpiler")
+	transpileTime := runCommand(t, "transpiler", root,
+		transpilerBin,
+		"--proof", fmt.Sprintf("/tmp/%s_proof.bin", prefix),
+		"--io-device", fmt.Sprintf("/tmp/%s_io_device.bin", prefix),
+	)
+
+	t.Log("--- Step 3: Groth16 ---")
+	groth16Time := runCommand(t, "groth16", goDir,
+		"go", "test", "-run", "TestStagesCircuitProveVerify",
+		"-v", "-timeout", "25m", "-count=1",
+	)
+
+	resultsPath := filepath.Join(goDir, "groth16_results.json")
+	data, err := os.ReadFile(resultsPath)
+	if err != nil {
+		t.Fatalf("Failed to read groth16_results.json: %v", err)
+	}
+	var results map[string]float64
+	if err := json.Unmarshal(data, &results); err != nil {
+		t.Fatalf("Failed to parse groth16_results.json: %v", err)
+	}
+
+	totalTime := time.Since(totalStart)
+	t.Log("")
+	t.Log("========================================")
+	t.Logf("=== %s E2E Summary ===", pkg)
+	t.Log("========================================")
+	t.Logf("%s proof (Rust):     %v", pkg, exampleTime)
+	t.Logf("Transpile (Rust):        %v", transpileTime)
+	t.Logf("Circuit compile (Go):    %v", time.Duration(results["compile_ms"])*time.Millisecond)
+	t.Logf("Groth16 setup (Go):      %v", time.Duration(results["setup_ms"])*time.Millisecond)
+	t.Logf("Groth16 prove (Go):      %v", time.Duration(results["prove_ms"])*time.Millisecond)
+	t.Logf("Groth16 verify (Go):     %v", time.Duration(results["verify_ms"])*time.Millisecond)
+	t.Log("----------------------------------------")
+	t.Logf("TOTAL pipeline:          %v", totalTime)
+	t.Logf("Groth16 total:           %v", groth16Time)
+	t.Logf("Constraints:             %.0f", results["constraints"])
+	t.Logf("Proof size:              %.0f bytes", results["proof_bytes"])
+	t.Log("========================================")
+}
+
+// TestEndToEndMuldiv runs the E2E pipeline for the muldiv example.
+// Usage: go test -run TestEndToEndMuldiv -v -timeout 30m
+func TestEndToEndMuldiv(t *testing.T) {
+	runExamplePipeline(t, "muldiv", "muldiv", "muldiv")
+}
+
+// TestEndToEndCollatz runs the E2E pipeline for the collatz example.
+// Usage: go test -run TestEndToEndCollatz -v -timeout 30m
+func TestEndToEndCollatz(t *testing.T) {
+	runExamplePipeline(t, "collatz", "collatz", "collatz")
+}
+
+// TestEndToEndModinv runs the E2E pipeline for the modinv example.
+// Usage: go test -run TestEndToEndModinv -v -timeout 30m
+func TestEndToEndModinv(t *testing.T) {
+	runExamplePipeline(t, "modinv", "modinv", "modinv")
+}
+
+// TestEndToEndSha3 runs the E2E pipeline for the sha3-ex example.
+// Usage: go test -run TestEndToEndSha3 -v -timeout 30m
+func TestEndToEndSha3(t *testing.T) {
+	runExamplePipeline(t, "sha3-ex", "sha3-ex", "sha3")
+}
+
 // loadWitnessMap is a helper to load raw witness JSON
 func loadWitnessMap(path string) (map[string]string, error) {
 	data, err := os.ReadFile(path)
