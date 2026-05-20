@@ -1259,7 +1259,7 @@ fn node_requires_poseidon_import(nodes: &[Node], root: usize) -> bool {
             | Node::Truncate128Reverse(_)
             | Node::Truncate128(_)
             | Node::AppendU64Transform(_) => return true,
-            node => stack.extend(node_children(node)),
+            node => stack.extend(node.child_node_ids()),
         }
     }
 
