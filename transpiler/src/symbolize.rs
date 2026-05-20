@@ -26,15 +26,21 @@
 //! `fiat_shamir_preamble` (jolt-core/src/zkvm/mod.rs):
 //!
 //! ```text
-//! append_u64(max_input_size)   → raw_append_u64  (no FIFO)
-//! append_u64(max_output_size)  → raw_append_u64  (no FIFO)
-//! append_u64(heap_size)        → raw_append_u64  (no FIFO)
-//! append_bytes(inputs)         → raw_append_bytes → CONSUMES input chunk overrides
-//! append_bytes(outputs)        → raw_append_bytes → CONSUMES output chunk overrides
-//! append_u64(panic)            → raw_append_u64  (no FIFO)
-//! append_u64(ram_K)            → raw_append_u64  (no FIFO)
-//! append_u64(trace_length)     → raw_append_u64  (no FIFO)
+//! append_bytes(preprocessing_digest) → raw_append_bytes → CONSUMES 1 digest chunk (concrete)
+//! append_u64(max_input_size)         → raw_append_u64  (no FIFO)
+//! append_u64(max_output_size)        → raw_append_u64  (no FIFO)
+//! append_u64(heap_size)              → raw_append_u64  (no FIFO)
+//! append_bytes(inputs)               → raw_append_bytes → CONSUMES input chunk overrides
+//! append_bytes(outputs)              → raw_append_bytes → CONSUMES output chunk overrides
+//! append_u64(panic)                  → raw_append_u64  (no FIFO)
+//! append_u64(ram_K)                  → raw_append_u64  (no FIFO)
+//! append_u64(trace_length)           → raw_append_u64  (no FIFO)
 //! ```
+//!
+//! The `preprocessing_digest` override is pushed as a *concrete* MleAst constant
+//! (not a witness variable). It hashes the same bytes the verifier would hash
+//! without an override, but its presence in the FIFO keeps the subsequent
+//! input/output overrides aligned.
 //!
 //! After preamble the FIFO must be empty. If not, a stale override would corrupt
 //! the next `raw_append_bytes` call.
@@ -51,11 +57,17 @@ use crate::symbolic_traits::io_replay::push_bytes_override;
 /// Allocate symbolic witness variables for all IO values and set up interception
 /// points so that `verifier.verify()` uses them instead of concrete constants.
 ///
+/// `preprocessing_digest` is the Blake2b-256 digest of `JoltSharedPreprocessing`
+/// (from `preprocessing.shared.digest()`). It is hashed by `fiat_shamir_preamble`
+/// before the inputs/outputs, so we push it as the first FIFO override (as a
+/// concrete constant — it is program/class identity, not a per-execution input).
+///
 /// Returns `(input_words, output_words)` at u64-word granularity — these are
 /// passed to `PENDING_INITIAL_RAM` in main.rs so `eval_initial_ram_mle` can
 /// also use symbolic inputs.
 pub fn symbolize_io_device(
     io_device: &JoltDevice,
+    preprocessing_digest: &[u8; 32],
     var_alloc: &mut VarAllocator,
 ) -> (Vec<MleAst>, Vec<MleAst>) {
     // With padded-io: pad to max sizes so the FIFO and word vectors match
@@ -76,7 +88,8 @@ pub fn symbolize_io_device(
     //
     // One symbolic variable per 32-byte chunk. Consumed in order by
     // PoseidonAstTranscript::raw_append_bytes when fiat_shamir_preamble
-    // calls append_bytes(b"inputs", ...) and append_bytes(b"outputs", ...).
+    // calls append_bytes(b"preprocessing_digest"), append_bytes(b"inputs"),
+    // and append_bytes(b"outputs").
     //
     // Panic is NOT pushed into this FIFO because fiat_shamir_preamble sends
     // it via append_u64 → raw_append_u64 (a different code path that doesn't
@@ -86,6 +99,23 @@ pub fn symbolize_io_device(
     //      concrete constant into the Poseidon state (correct for Fiat-Shamir).
     //   2. RAM MLE: allocated as witness variable "io_panic_val" below, used
     //      by eval_io_mle for panic_contribution and termination checks.
+
+    // FIRST: preprocessing_digest (32 bytes = 1 chunk).
+    // Pushed as a concrete MleAst constant so it does not add a witness variable
+    // and yields the same hash as the fallback (no-override) path. Its only role
+    // is to consume the corresponding raw_append_bytes call in the preamble so
+    // that the subsequent input/output overrides remain correctly aligned.
+    //
+    // Matches the conversion in PoseidonAstTranscript::raw_append_bytes (32 LE
+    // bytes → [u64; 4] limbs → MleAst constant, no mod reduction).
+    let digest_limbs: [u64; 4] = {
+        let mut limbs = [0u64; 4];
+        for (i, chunk) in preprocessing_digest.chunks(8).enumerate() {
+            limbs[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        limbs
+    };
+    push_bytes_override(MleAst::from(digest_limbs));
 
     let _input_chunk_vars = push_byte_chunk_overrides(&input_bytes, "io_input_chunk", var_alloc);
 

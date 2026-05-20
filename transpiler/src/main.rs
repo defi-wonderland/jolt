@@ -290,8 +290,12 @@ fn main() {
     //    during fiat_shamir_preamble
     // 2. PENDING_IO_MLE: consumed by eval_io_mle during output sumcheck
     println!("\n=== Symbolizing IO Device ===");
-    let (eval_input_words, _eval_output_words) =
-        transpiler::symbolize::symbolize_io_device(&io_device, &mut var_alloc);
+    let preprocessing_digest = real_preprocessing.shared.digest();
+    let (eval_input_words, _eval_output_words) = transpiler::symbolize::symbolize_io_device(
+        &io_device,
+        &preprocessing_digest,
+        &mut var_alloc,
+    );
     println!("  IO input words: {}", eval_input_words.len());
 
     // Set PENDING_INITIAL_RAM: bytecode + inputs as symbolic
