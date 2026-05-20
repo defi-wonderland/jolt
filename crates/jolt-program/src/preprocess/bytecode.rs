@@ -25,9 +25,20 @@ pub struct BytecodePreprocessing {
 
 impl BytecodePreprocessing {
     pub fn preprocess(
+        bytecode: Vec<JoltInstructionRow>,
+        entry_address: u64,
+        profile: JoltInstructionProfile,
+    ) -> Result<Self, PreprocessingError> {
+        Self::preprocess_with_target(bytecode, entry_address, profile, None)
+    }
+
+    /// Like `preprocess`, but pads bytecode to `target_code_size` instead of the
+    /// minimum power-of-2. Used for size-class padding (cross-program universal circuits).
+    pub fn preprocess_with_target(
         mut bytecode: Vec<JoltInstructionRow>,
         entry_address: u64,
         profile: JoltInstructionProfile,
+        target_code_size: Option<usize>,
     ) -> Result<Self, PreprocessingError> {
         for instruction in &bytecode {
             if !profile.supports_jolt(instruction.instruction_kind) {
@@ -39,7 +50,21 @@ impl BytecodePreprocessing {
         bytecode.insert(0, noop_instruction());
         let pc_map = BytecodePCMapper::try_new(&bytecode)?;
 
-        let code_size = bytecode.len().next_power_of_two().max(2);
+        let code_size = if let Some(target) = target_code_size {
+            assert!(
+                bytecode.len() <= target,
+                "bytecode ({} instructions) exceeds target_code_size ({})",
+                bytecode.len(),
+                target,
+            );
+            assert!(
+                target.is_power_of_two(),
+                "target_code_size must be a power of 2"
+            );
+            target
+        } else {
+            bytecode.len().next_power_of_two().max(2)
+        };
         bytecode.resize(code_size, noop_instruction());
 
         Ok(Self {

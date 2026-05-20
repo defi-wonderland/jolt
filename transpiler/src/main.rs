@@ -38,9 +38,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use common::jolt_device::JoltDevice;
+use common::size_class::find_class;
 use jolt_core::curve::Bn254Curve;
 use jolt_core::poly::commitment::dory::{ArkGT, DoryCommitmentScheme};
+use jolt_core::poly::opening_proof::VerifierOpeningAccumulator;
 use jolt_core::transcripts::Transcript;
+use jolt_core::zkvm::bytecode::read_raf_checking::{
+    enable_capture_val_poly_evals, set_pending_val_poly_evals, take_captured_val_poly_evals,
+};
 use jolt_core::zkvm::transpilable_verifier::TranspilableVerifier;
 use jolt_core::zkvm::verifier::JoltVerifierPreprocessing;
 use jolt_core::zkvm::RV64IMACProof;
@@ -158,6 +163,21 @@ fn main() {
         "  memory_layout: {:?}",
         real_preprocessing.shared.memory_layout
     );
+    // Auto-detect size class from proof parameters
+    let log_t = real_proof.trace_length.trailing_zeros() as usize;
+    let bytecode_k = real_preprocessing.shared.bytecode.code_size;
+    let ram_k = real_proof.ram_K;
+    let detected_class = find_class(log_t, bytecode_k, ram_k);
+    if let Some(class) = detected_class {
+        println!(
+            "\n  Size class: {} (log_T={}, bytecode_K={}, ram_K={})",
+            class.name, log_t, bytecode_k, ram_k
+        );
+    } else {
+        println!(
+            "\n  No matching size class (log_T={log_t}, bytecode_K={bytecode_k}, ram_K={ram_k}), generating custom circuit"
+        );
+    }
 
     // Convert to symbolic preprocessing: replace Dory generators with AstVerifierSetup stub.
     // The `shared` field (memory layout, bytecode info) is reused as-is.
@@ -169,6 +189,56 @@ fn main() {
             shared: real_preprocessing.shared.clone(),
             blindfold_setup: None,
         };
+
+    // =========================================================================
+    // Step 1.5: Concrete pre-computation (universal circuit mode)
+    // =========================================================================
+    // Run a concrete (Fr) verification to capture the 5 val_poly evaluations
+    // from BytecodeReadRafSumcheck. These depend on the program's instruction data,
+    // which would otherwise bake concrete constants into the circuit. By capturing
+    // the evaluations and replacing them with witness variables, we make the circuit
+    // program-independent within a size class.
+    let captured_val_evals: Option<[ark_bn254::Fr; 5]> = if detected_class.is_some() {
+        println!("\n=== Concrete pre-computation (val_poly eval capture) ===");
+        enable_capture_val_poly_evals();
+
+        // Fresh copies: TranspilableVerifier::new() consumes proof and io_device
+        let concrete_proof: RV64IMACProof =
+            CanonicalDeserialize::deserialize_compressed(&proof_bytes[..])
+                .expect("Failed to re-deserialize proof for concrete verification");
+        let concrete_io: JoltDevice =
+            CanonicalDeserialize::deserialize_compressed(&io_device_bytes[..])
+                .expect("Failed to re-deserialize io_device for concrete verification");
+
+        let concrete_trusted_advice: Option<ArkGT> = args.trusted_advice.as_ref().map(|path| {
+            let bytes = std::fs::read(path).expect("Failed to re-read trusted advice");
+            let commitment: Option<ArkGT> =
+                CanonicalDeserialize::deserialize_compressed(&bytes[..])
+                    .expect("Failed to re-deserialize trusted advice");
+            commitment.expect("Trusted advice is None")
+        });
+
+        let concrete_verifier =
+            TranspilableVerifier::<_, _, _, _, VerifierOpeningAccumulator<ark_bn254::Fr>>::new(
+                &real_preprocessing,
+                concrete_proof,
+                concrete_io,
+                concrete_trusted_advice,
+                None,
+            )
+            .expect("Concrete verifier creation failed");
+
+        concrete_verifier
+            .verify()
+            .expect("Concrete verification failed (val_poly capture)");
+
+        let evals = take_captured_val_poly_evals::<ark_bn254::Fr>()
+            .expect("Val poly evals were not captured during concrete verification");
+        println!("  Captured {} val_poly evaluations", evals.len());
+        Some(evals)
+    } else {
+        None
+    };
 
     // =========================================================================
     // Step 2: Convert proof to symbolic representation
@@ -224,16 +294,21 @@ fn main() {
         transpiler::symbolize::symbolize_io_device(&io_device, &mut var_alloc);
     println!("  IO input words: {}", eval_input_words.len());
 
-    // Set PENDING_INITIAL_RAM: bytecode as constants, inputs as symbolic
+    // Set PENDING_INITIAL_RAM: bytecode + inputs as symbolic
     {
         use jolt_core::zkvm::ram::{set_pending_initial_ram, PendingInitialRamValues};
-        let bytecode_words: Vec<MleAst> = real_preprocessing
-            .shared
-            .ram
-            .bytecode_words
-            .iter()
-            .map(|&w| MleAst::from_u64(w))
-            .collect();
+        let raw_words = &real_preprocessing.shared.ram.bytecode_words;
+        let bytecode_words = if let Some(class) = detected_class {
+            // Universal mode: witness variables padded to fixed length per class
+            transpiler::symbolize::symbolize_bytecode_words(
+                raw_words,
+                class.max_program_words,
+                &mut var_alloc,
+            )
+        } else {
+            // No size class: constants (program-specific circuit)
+            raw_words.iter().map(|&w| MleAst::from_u64(w)).collect()
+        };
         set_pending_initial_ram(PendingInitialRamValues {
             bytecode_words,
             input_words: eval_input_words,
@@ -243,6 +318,22 @@ fn main() {
         "  Total symbolic variables after IO: {}",
         var_alloc.next_idx()
     );
+
+    // =========================================================================
+    // Step 2c: Symbolize val_poly evaluations (universal circuit mode)
+    // =========================================================================
+    // Replace the 5 val_poly evaluations (which depend on concrete instruction data)
+    // with witness variables. The concrete values were captured in Step 1.5.
+    if let Some(val_evals) = captured_val_evals {
+        let val_poly_witnesses: [MleAst; 5] = std::array::from_fn(|s| {
+            var_alloc.alloc_with_value(&format!("val_poly_eval_{s}"), &val_evals[s])
+        });
+        set_pending_val_poly_evals(val_poly_witnesses);
+        println!(
+            "  Symbolized 5 val_poly evaluations as witness variables (total vars: {})",
+            var_alloc.next_idx()
+        );
+    }
 
     // =========================================================================
     // Step 3: Set up symbolic verifier
@@ -362,10 +453,19 @@ fn main() {
     // Step 6: Resolve output directory and write bundle
     // =========================================================================
     let default_output_dir = match args.target {
-        TranspilationTarget::Gnark => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("go"),
+        TranspilationTarget::Gnark => {
+            let base = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("go");
+            if let Some(class) = detected_class {
+                base.join(format!("class_{}", class.name))
+            } else {
+                base
+            }
+        }
         TranspilationTarget::AstBundle => PathBuf::from("."),
     };
     let output_dir = args.output_dir.clone().unwrap_or(default_output_dir);
+    std::fs::create_dir_all(&output_dir)
+        .unwrap_or_else(|e| panic!("Failed to create output dir {output_dir:?}: {e}"));
 
     // Save bundle to JSON (common to all targets)
     let bundle_path = output_dir.join(BUNDLE_FILENAME);

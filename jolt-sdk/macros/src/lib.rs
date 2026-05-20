@@ -555,13 +555,30 @@ impl MacroBuilder {
                 };
                 let memory_layout = MemoryLayout::new(&memory_config);
 
-                let preprocessing = JoltSharedPreprocessing::new(
-                    bytecode,
-                    memory_layout,
-                    memory_init,
-                    #max_trace_length,
-                    e_entry,
-                )?;
+                let preprocessing = if let Some(class) = jolt::size_class::find_class_for_program(
+                    bytecode.len(),
+                    #max_trace_length as usize,
+                ) {
+                    let class_trace_length = 1usize << class.max_log_t;
+                    JoltSharedPreprocessing::new_with_targets(
+                        bytecode,
+                        memory_layout,
+                        memory_init,
+                        class_trace_length,
+                        e_entry,
+                        Some(class_trace_length),
+                        Some(class.max_ram_k),
+                        Some(class.max_bytecode_k),
+                    )?
+                } else {
+                    JoltSharedPreprocessing::new(
+                        bytecode,
+                        memory_layout,
+                        memory_init,
+                        #max_trace_length,
+                        e_entry,
+                    )?
+                };
 
                 Ok(preprocessing)
             }

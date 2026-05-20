@@ -7,3 +7,4 @@ extern crate alloc;
 pub mod attributes;
 pub mod constants;
 pub mod jolt_device;
+pub mod size_class;

@@ -81,19 +81,13 @@ fn run_go_crossval() -> Vec<GoAssertionValue> {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     if !output.status.success() {
-        panic!(
-            "Go crossval test failed!\nstdout:\n{}\nstderr:\n{}",
-            stdout, stderr
-        );
+        panic!("Go crossval test failed!\nstdout:\n{stdout}\nstderr:\n{stderr}");
     }
 
     // Read the JSON output
     let json_path = go_dir.join("go_crossval_values.json");
     let json_str = std::fs::read_to_string(&json_path).unwrap_or_else(|e| {
-        panic!(
-            "failed to read go_crossval_values.json: {}\nGo stdout:\n{}",
-            e, stdout
-        )
+        panic!("failed to read go_crossval_values.json: {e}\nGo stdout:\n{stdout}")
     });
 
     serde_json::from_str(&json_str).expect("failed to parse go_crossval_values.json")
@@ -227,15 +221,14 @@ fn test_cross_validation_80_values() {
     }
 
     println!("\n=== RESULTS ===");
-    println!("  {}/{} comparisons PASS", pass_count, total_comparisons);
+    println!("  {pass_count}/{total_comparisons} comparisons PASS");
     if fail_count > 0 {
-        println!("  {}/{} comparisons FAIL", fail_count, total_comparisons);
+        println!("  {fail_count}/{total_comparisons} comparisons FAIL");
     }
 
     assert_eq!(
         fail_count, 0,
-        "{} of {} comparisons mismatched!",
-        fail_count, total_comparisons
+        "{fail_count} of {total_comparisons} comparisons mismatched!"
     );
 
     // === Generate report ===
@@ -276,8 +269,7 @@ fn test_cross_validation_80_values() {
     }
 
     report.push_str(&format!(
-        "\nResult: {}/{} PASS, {}/{} FAIL\n",
-        pass_count, total_comparisons, fail_count, total_comparisons
+        "\nResult: {pass_count}/{total_comparisons} PASS, {fail_count}/{total_comparisons} FAIL\n"
     ));
 
     std::fs::write(&report_path, &report).expect("failed to write report");

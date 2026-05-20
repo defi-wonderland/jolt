@@ -375,7 +375,13 @@ impl<
         );
 
         let unpadded_trace_len = trace.len();
-        let padded_trace_len = if unpadded_trace_len < 256 {
+        let padded_trace_len = if let Some(target) = preprocessing.shared.target_trace_length {
+            assert!(
+                unpadded_trace_len < target,
+                "trace ({unpadded_trace_len} cycles) exceeds target_trace_length ({target})",
+            );
+            target
+        } else if unpadded_trace_len < 256 {
             256 // ensures that T >= k^{1/D}
         } else {
             (trace.len() + 1).next_power_of_two()
@@ -406,7 +412,7 @@ impl<
         trace.resize(padded_trace_len, Cycle::NoOp);
 
         // Calculate K for DoryGlobals initialization
-        let ram_K = trace
+        let computed_ram_K = trace
             .par_iter()
             .filter_map(|cycle| {
                 remap_address(
@@ -426,6 +432,16 @@ impl<
                     + 1,
             )
             .next_power_of_two() as usize;
+
+        let ram_K = if let Some(target) = preprocessing.shared.target_ram_k {
+            assert!(
+                computed_ram_K <= target,
+                "ram_K ({computed_ram_K}) exceeds target_ram_k ({target})",
+            );
+            target
+        } else {
+            computed_ram_K
+        };
 
         let transcript = ProofTranscript::new(b"Jolt");
         let opening_accumulator = ProverOpeningAccumulator::new(trace.len().log_2());

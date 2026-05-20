@@ -14,6 +14,7 @@ import (
 
 	"github.com/consensys/gnark-crypto/ecc"
 	"github.com/consensys/gnark/backend/groth16"
+	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/test"
@@ -183,6 +184,69 @@ func TestStagesCircuitSolver(t *testing.T) {
 	}
 }
 
+// cachedSetup runs Groth16 setup with disk caching. If pk/vk files exist in cacheDir,
+// they are loaded from disk. Otherwise, setup runs fresh and results are saved to disk.
+// Returns (pk, vk, setupTime, fromCache).
+func cachedSetup(
+	t *testing.T,
+	r1cs constraint.ConstraintSystem,
+	cacheDir string,
+) (groth16.ProvingKey, groth16.VerifyingKey, time.Duration, bool) {
+	pkPath := filepath.Join(cacheDir, "proving_key.bin")
+	vkPath := filepath.Join(cacheDir, "verifying_key.bin")
+
+	// Try loading from cache
+	if pkData, err := os.ReadFile(pkPath); err == nil {
+		if vkData, err := os.ReadFile(vkPath); err == nil {
+			t.Log("Loading cached pk/vk from disk...")
+			startLoad := time.Now()
+
+			pk := groth16.NewProvingKey(ecc.BN254)
+			if _, err := pk.ReadFrom(bytes.NewReader(pkData)); err != nil {
+				t.Logf("Warning: failed to read cached pk, running fresh setup: %v", err)
+			} else {
+				vk := groth16.NewVerifyingKey(ecc.BN254)
+				if _, err := vk.ReadFrom(bytes.NewReader(vkData)); err != nil {
+					t.Logf("Warning: failed to read cached vk, running fresh setup: %v", err)
+				} else {
+					loadTime := time.Since(startLoad)
+					t.Logf("Loaded cached pk (%.2f MB) + vk (%.2f KB) [%v]",
+						float64(len(pkData))/1024/1024, float64(len(vkData))/1024, loadTime)
+					return pk, vk, loadTime, true
+				}
+			}
+		}
+	}
+
+	// Fresh setup
+	t.Log("Running Groth16 setup (no cache found)...")
+	startSetup := time.Now()
+
+	pk, vk, err := groth16.Setup(r1cs)
+	if err != nil {
+		t.Fatalf("Failed to setup: %v", err)
+	}
+	setupTime := time.Since(startSetup)
+
+	// Save to cache
+	if err := os.MkdirAll(cacheDir, 0755); err == nil {
+		var pkBuf, vkBuf bytes.Buffer
+		pk.WriteTo(&pkBuf)
+		vk.WriteTo(&vkBuf)
+
+		if err := os.WriteFile(pkPath, pkBuf.Bytes(), 0644); err != nil {
+			t.Logf("Warning: failed to cache pk: %v", err)
+		}
+		if err := os.WriteFile(vkPath, vkBuf.Bytes(), 0644); err != nil {
+			t.Logf("Warning: failed to cache vk: %v", err)
+		}
+		t.Logf("Cached pk (%.2f MB) + vk (%.2f KB) to %s",
+			float64(pkBuf.Len())/1024/1024, float64(vkBuf.Len())/1024, cacheDir)
+	}
+
+	return pk, vk, setupTime, false
+}
+
 // TestStagesCircuitProveVerify runs the complete Groth16 workflow: compile, setup, prove, verify.
 // This test generates a 164-byte proof from the transpiled circuit and verifies it succeeds.
 // Expected time: ~100s (setup: 1m22s, prove: 7.5s, verify: 2ms)
@@ -213,23 +277,21 @@ func TestStagesCircuitProveVerify(t *testing.T) {
 	t.Logf("Compiled: %d constraints, %d public inputs, %d internal vars [%v]",
 		r1cs.GetNbConstraints(), r1cs.GetNbPublicVariables(), r1cs.GetNbInternalVariables(), compileTime)
 
-	// Setup
+	// Setup (with disk caching)
 	t.Log("")
-	t.Log("Running Groth16 setup...")
-	startSetup := time.Now()
+	_, currentFile, _, _ := runtime.Caller(0)
+	cacheDir := filepath.Dir(currentFile)
+	pk, vk, setupTime, fromCache := cachedSetup(t, r1cs, cacheDir)
 
-	pk, vk, err := groth16.Setup(r1cs)
-	if err != nil {
-		t.Fatalf("Failed to setup: %v", err)
+	if fromCache {
+		t.Logf("Setup loaded from cache [%v]", setupTime)
+	} else {
+		var pkBuf, vkBuf bytes.Buffer
+		pk.WriteTo(&pkBuf)
+		vk.WriteTo(&vkBuf)
+		t.Logf("Setup complete: pk=%.2f MB, vk=%.2f KB [%v]",
+			float64(pkBuf.Len())/1024/1024, float64(vkBuf.Len())/1024, setupTime)
 	}
-	setupTime := time.Since(startSetup)
-
-	var pkBuf, vkBuf bytes.Buffer
-	pk.WriteTo(&pkBuf)
-	vk.WriteTo(&vkBuf)
-
-	t.Logf("Setup complete: pk=%.2f MB, vk=%.2f KB [%v]",
-		float64(pkBuf.Len())/1024/1024, float64(vkBuf.Len())/1024, setupTime)
 
 	// Prove
 	t.Log("")

@@ -12,6 +12,7 @@ pub use jolt_program::execution::{
 pub use tracer::TracerBackend;
 
 pub use common::jolt_device::{JoltDevice, MemoryConfig, MemoryLayout};
+pub use common::size_class;
 pub use jolt_core::ark_bn254::Fr as F;
 pub use jolt_core::curve::Bn254Curve as Curve;
 pub use jolt_core::curve::JoltCurve;
