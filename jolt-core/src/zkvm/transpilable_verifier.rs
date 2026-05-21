@@ -232,11 +232,19 @@ impl<
             &preprocessing.shared.memory_layout,
         );
         let max_ram_K = compute_max_ram_K(&preprocessing.shared.memory_layout);
-        if !proof.ram_K.is_power_of_two() || proof.ram_K < min_ram_K || proof.ram_K > max_ram_K {
+        // When a size_class target is set, the prover intentionally inflates ram_K
+        // to the class maximum (which can exceed the memory-layout-derived max).
+        // The target comes from trusted preprocessing, not the proof, so the
+        // memory-layout bound is bypassed in that case.
+        let effective_max_ram_K = preprocessing.shared.target_ram_k.unwrap_or(max_ram_K);
+        if !proof.ram_K.is_power_of_two()
+            || proof.ram_K < min_ram_K
+            || proof.ram_K > effective_max_ram_K
+        {
             return Err(ProofVerifyError::InvalidRamK {
                 got: proof.ram_K,
                 min: min_ram_K,
-                max: max_ram_K,
+                max: effective_max_ram_K,
             });
         }
 

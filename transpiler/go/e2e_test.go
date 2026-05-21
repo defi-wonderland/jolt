@@ -379,7 +379,6 @@ func TestCrossWitnessSoundness(t *testing.T) {
 	runCommand(t, "transpile-muldiv", root, transpilerBin,
 		"--proof", "/tmp/muldiv_proof.bin",
 		"--io-device", "/tmp/muldiv_io_device.bin",
-		"--preprocessing", "/tmp/muldiv_preprocessing.dat",
 	)
 	muldivWitnessPath := filepath.Join(classDir, "stages_witness.json")
 
@@ -600,7 +599,6 @@ func TestSizeClassCrossProgram(t *testing.T) {
 	runCommand(t, "transpile-muldiv", root, transpilerBin,
 		"--proof", "/tmp/muldiv_proof.bin",
 		"--io-device", "/tmp/muldiv_io_device.bin",
-		"--preprocessing", "/tmp/muldiv_preprocessing.dat",
 	)
 
 	circuitB, err := os.ReadFile(filepath.Join(classDir, "stages_circuit.go"))

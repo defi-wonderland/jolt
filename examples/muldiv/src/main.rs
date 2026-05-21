@@ -62,7 +62,7 @@ pub fn main() {
     if save_to_disk {
         serialize_and_print_size(
             "Verifier Preprocessing",
-            "/tmp/muldiv_preprocessing.dat",
+            "/tmp/jolt_verifier_preprocessing.dat",
             &verifier_preprocessing,
         )
         .expect("Could not serialize preprocessing.");
