@@ -222,13 +222,15 @@ func runExamplePipeline(t *testing.T, pkg, bin, prefix string, binArgs ...string
 	_, thisFile, _, _ := runtime.Caller(0)
 	goDir := filepath.Dir(thisFile)
 
-	t.Logf("--- Step 0: Building Rust binaries (%s) ---", pkg)
+	features := cargoFeatures()
+	t.Logf("--- Step 0: Building Rust binaries (%s, features: %s) ---", pkg, features)
 	runCommand(t, "build-"+pkg, root,
 		"cargo", "build", "-p", pkg, "--release",
-		"--features", "transcript-poseidon",
+		"--features", features,
 	)
 	runCommand(t, "build-transpiler", root,
 		"cargo", "build", "-p", "transpiler", "--bin", "transpiler",
+		"--features", features,
 	)
 	t.Log("Rust binaries ready")
 
