@@ -26,7 +26,7 @@
 //! `fiat_shamir_preamble` (jolt-core/src/zkvm/mod.rs):
 //!
 //! ```text
-//! append_bytes(preprocessing_digest) → raw_append_bytes → CONSUMES 1 digest chunk (concrete)
+//! append_bytes(preprocessing_digest) → raw_append_bytes → CONSUMES 1 digest witness var
 //! append_u64(max_input_size)         → raw_append_u64  (no FIFO)
 //! append_u64(max_output_size)        → raw_append_u64  (no FIFO)
 //! append_u64(heap_size)              → raw_append_u64  (no FIFO)
@@ -37,10 +37,9 @@
 //! append_u64(trace_length)           → raw_append_u64  (no FIFO)
 //! ```
 //!
-//! The `preprocessing_digest` override is pushed as a *concrete* MleAst constant
-//! (not a witness variable). It hashes the same bytes the verifier would hash
-//! without an override, but its presence in the FIFO keeps the subsequent
-//! input/output overrides aligned.
+//! The `preprocessing_digest` override is a witness variable (not a baked-in
+//! constant) so that two programs in the same size class produce byte-identical
+//! circuits even though their digests differ.
 //!
 //! After preamble the FIFO must be empty. If not, a stale override would corrupt
 //! the next `raw_append_bytes` call.
@@ -60,7 +59,8 @@ use crate::symbolic_traits::io_replay::push_bytes_override;
 /// `preprocessing_digest` is the Blake2b-256 digest of `JoltSharedPreprocessing`
 /// (from `preprocessing.shared.digest()`). It is hashed by `fiat_shamir_preamble`
 /// before the inputs/outputs, so we push it as the first FIFO override (as a
-/// concrete constant — it is program/class identity, not a per-execution input).
+/// witness variable, so its value can vary per program while the circuit stays
+/// identical across programs in the same size class).
 ///
 /// Returns `(input_words, output_words)` at u64-word granularity — these are
 /// passed to `PENDING_INITIAL_RAM` in main.rs so `eval_initial_ram_mle` can
@@ -101,21 +101,19 @@ pub fn symbolize_io_device(
     //      by eval_io_mle for panic_contribution and termination checks.
 
     // FIRST: preprocessing_digest (32 bytes = 1 chunk).
-    // Pushed as a concrete MleAst constant so it does not add a witness variable
-    // and yields the same hash as the fallback (no-override) path. Its only role
-    // is to consume the corresponding raw_append_bytes call in the preamble so
-    // that the subsequent input/output overrides remain correctly aligned.
-    //
-    // Matches the conversion in PoseidonAstTranscript::raw_append_bytes (32 LE
-    // bytes → [u64; 4] limbs → MleAst constant, no mod reduction).
-    let digest_limbs: [u64; 4] = {
-        let mut limbs = [0u64; 4];
-        for (i, chunk) in preprocessing_digest.chunks(8).enumerate() {
-            limbs[i] = u64::from_le_bytes(chunk.try_into().unwrap());
-        }
-        limbs
+    // Allocated as a WITNESS variable, not a constant, so the generated circuit
+    // is the same across programs in the same size class (the digest value
+    // varies per program but enters the circuit as a witness input). Without
+    // this, fib and muldiv would bake different digest constants into their
+    // circuits and break the byte-identity (universal-circuit) guarantee.
+    let digest_padded = {
+        let mut padded = [0u8; 32];
+        padded.copy_from_slice(preprocessing_digest);
+        padded
     };
-    push_bytes_override(MleAst::from(digest_limbs));
+    let digest_fr = Fr::from_le_bytes_mod_order(&digest_padded);
+    let digest_var = var_alloc.alloc_with_value("preprocessing_digest", &digest_fr);
+    push_bytes_override(digest_var);
 
     let _input_chunk_vars = push_byte_chunk_overrides(&input_bytes, "io_input_chunk", var_alloc);
 
