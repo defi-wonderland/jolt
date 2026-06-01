@@ -1859,7 +1859,7 @@ impl JoltSharedPreprocessing {
     }
 
     /// Like `new`, but pads bytecode/trace/RAM to size-class bounds.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[tracing::instrument(skip_all, name = "JoltSharedPreprocessing::new_with_targets")]
     pub fn new_with_targets(
         bytecode: Vec<JoltInstructionRow>,

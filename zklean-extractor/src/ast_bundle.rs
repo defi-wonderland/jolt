@@ -318,9 +318,14 @@ impl AstBundle {
             }
         }
 
-        // Phase 2: Find TranscriptHash nodes that appear in ≥2 distinct constraints
+        // Phase 2: Find TranscriptHash nodes that appear in ≥2 distinct constraints.
+        // HashMap iteration order is non-deterministic; sort the keys so that
+        // any downstream tie-breaking (and the worklist in Phase 3) is stable.
         let mut global_nodes: HashSet<NodeId> = HashSet::new();
-        for (&node_id, constraints) in &node_to_constraints {
+        let mut sorted_node_ids: Vec<NodeId> = node_to_constraints.keys().copied().collect();
+        sorted_node_ids.sort_unstable();
+        for node_id in sorted_node_ids {
+            let constraints = &node_to_constraints[&node_id];
             // Deduplicate constraint indices
             let mut unique: Vec<usize> = constraints.clone();
             unique.sort_unstable();
@@ -339,7 +344,9 @@ impl AstBundle {
         // Walk children of each global node; if a child is in ≥2 constraints and is
         // non-trivial (not an atom), include it too. This captures the full chain.
         let mut expanded = global_nodes.clone();
+        // Sort the worklist so Phase 3 expansion is deterministic across runs.
         let mut worklist: Vec<NodeId> = global_nodes.into_iter().collect();
+        worklist.sort_unstable();
         while let Some(node_id) = worklist.pop() {
             for child_id in self.node_children(node_id) {
                 if expanded.contains(&child_id) {

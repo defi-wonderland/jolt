@@ -539,6 +539,27 @@ fn main() {
             println!("  Witness written to: {witness_path:?}");
             println!("  Witness variables: {}", witness_map.len());
 
+            // Mirror the generated files into transpiler/go/ (the Go package root)
+            // when output_dir is a class subdir. The `jolt_verifier` Go package
+            // physically lives in transpiler/go/, and `go test` needs
+            // stages_circuit.go there to compile the package. Without this copy,
+            // `go test` from a fresh checkout fails because the file only lives in
+            // class_*/.
+            let base_go_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("go");
+            if matches!(args.target, TranspilationTarget::Gnark) && output_dir != base_go_dir {
+                std::fs::create_dir_all(&base_go_dir).unwrap_or_else(|e| {
+                    panic!("Failed to create go dir {base_go_dir:?}: {e}")
+                });
+                for fname in [BUNDLE_FILENAME, "stages_circuit.go", "stages_witness.json"] {
+                    let src = output_dir.join(fname);
+                    let dst = base_go_dir.join(fname);
+                    std::fs::copy(&src, &dst).unwrap_or_else(|e| {
+                        panic!("Failed to mirror {src:?} -> {dst:?}: {e}")
+                    });
+                }
+                println!("  Mirrored to: {base_go_dir:?}");
+            }
+
             println!("\n=== SUCCESS ===");
             println!("Stages 1-7 transpiled to Gnark. Run 'go test' in {output_dir:?} to verify.",);
         }

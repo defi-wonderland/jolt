@@ -2,6 +2,8 @@ package jolt_verifier
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -19,6 +21,20 @@ import (
 	"github.com/consensys/gnark/frontend/cs/r1cs"
 	"github.com/consensys/gnark/test"
 )
+
+// r1csFingerprint returns a sha256 hex digest of the serialized R1CS. Used to
+// invalidate cached pk/vk when the compiled circuit changes (e.g. switching
+// between programs of different size classes). Without this, a stale pk/vk
+// from a previous test run causes prove to crash with "makeslice: len out of
+// range" on the next test that compiles a different circuit.
+func r1csFingerprint(r1cs constraint.ConstraintSystem) string {
+	var buf bytes.Buffer
+	if _, err := r1cs.WriteTo(&buf); err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	return hex.EncodeToString(sum[:])
+}
 
 // getStagesWitnessPath returns the path to stages_witness.json
 func getStagesWitnessPath() string {
@@ -184,8 +200,11 @@ func TestStagesCircuitSolver(t *testing.T) {
 	}
 }
 
-// cachedSetup runs Groth16 setup with disk caching. If pk/vk files exist in cacheDir,
-// they are loaded from disk. Otherwise, setup runs fresh and results are saved to disk.
+// cachedSetup runs Groth16 setup with disk caching. The cache is keyed by the
+// sha256 fingerprint of the serialized R1CS: if the fingerprint stored
+// alongside pk/vk matches the current r1cs, the cached pair is reused. If it
+// differs (typically because a previous test compiled a different circuit and
+// left stale pk/vk on disk), the cache is invalidated and setup runs fresh.
 // Returns (pk, vk, setupTime, fromCache).
 func cachedSetup(
 	t *testing.T,
@@ -194,32 +213,42 @@ func cachedSetup(
 ) (groth16.ProvingKey, groth16.VerifyingKey, time.Duration, bool) {
 	pkPath := filepath.Join(cacheDir, "proving_key.bin")
 	vkPath := filepath.Join(cacheDir, "verifying_key.bin")
+	hashPath := filepath.Join(cacheDir, "r1cs_hash.txt")
 
-	// Try loading from cache
-	if pkData, err := os.ReadFile(pkPath); err == nil {
-		if vkData, err := os.ReadFile(vkPath); err == nil {
-			t.Log("Loading cached pk/vk from disk...")
-			startLoad := time.Now()
+	currentHash := r1csFingerprint(r1cs)
 
-			pk := groth16.NewProvingKey(ecc.BN254)
-			if _, err := pk.ReadFrom(bytes.NewReader(pkData)); err != nil {
-				t.Logf("Warning: failed to read cached pk, running fresh setup: %v", err)
-			} else {
-				vk := groth16.NewVerifyingKey(ecc.BN254)
-				if _, err := vk.ReadFrom(bytes.NewReader(vkData)); err != nil {
-					t.Logf("Warning: failed to read cached vk, running fresh setup: %v", err)
-				} else {
-					loadTime := time.Since(startLoad)
-					t.Logf("Loaded cached pk (%.2f MB) + vk (%.2f KB) [%v]",
-						float64(len(pkData))/1024/1024, float64(len(vkData))/1024, loadTime)
-					return pk, vk, loadTime, true
+	// Try loading from cache only if the fingerprint matches.
+	if cachedHashBytes, err := os.ReadFile(hashPath); err == nil {
+		cachedHash := string(bytes.TrimSpace(cachedHashBytes))
+		if currentHash != "" && cachedHash == currentHash {
+			if pkData, err := os.ReadFile(pkPath); err == nil {
+				if vkData, err := os.ReadFile(vkPath); err == nil {
+					t.Log("Loading cached pk/vk from disk (r1cs fingerprint matches)...")
+					startLoad := time.Now()
+
+					pk := groth16.NewProvingKey(ecc.BN254)
+					if _, err := pk.ReadFrom(bytes.NewReader(pkData)); err != nil {
+						t.Logf("Warning: failed to read cached pk, running fresh setup: %v", err)
+					} else {
+						vk := groth16.NewVerifyingKey(ecc.BN254)
+						if _, err := vk.ReadFrom(bytes.NewReader(vkData)); err != nil {
+							t.Logf("Warning: failed to read cached vk, running fresh setup: %v", err)
+						} else {
+							loadTime := time.Since(startLoad)
+							t.Logf("Loaded cached pk (%.2f MB) + vk (%.2f KB) [%v]",
+								float64(len(pkData))/1024/1024, float64(len(vkData))/1024, loadTime)
+							return pk, vk, loadTime, true
+						}
+					}
 				}
 			}
+		} else if cachedHash != currentHash {
+			t.Logf("R1CS fingerprint changed (cache stale), running fresh setup")
 		}
 	}
 
 	// Fresh setup
-	t.Log("Running Groth16 setup (no cache found)...")
+	t.Log("Running Groth16 setup (no valid cache)...")
 	startSetup := time.Now()
 
 	pk, vk, err := groth16.Setup(r1cs)
@@ -228,7 +257,7 @@ func cachedSetup(
 	}
 	setupTime := time.Since(startSetup)
 
-	// Save to cache
+	// Save to cache, including the fingerprint
 	if err := os.MkdirAll(cacheDir, 0755); err == nil {
 		var pkBuf, vkBuf bytes.Buffer
 		pk.WriteTo(&pkBuf)
@@ -239,6 +268,11 @@ func cachedSetup(
 		}
 		if err := os.WriteFile(vkPath, vkBuf.Bytes(), 0644); err != nil {
 			t.Logf("Warning: failed to cache vk: %v", err)
+		}
+		if currentHash != "" {
+			if err := os.WriteFile(hashPath, []byte(currentHash), 0644); err != nil {
+				t.Logf("Warning: failed to cache r1cs fingerprint: %v", err)
+			}
 		}
 		t.Logf("Cached pk (%.2f MB) + vk (%.2f KB) to %s",
 			float64(pkBuf.Len())/1024/1024, float64(vkBuf.Len())/1024, cacheDir)

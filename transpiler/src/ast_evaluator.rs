@@ -10,19 +10,6 @@ use std::collections::HashMap;
 use zklean_extractor::ast_bundle::{Assertion, Constraint};
 use zklean_extractor::mle_ast::{Atom, Edge, Node, NodeId, Scalar, TranscriptHashData};
 
-/// Evaluate an Edge to a concrete Fr value.
-fn eval_edge(
-    edge: &Edge,
-    nodes: &[Node],
-    cache: &mut HashMap<NodeId, Fr>,
-    witness: &HashMap<u16, Fr>,
-) -> Fr {
-    match edge {
-        Edge::Atom(atom) => eval_atom(atom, witness),
-        Edge::NodeRef(id) => eval_node(*id, nodes, cache, witness),
-    }
-}
-
 /// Evaluate an Atom to Fr.
 fn eval_atom(atom: &Atom, witness: &HashMap<u16, Fr>) -> Fr {
     match atom {
@@ -44,45 +31,43 @@ fn scalar_to_fr(limbs: &Scalar) -> Fr {
     Fr::from_le_bytes_mod_order(&bytes)
 }
 
-/// Evaluate a node, caching results.
-fn eval_node(
-    node_id: NodeId,
-    nodes: &[Node],
-    cache: &mut HashMap<NodeId, Fr>,
-    witness: &HashMap<u16, Fr>,
-) -> Fr {
-    if let Some(&val) = cache.get(&node_id) {
-        return val;
+/// Resolve an `Edge` whose children have already been evaluated. `Edge::Atom`
+/// is evaluated inline; `Edge::NodeRef(id)` is looked up in the cache. A
+/// missing cache entry indicates a bug in the iterative walk, not malformed
+/// input, hence the panic-on-missing.
+fn eval_edge_cached(edge: &Edge, cache: &HashMap<NodeId, Fr>, witness: &HashMap<u16, Fr>) -> Fr {
+    match edge {
+        Edge::Atom(atom) => eval_atom(atom, witness),
+        Edge::NodeRef(id) => *cache
+            .get(id)
+            .unwrap_or_else(|| panic!("iterative walk missed NodeRef({id}) in cache")),
     }
+}
 
-    let result = match &nodes[node_id] {
+/// Combine a node into an `Fr`, assuming every `Edge::NodeRef` child is
+/// already in `cache`. Mirrors the original recursive `eval_node` match but
+/// resolves children via `eval_edge_cached` instead of recursion.
+fn combine_node(node_id: NodeId, nodes: &[Node], cache: &HashMap<NodeId, Fr>, witness: &HashMap<u16, Fr>) -> Fr {
+    match &nodes[node_id] {
         Node::Atom(atom) => eval_atom(atom, witness),
 
-        Node::Add(a, b) => {
-            eval_edge(a, nodes, cache, witness) + eval_edge(b, nodes, cache, witness)
-        }
-        Node::Sub(a, b) => {
-            eval_edge(a, nodes, cache, witness) - eval_edge(b, nodes, cache, witness)
-        }
-        Node::Mul(a, b) => {
-            eval_edge(a, nodes, cache, witness) * eval_edge(b, nodes, cache, witness)
-        }
+        Node::Add(a, b) => eval_edge_cached(a, cache, witness) + eval_edge_cached(b, cache, witness),
+        Node::Sub(a, b) => eval_edge_cached(a, cache, witness) - eval_edge_cached(b, cache, witness),
+        Node::Mul(a, b) => eval_edge_cached(a, cache, witness) * eval_edge_cached(b, cache, witness),
         Node::Div(a, b) => {
-            let denom = eval_edge(b, nodes, cache, witness);
-            eval_edge(a, nodes, cache, witness) * denom.inverse().expect("div by zero")
+            let denom = eval_edge_cached(b, cache, witness);
+            eval_edge_cached(a, cache, witness) * denom.inverse().expect("div by zero")
         }
-        Node::Neg(a) => -eval_edge(a, nodes, cache, witness),
-        Node::Inv(a) => eval_edge(a, nodes, cache, witness)
-            .inverse()
-            .expect("inv of zero"),
+        Node::Neg(a) => -eval_edge_cached(a, cache, witness),
+        Node::Inv(a) => eval_edge_cached(a, cache, witness).inverse().expect("inv of zero"),
 
         Node::TranscriptHash(hash_data, state_edge, rounds_edge) => {
-            let state = eval_edge(state_edge, nodes, cache, witness);
-            let rounds = eval_edge(rounds_edge, nodes, cache, witness);
+            let state = eval_edge_cached(state_edge, cache, witness);
+            let rounds = eval_edge_cached(rounds_edge, cache, witness);
 
             match hash_data {
                 TranscriptHashData::Poseidon(data_edge) => {
-                    let data = eval_edge(data_edge, nodes, cache, witness);
+                    let data = eval_edge_cached(data_edge, cache, witness);
                     let mut hasher =
                         Poseidon::<Fr>::new_circom(3).expect("failed to create Poseidon hasher");
                     hasher
@@ -94,7 +79,7 @@ fn eval_node(
         }
 
         Node::ByteReverse(e) => {
-            let val = eval_edge(e, nodes, cache, witness);
+            let val = eval_edge_cached(e, cache, witness);
             let bigint = val.into_bigint();
             let mut bytes = [0u8; 32];
             for (i, limb) in bigint.0.iter().enumerate() {
@@ -105,13 +90,12 @@ fn eval_node(
         }
 
         Node::Truncate128Reverse(e) => {
-            let val = eval_edge(e, nodes, cache, witness);
+            let val = eval_edge_cached(e, cache, witness);
             let bigint = val.into_bigint();
             let mut le_bytes = [0u8; 32];
             for (i, limb) in bigint.0.iter().enumerate() {
                 le_bytes[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_le_bytes());
             }
-            // Take low 16 bytes, reverse, interpret as field element, multiply by 2^128
             let mut truncated = [0u8; 16];
             truncated.copy_from_slice(&le_bytes[..16]);
             truncated.reverse();
@@ -121,7 +105,7 @@ fn eval_node(
         }
 
         Node::Truncate128(e) => {
-            let val = eval_edge(e, nodes, cache, witness);
+            let val = eval_edge_cached(e, cache, witness);
             let bigint = val.into_bigint();
             let mut le_bytes = [0u8; 32];
             for (i, limb) in bigint.0.iter().enumerate() {
@@ -134,17 +118,70 @@ fn eval_node(
         }
 
         Node::AppendU64Transform(e) => {
-            let val = eval_edge(e, nodes, cache, witness);
-            // bswap64(x) * 2^192
+            let val = eval_edge_cached(e, cache, witness);
             let bigint = val.into_bigint();
-            let x = bigint.0[0]; // u64 value
+            let x = bigint.0[0];
             let swapped = x.swap_bytes();
             Fr::from(swapped) * Fr::from(2u64).pow([192])
         }
-    };
+    }
+}
 
-    cache.insert(node_id, result);
-    result
+/// Evaluate a node, caching results. Iterative DFS post-order with a
+/// double-visit stack: first visit pushes the node back as "ready to combine"
+/// then pushes its children; second visit combines (all children are cached
+/// by then). The recursive form overflowed the default 8 MB stack on bundles
+/// with deep linear chains (e.g. size_class padded AST trees with >32k
+/// levels). Moving the stack to heap removes the limit; memory per frame is
+/// ~16 bytes vs ~256 bytes for a real stack frame.
+fn eval_node(
+    root_id: NodeId,
+    nodes: &[Node],
+    cache: &mut HashMap<NodeId, Fr>,
+    witness: &HashMap<u16, Fr>,
+) -> Fr {
+    let mut stack: Vec<(NodeId, bool)> = vec![(root_id, false)];
+
+    while let Some((id, processed)) = stack.pop() {
+        if cache.contains_key(&id) {
+            continue;
+        }
+
+        if processed {
+            let result = combine_node(id, nodes, cache, witness);
+            cache.insert(id, result);
+            continue;
+        }
+
+        // Re-push self marked as ready, then push unvisited NodeRef children
+        // so they get evaluated first (LIFO post-order).
+        stack.push((id, true));
+        for child_id in nodes[id].child_node_ids() {
+            if !cache.contains_key(&child_id) {
+                stack.push((child_id, false));
+            }
+        }
+    }
+
+    *cache
+        .get(&root_id)
+        .expect("eval_node: root must be in cache after iterative walk")
+}
+
+/// Public adapter for code paths that need to evaluate a single `Edge`
+/// (e.g. `evaluate_assertions` when decomposing `Sub(lhs, rhs)`). Resolves
+/// `Edge::NodeRef` via the iterative `eval_node` so deep chains do not
+/// overflow.
+fn eval_edge(
+    edge: &Edge,
+    nodes: &[Node],
+    cache: &mut HashMap<NodeId, Fr>,
+    witness: &HashMap<u16, Fr>,
+) -> Fr {
+    match edge {
+        Edge::Atom(atom) => eval_atom(atom, witness),
+        Edge::NodeRef(id) => eval_node(*id, nodes, cache, witness),
+    }
 }
 
 /// LHS and RHS of one assertion.
@@ -290,5 +327,34 @@ mod tests {
         }];
         let witness = HashMap::new();
         let _ = evaluate_assertions(&nodes, &constraints, &witness);
+    }
+
+    // Builds a linear AST of `Add(prev, 1)` chained DEPTH times. The recursive
+    // form of `eval_node` overflowed the default 8 MB stack for chains beyond
+    // ~30k. The iterative form must handle 100k without crashing.
+    #[test]
+    fn test_iterative_eval_survives_deep_chain() {
+        use zklean_extractor::ast_bundle::{Assertion, Constraint};
+
+        const DEPTH: usize = 100_000;
+        let mut nodes: Vec<Node> = Vec::with_capacity(DEPTH + 1);
+        nodes.push(Node::Atom(Atom::Scalar([1, 0, 0, 0])));
+        for _ in 0..DEPTH {
+            let prev = nodes.len() - 1;
+            nodes.push(Node::Add(
+                Edge::NodeRef(prev),
+                Edge::Atom(Atom::Scalar([1, 0, 0, 0])),
+            ));
+        }
+        let constraints = vec![Constraint {
+            name: "deep_chain".into(),
+            root: nodes.len() - 1,
+            assertion: Assertion::EqualZero,
+        }];
+        let witness = HashMap::new();
+        let result = evaluate_assertions(&nodes, &constraints, &witness);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].lhs, Fr::from((DEPTH + 1) as u64));
+        assert_eq!(result[0].rhs, Fr::from(0u64));
     }
 }

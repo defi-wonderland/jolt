@@ -77,3 +77,6 @@ transpiler/go/class_*/
 # generated docs and scripts
 docs/
 scripts/ci-local.sh
+
+# local IDE / agent settings
+.claude/

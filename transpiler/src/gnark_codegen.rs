@@ -166,6 +166,7 @@ fn fragment_len_estimate(f: &ExprFragment) -> usize {
 /// `CseRef` appears and `slice_mode` is false (named-var emission). With
 /// `slice_mode = true`, CSE references become `cse[N]` slice indexes and
 /// `constraint_idx` is ignored.
+#[expect(clippy::expect_used)]
 fn render_expr(expr: &[ExprFragment], constraint_idx: Option<usize>, slice_mode: bool) -> String {
     let mut out = String::new();
     for frag in expr {
@@ -694,11 +695,17 @@ fn render_global_cse_functions(
 ///
 /// If a constraint expression is entirely constant (contains no variables):
 /// - **EqualZero + constant == 0**: Constraint is skipped (statically satisfied)
-/// - **EqualZero + constant != 0**: Failure recorded in `stats.constant_failed`,
-///   constraint still emitted (will fail at prove time)
+/// - **EqualZero + constant != 0**: Failure recorded in `stats.constant_failed`.
+///   Emission of the constraint body is skipped when `crossval=false`; under
+///   `crossval=true` the body is kept for inspection. Either way the public
+///   wrapper [`generate_circuit_from_bundle`] panics whenever
+///   `constant_failed > 0`, so a circuit with skipped-body output never reaches
+///   disk through the standard CLI path.
 /// - **Other assertion types**: Emitted normally (no static verification)
 ///
-/// Callers should check `stats.constant_failed > 0` to detect static failures.
+/// Callers that bypass the wrapper MUST check `stats.constant_failed > 0`
+/// themselves before writing the output, otherwise the resulting circuit
+/// would silently omit a failing assertion.
 ///
 /// # Per-Constraint Expression Trees
 ///
